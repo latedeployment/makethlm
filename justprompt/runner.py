@@ -6,11 +6,28 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep
 from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, ShellDispatcher
+
+
+def _log(msg: str, *, bold: bool = False, dim: bool = False) -> None:
+    """Print a progress message to stderr."""
+    if sys.stderr.isatty():
+        if bold:
+            msg = f"\033[1m{msg}\033[0m"
+        elif dim:
+            msg = f"\033[2m{msg}\033[0m"
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.1f}s"
 
 
 class CycleError(Exception):
@@ -141,12 +158,13 @@ def _load_dotenv(path: str | None = None, required: bool = False) -> None:
 class Runner:
     """Executes tasks from a Promptfile using a Dispatcher."""
 
-    def __init__(self, pf: Promptfile, dispatcher: Dispatcher, *, quiet: bool = False):
+    def __init__(self, pf: Promptfile, dispatcher: Dispatcher, *, quiet: bool = False, verbose: bool = True):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
         self._dotenv_loaded = False
         self._exports_applied = False
         self.quiet = quiet  # global quiet from CLI or settings
+        self.verbose = verbose and not quiet  # show progress unless quiet
 
     def _get_dispatcher(self, task: Task) -> Dispatcher:
         """Return the appropriate dispatcher for a task (per-task LLM > default)."""
@@ -223,11 +241,18 @@ class Runner:
         execution_order = topological_sort(self.pf, target)
         result = RunResult(target=target)
 
-        for task_name in execution_order:
+        total = len(execution_order)
+        if self.verbose and total > 1:
+            dep_names = [n for n in execution_order if n != target]
+            _log(f"Running {target} ({total} tasks: {', '.join(dep_names)} -> {target})", bold=True)
+
+        for idx, task_name in enumerate(execution_order, 1):
             task = self.pf.tasks[task_name]
 
             # OS filter: skip tasks not meant for this OS
             if task.options.should_skip_for_os():
+                if self.verbose:
+                    _log(f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})", dim=True)
                 result.task_results.append(TaskResult(
                     task_name=task_name,
                     prompt_sent="",
@@ -247,9 +272,27 @@ class Runner:
                     ))
                     return result
 
+            if self.verbose:
+                step_count = len(task.steps)
+                shell_count = sum(1 for s in task.steps if s.kind == "shell")
+                prompt_count = step_count - shell_count
+                parts = []
+                if shell_count:
+                    parts.append(f"{shell_count} shell")
+                if prompt_count:
+                    parts.append(f"{prompt_count} prompt")
+                step_desc = f" ({', '.join(parts)})" if parts else ""
+                _log(f"  [{idx}/{total}] {task_name}{step_desc} ...", bold=True)
+
             task_args = args if task_name == target else None
+            t0 = time.monotonic()
             task_result = self._run_task(task, task_args)
+            elapsed = time.monotonic() - t0
             result.task_results.append(task_result)
+
+            if self.verbose:
+                status = "done" if task_result.success else "FAILED"
+                _log(f"  [{idx}/{total}] {task_name} {status} ({_fmt_elapsed(elapsed)})")
 
             if not task_result.success:
                 break
@@ -282,8 +325,16 @@ class Runner:
 
         for step in resolved_steps:
             if step.kind == "shell":
+                if self.verbose:
+                    cmd_preview = step.content if len(step.content) <= 60 else step.content[:57] + "..."
+                    _log(f"         $ {cmd_preview}", dim=True)
                 sr = self._run_shell_step(step, task=task, working_dir=working_dir)
             else:
+                if self.verbose:
+                    prompt_preview = step.content.split("\n")[0]
+                    if len(prompt_preview) > 60:
+                        prompt_preview = prompt_preview[:57] + "..."
+                    _log(f"         > sending prompt to LLM ...", dim=True)
                 sr = self._run_prompt_step(step, task, dispatcher)
 
             step_results.append(sr)
@@ -320,6 +371,8 @@ class Runner:
             if step.kind == "shell":
                 # Execute on each host
                 for host in host_group.hosts:
+                    if self.verbose:
+                        _log(f"         $ {step.content} (on {host})", dim=True)
                     sr = self._run_ssh_step(step, host, host_group)
                     step_results.append(sr)
                     all_responses.append(sr.response)
@@ -330,6 +383,8 @@ class Runner:
                     break
             else:
                 # Prompt steps still run locally via LLM
+                if self.verbose:
+                    _log(f"         > sending prompt to LLM ...", dim=True)
                 sr = self._run_prompt_step(step, task, dispatcher)
                 step_results.append(sr)
                 all_responses.append(sr.response)
@@ -461,6 +516,8 @@ class Runner:
         description = "\n".join(s.content for s in resolved_steps if s.kind == "prompt")
         generate_prompt = _DOCKER_GENERATE_PREFIX + description
 
+        if self.verbose:
+            _log(f"         > generating Dockerfile via LLM ...", dim=True)
         dr = dispatcher.dispatch(generate_prompt, task)
         step_results.append(StepResult(
             kind="docker-generate",

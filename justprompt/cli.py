@@ -340,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
     # Run
-    runner = Runner(pf, dispatcher, quiet=args.quiet)
+    runner = Runner(pf, dispatcher, quiet=args.quiet, verbose=not args.dry_run)
     try:
         result = runner.run(target, args=task_args)
     except KeyError as e:

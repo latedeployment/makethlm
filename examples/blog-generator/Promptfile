@@ -1,0 +1,47 @@
+# Blog Generator — use the LLM as a writing assistant
+#
+# This example shows a non-code use case:
+#   - Generate blog posts from a topic
+#   - Reusable prompt templates with functions (@use)
+#   - Task arguments for customization
+#
+# Try it:
+#   justprompt --list                          # see available tasks
+#   justprompt --dry-run draft "async Python"  # preview
+#   justprompt draft "Docker networking"       # generate a blog post
+
+llm claude [model=sonnet]
+
+# Reusable writing style guide
+fn writing-style:
+    Write in a clear, conversational tone.
+    Use short paragraphs. Avoid jargon unless you explain it.
+    Include practical code examples where relevant.
+    Target audience: intermediate developers.
+
+# Generate a blog post draft
+task draft(topic):
+    @use writing-style
+    Write a technical blog post about: {{topic}}
+    Include:
+    - A catchy title
+    - An introduction that hooks the reader
+    - 3-4 main sections with subheadings
+    - Code examples where appropriate
+    - A conclusion with key takeaways
+    Format as Markdown.
+
+# Summarize an existing article
+task summarize:
+    !cat article.md 2>/dev/null || echo "No article.md found — create one first."
+    @use writing-style
+    Summarize the article above into 3-5 bullet points.
+    Each bullet should capture one key idea.
+
+# Generate a tweet thread from a blog post
+task tweet-thread:
+    !cat article.md 2>/dev/null || echo "No article.md found — create one first."
+    Turn the article above into a Twitter/X thread of 5-8 tweets.
+    First tweet should hook the reader.
+    Last tweet should have a call to action.
+    Use plain text, no markdown.

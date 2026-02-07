@@ -1,11 +1,13 @@
 # ==========================================================================
-# Example Promptfile — a task runner where tasks are LLM prompts
+# Kitchen-sink Promptfile — showcases ALL features in one file
+#
+# This is a reference, not a starting point. See examples/ for simpler,
+# realistic Promptfiles you can copy and adapt.
 #
 # Usage:
-#   promptfile build                    # build the project
-#   promptfile deploy staging           # deploy with args
-#   promptfile --dry-run deploy prod    # preview what would run
-#   promptfile --list                   # list tasks, functions, hosts, llms
+#   justprompt --list                   # list tasks, functions, hosts, llms
+#   justprompt --dry-run build          # preview what would run
+#   justprompt deploy staging           # deploy with args
 # ==========================================================================
 
 # --------------------------------------------------------------------------

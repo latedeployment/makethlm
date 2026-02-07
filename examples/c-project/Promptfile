@@ -1,0 +1,44 @@
+# C Project — hello world with a generated library
+#
+# This example shows how justprompt can:
+#   - Run shell commands (lines starting with !)
+#   - Ask an LLM to generate code
+#   - Chain tasks with dependencies
+#
+# Try it:
+#   justprompt --list              # see available tasks
+#   justprompt --dry-run build     # preview what would happen
+#   justprompt build               # actually run it
+
+project := "hello"
+
+# Use claude by default (change to ollama/openai as needed)
+llm claude [model=sonnet]
+
+# -- Tasks --
+
+# Generate a small utility library using the LLM
+task generate-lib:
+    !mkdir -p src
+    Write a small C library with a header file.
+    The library should provide two functions:
+      - char *greet(const char *name) that returns "Hello, <name>!"
+      - int add(int a, int b) that returns the sum
+    Output ONLY the contents of two files, clearly separated:
+    First src/mylib.h (the header), then src/mylib.c (the implementation).
+    Use standard C, no external dependencies.
+
+# Compile everything
+task build: generate-lib:
+    !gcc -c src/mylib.c -o src/mylib.o
+    !gcc src/main.c src/mylib.o -o {{project}}
+    !echo "Build complete: ./{{project}}"
+
+# Run the program
+task run: build:
+    !./{{project}}
+
+# Clean build artifacts
+task clean:
+    !rm -f src/*.o {{project}}
+    !echo "Cleaned."
