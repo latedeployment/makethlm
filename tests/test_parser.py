@@ -1884,3 +1884,78 @@ task build:
         step = pf.tasks["build"].steps[0]
         assert step.quiet is True
         assert step.content == "echo hello"
+
+
+# ---------------------------------------------------------------------------
+# Example Promptfiles — ensure all shipped examples parse without errors
+# ---------------------------------------------------------------------------
+
+class TestExamplesCompile:
+    """Validate that every example Promptfile (and the root one) can be parsed.
+
+    This is a compile-time check only — no tasks are executed, no LLM calls
+    are made, and no libraries are generated.
+    """
+
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _parse_promptfile(self, path: str):
+        """Helper: read and parse a Promptfile, returning the parsed model."""
+        abs_path = os.path.join(self._PROJECT_ROOT, path)
+        with open(abs_path) as f:
+            source = f.read()
+        return parse(source, filename=abs_path)
+
+    # -- Individual example tests --
+
+    def test_root_promptfile_compiles(self):
+        pf = self._parse_promptfile("Promptfile")
+        assert len(pf.tasks) > 0
+
+    def test_python_project_compiles(self):
+        pf = self._parse_promptfile("examples/python-project/Promptfile")
+        assert "test" in pf.tasks
+        assert "document" in pf.tasks
+        assert "review" in pf.tasks
+
+    def test_npm_project_compiles(self):
+        pf = self._parse_promptfile("examples/npm-project/Promptfile")
+        assert "setup" in pf.tasks
+        assert "build" in pf.tasks
+        assert "test" in pf.tasks
+
+    def test_c_project_compiles(self):
+        pf = self._parse_promptfile("examples/c-project/Promptfile")
+        assert "generate-lib" in pf.tasks
+        assert "build" in pf.tasks
+        assert "run" in pf.tasks
+        # build should NOT depend on generate-lib (no LLM call on every build)
+        assert "generate-lib" not in pf.tasks["build"].dependencies
+
+    def test_blog_generator_compiles(self):
+        pf = self._parse_promptfile("examples/blog-generator/Promptfile")
+        assert "draft" in pf.tasks
+        assert "summarize" in pf.tasks
+        assert "tweet-thread" in pf.tasks
+        # Verify the function reference works
+        assert "writing-style" in pf.functions
+
+    # -- Catch-all: discover and parse every Promptfile under examples/ --
+
+    def test_all_example_promptfiles_compile(self):
+        """Walk examples/ and parse every Promptfile found.
+
+        This catches new examples that are added without a dedicated test.
+        """
+        examples_dir = os.path.join(self._PROJECT_ROOT, "examples")
+        found = []
+        for root, _dirs, files in os.walk(examples_dir):
+            for fname in files:
+                if fname in ("Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"):
+                    found.append(os.path.join(root, fname))
+        assert found, "no example Promptfiles found — directory structure may have changed"
+        for pf_path in found:
+            with open(pf_path) as f:
+                source = f.read()
+            pf = parse(source, filename=pf_path)
+            assert len(pf.tasks) > 0, f"{pf_path} parsed but has no tasks"

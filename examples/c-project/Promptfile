@@ -28,8 +28,8 @@ task generate-lib:
     First src/mylib.h (the header), then src/mylib.c (the implementation).
     Use standard C, no external dependencies.
 
-# Compile everything
-task build: generate-lib:
+# Compile everything (run generate-lib first if src/mylib.c doesn't exist)
+task build:
     !gcc -c src/mylib.c -o src/mylib.o
     !gcc src/main.c src/mylib.o -o {{project}}
     !echo "Build complete: ./{{project}}"
