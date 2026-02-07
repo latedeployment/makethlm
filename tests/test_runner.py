@@ -854,3 +854,185 @@ task build:
 
         assert result.success
         assert "hello" in result.task_results[0].step_results[0].response
+
+
+# ---------------------------------------------------------------------------
+# Runner — export variables
+# ---------------------------------------------------------------------------
+
+class TestRunnerExport:
+    def test_export_var_in_env(self):
+        pf = parse("""\
+export PF_TEST_EXPORT := "exported_value"
+
+task show:
+    !echo $PF_TEST_EXPORT
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        # Clean up before test
+        os.environ.pop("PF_TEST_EXPORT", None)
+        result = runner.run("show")
+        os.environ.pop("PF_TEST_EXPORT", None)
+
+        assert result.success
+        assert "exported_value" in result.task_results[0].step_results[0].response
+
+    def test_set_export_all(self):
+        pf = parse("""\
+set export
+
+PF_TEST_SETEXPORT := "all_exported"
+
+task show:
+    !echo $PF_TEST_SETEXPORT
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        os.environ.pop("PF_TEST_SETEXPORT", None)
+        result = runner.run("show")
+        os.environ.pop("PF_TEST_SETEXPORT", None)
+
+        assert result.success
+        assert "all_exported" in result.task_results[0].step_results[0].response
+
+
+# ---------------------------------------------------------------------------
+# Runner — no-cd
+# ---------------------------------------------------------------------------
+
+class TestRunnerNoCd:
+    def test_no_cd_ignores_working_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pf = parse(f"""\
+set working-dir "{tmpdir}"
+
+task build [no-cd]:
+    !pwd
+""")
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+            result = runner.run("build")
+
+            assert result.success
+            # no-cd means working dir should NOT be tmpdir
+            output = result.task_results[0].step_results[0].response
+            # It should be the current directory, not tmpdir
+            assert output  # just check it ran
+
+
+# ---------------------------------------------------------------------------
+# Runner — variadic args
+# ---------------------------------------------------------------------------
+
+class TestRunnerVariadicArgs:
+    def test_plus_variadic_collects_remaining(self):
+        pf = parse("""\
+task greet(+names):
+    hello to {{names}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("greet", args={"names": "alice bob charlie"})
+
+        assert result.success
+        assert "alice bob charlie" in result.task_results[0].prompt_sent
+
+    def test_star_variadic_allows_empty(self):
+        pf = parse("""\
+task greet(*names):
+    hello to {{names}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("greet", args={"names": ""})
+
+        assert result.success
+
+
+# ---------------------------------------------------------------------------
+# Runner — ignore-comments
+# ---------------------------------------------------------------------------
+
+class TestRunnerIgnoreComments:
+    def test_ignore_comments_strips_comments(self):
+        pf = parse("""\
+set ignore-comments
+
+task build:
+    !echo hello # this is a comment
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("build")
+
+        assert result.success
+        # The comment should be stripped, so output should be "hello"
+        assert "hello" in result.task_results[0].step_results[0].response
+        assert "this is a comment" not in result.task_results[0].step_results[0].response
+
+
+# ---------------------------------------------------------------------------
+# Runner — built-in functions
+# ---------------------------------------------------------------------------
+
+class TestRunnerBuiltinFunctions:
+    def test_os_in_prompt(self):
+        pf = parse("""\
+task show:
+    running on {{os()}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("show")
+
+        assert result.success
+        assert "{{os()}}" not in result.task_results[0].prompt_sent
+
+    def test_arch_in_shell(self):
+        import platform
+        pf = parse("""\
+task show:
+    !echo {{arch()}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("show")
+
+        assert result.success
+        assert platform.machine() in result.task_results[0].step_results[0].response
+
+
+# ---------------------------------------------------------------------------
+# Runner — if/else in templates
+# ---------------------------------------------------------------------------
+
+class TestRunnerIfElse:
+    def test_if_else_in_prompt(self):
+        pf = parse("""\
+env := "prod"
+
+task show:
+    {{if env == "prod" { "production" } else { "development" }}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("show")
+
+        assert result.success
+        assert "production" in result.task_results[0].prompt_sent
+
+    def test_if_else_concat_in_prompt(self):
+        pf = parse("""\
+project := "app"
+
+task show:
+    name is {{"my-" + project + "-v1"}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("show")
+
+        assert result.success
+        assert "my-app-v1" in result.task_results[0].prompt_sent

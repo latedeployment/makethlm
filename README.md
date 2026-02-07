@@ -645,12 +645,20 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `max_tokens` | int | Maximum tokens in the LLM response |
 | `llm` | string | Name of the LLM provider to use (must be declared globally) |
 | `on` | string | Host group to execute shell commands on via SSH |
-| `private` | flag | Hide this task from `--list` output |
+| `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
 | `group` | string | Group heading for `--list` (e.g., `group="deploy"`) |
 | `doc` | string | Description shown in `--list` output |
 | `confirm` | flag/string | Prompt for confirmation before running. Use `confirm` for the default message or `confirm="Are you sure?"` for a custom one |
 | `os` | string | Only run this task on the specified OS (e.g., `os=linux`) |
+| `linux` | flag | Shorthand for `os=linux` (Justfile-compatible) |
+| `macos` | flag | Shorthand for `os=macos` (Justfile-compatible) |
+| `windows` | flag | Shorthand for `os=windows` (Justfile-compatible) |
+| `unix` | flag | Shorthand for `os=unix` (matches Linux and macOS) |
 | `working-dir` | string | Change to this directory before executing the task |
+| `no-cd` | flag | Don't change to working directory (overrides `set working-dir`) |
+| `no-exit-message` | flag | Suppress error message on failure |
+| `no-quiet` | flag | Override global `set quiet` for this task |
+| `positional-arguments` | flag | Per-task override for positional argument passing |
 
 Options can be combined with dependencies:
 
@@ -672,8 +680,111 @@ set working-dir "/home/deploy/app"
 | Directive | Description |
 |-----------|-------------|
 | `set dotenv-load` | Automatically load a `.env` file from the working directory |
+| `set dotenv-path "path"` | Custom `.env` file path |
+| `set dotenv-required` | Error if `.env` is missing |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set working-dir "path"` | Set the working directory for all tasks |
+| `set export` | Export all variables to the environment |
+| `set positional-arguments` | Pass task arguments as `$1`, `$2`, etc. |
+| `set fallback` | Search parent directories for a Promptfile |
+| `set ignore-comments` | Strip `#` comments from shell commands |
+| `set quiet` | Suppress command echoing globally |
+| `set tempdir "path"` | Temporary directory for recipes |
+| `set allow-duplicate-tasks` | Allow redefining tasks (last wins) |
+| `set allow-duplicate-variables` | Allow redefining variables |
+
+### Export Variables
+
+Variables prefixed with `export` are passed to the environment of shell commands:
+
+```
+export API_KEY := "secret"
+export DATABASE_URL := "postgres://..."
+
+task deploy:
+    !echo $API_KEY          # accessible in shell commands
+    deploy with API key
+```
+
+Use `set export` to export **all** variables:
+
+```
+set export
+
+project := "myapp"         # exported automatically
+version := "1.0"           # exported automatically
+```
+
+### String Concatenation
+
+Variables support string concatenation with `+`:
+
+```
+prefix := "my"
+project := prefix + "-app" + "-v1"     # "my-app-v1"
+```
+
+### Conditional Expressions
+
+Justfile-compatible `if/else` expressions in variables and templates:
+
+```
+env := "production"
+message := if env == "production" { "deploy carefully" } else { "test freely" }
+
+task deploy:
+    {{if env == "production" { "running production deploy" } else { "running dev deploy" }}}
+```
+
+Operators: `==`, `!=`.
+
+### Built-in Functions
+
+Justfile-compatible built-in functions, available in `{{ }}` templates:
+
+| Function | Description |
+|----------|-------------|
+| `{{os()}}` | Current OS: `linux`, `macos`, or `windows` |
+| `{{os_family()}}` | OS family: `unix` or `windows` |
+| `{{arch()}}` | CPU architecture (e.g., `x86_64`, `aarch64`) |
+| `{{num_cpus()}}` | Number of CPU cores |
+| `{{home_directory()}}` | User's home directory |
+
+```
+task info:
+    running on {{os()}} ({{arch()}}) with {{num_cpus()}} cores
+    home: {{home_directory()}}
+```
+
+### Variadic Arguments
+
+Tasks can accept variadic arguments (Justfile-compatible):
+
+```
+# One or more (required)
+task deploy(+targets):
+    deploy to {{targets}}
+
+# Zero or more (optional)
+task greet(*names):
+    hello {{names}}
+```
+
+```bash
+promptfile deploy staging prod     # targets="staging prod"
+promptfile greet alice bob         # names="alice bob"
+promptfile greet                   # names="" (ok for *)
+```
+
+### Line Continuation
+
+Long lines can be split with `\`:
+
+```
+task build:
+    this is a very long prompt \
+    that continues on the next line
+```
 
 ### Aliases
 
@@ -708,10 +819,15 @@ promptfile [OPTIONS] [TASK] [ARGS...]
 |------|-------|-------------|
 | `--file PATH` | `-f` | Path to Promptfile (default: auto-detect in current directory) |
 | `--list` | `-l` | List all tasks, functions, LLM providers, and host groups |
+| `--summary` | `-s` | List task names only (compact, one per line) |
+| `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
+| `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
+| `--quiet` | `-q` | Suppress command echoing |
+| `--verbose` | | Verbose output with step details |
 
 **Examples:**
 
@@ -781,18 +897,28 @@ $ promptfile --list
 | Task body language | Shell commands | Shell commands | Natural language + shell |
 | LLM integration | None | None | First-class, multi-provider |
 | Variable interpolation | `$(VAR)` | `{{VAR}}` | `{{VAR}}` |
+| String concatenation | N/A | `+` operator | `+` operator |
+| Conditional expressions | N/A | `if/else` | `if/else` |
+| Built-in functions | N/A | `os()`, `arch()`, etc. | `os()`, `arch()`, etc. |
 | Environment variables | `$$VAR` | `$VAR` | `${VAR}` with defaults |
+| Export variables | `export` | `export` | `export` / `set export` |
 | Dependencies | File-based (mtime) | Task-based | Task-based (topological) |
-| Task arguments | None | Positional + defaults | Positional + defaults |
+| Task arguments | None | Positional + defaults + variadic | Positional + defaults + variadic |
 | Shell command prefix | (tab-indented) | (indented) | `!` prefix |
 | Reusable templates | None | None | `fn` / `@use` |
 | Docker generation | None | None | `docker` blocks |
 | Remote execution | None | None | SSH host inventory |
 | Multi-LLM routing | N/A | N/A | Per-task `[llm=...]` |
+| OS-specific tasks | N/A | `[linux]`, `[macos]` | `[linux]`, `[macos]`, `[unix]` |
+| Private tasks | N/A | `_` prefix / `[private]` | `_` prefix / `[private]` |
+| Confirmation | N/A | `[confirm]` | `[confirm]` / `[confirm="msg"]` |
+| Line continuation | `\` | `\` | `\` |
+| Quiet mode | N/A | `@` prefix / `set quiet` | `@` prefix / `set quiet` |
+| Fallback search | N/A | `set fallback` | `set fallback` |
 | File composition | `include` | `import` | `include` |
 | Dry run | `-n` flag | `--dry-run` | `--dry-run` |
+| Dump structure | N/A | `--dump` | `--dump` |
 | File name | `Makefile` | `justfile` | `Promptfile` |
-| Language | Domain-specific | Domain-specific | Domain-specific |
 
 ---
 
@@ -935,6 +1061,19 @@ promptfile --list
 # Variables
 name := "value"
 backtick_var := `command`
+concat := "a" + name + "b"
+conditional := if name == "value" { "yes" } else { "no" }
+export secret := "key"
+
+# Set directives (Justfile-compatible)
+set dotenv-load
+set shell "bash"
+set working-dir "/path"
+set export
+set positional-arguments
+set fallback
+set ignore-comments
+set quiet
 
 # LLM providers
 llm <name> [model=..., key=$..., base_url=..., template=...]
@@ -949,10 +1088,15 @@ fn <name>:
     reusable prompt text
 
 # Tasks
-task <name>[(arg1, arg2="default")]: [dep1 dep2] [options]:
+task <name>[(arg1, arg2="default", +variadic)]: [dep1 dep2] [options]:
     !shell command
+    !@silent command            # suppress output
+    !@ignore command            # continue on failure
+    !@command                   # quiet (suppress echoing)
     natural language prompt
     @use function_name
+    running on {{os()}} / {{arch()}}
+    {{if var == "val" { "yes" } else { "no" }}}
 
 # Docker
 docker <name> [tag=..., context=..., file=...]:
@@ -964,10 +1108,9 @@ include "path/to/file.pf"
 # Aliases
 alias <short> := <task>
 
-# Set directives
-set dotenv-load
-set shell "bash"
-set working-dir "/path"
+# Line continuation
+long_line := "this is a very long" + \
+    " value that spans lines"
 ```
 
 ---

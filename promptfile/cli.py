@@ -14,14 +14,23 @@ from .dispatcher import ClaudeDispatcher, DryRunDispatcher, ShellDispatcher
 PROMPTFILE_NAMES = ["Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"]
 
 
-def find_promptfile(directory: Path | None = None) -> Path | None:
-    """Search for a Promptfile in the given directory (default: cwd)."""
+def find_promptfile(directory: Path | None = None, *, fallback: bool = False) -> Path | None:
+    """Search for a Promptfile in the given directory (default: cwd).
+
+    If ``fallback`` is True, also search parent directories (Justfile-compatible).
+    """
     d = directory or Path.cwd()
-    for name in PROMPTFILE_NAMES:
-        candidate = d / name
-        if candidate.is_file():
-            return candidate
-    return None
+    while True:
+        for name in PROMPTFILE_NAMES:
+            candidate = d / name
+            if candidate.is_file():
+                return candidate
+        if not fallback:
+            return None
+        parent = d.parent
+        if parent == d:
+            return None
+        d = parent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +68,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="List available tasks and exit",
     )
     ap.add_argument(
+        "--summary", "-s",
+        action="store_true",
+        help="List task names only (compact, one per line)",
+    )
+    ap.add_argument(
+        "--dump",
+        action="store_true",
+        help="Dump the parsed Promptfile (variables, tasks, etc.)",
+    )
+    ap.add_argument(
+        "--evaluate",
+        metavar="EXPR",
+        default=None,
+        help="Evaluate an expression and print the result",
+    )
+    ap.add_argument(
         "--model", "-m",
         default=None,
         help="Default LLM model to use",
@@ -74,6 +99,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Override a variable: -V name=value",
     )
+    ap.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress command echoing",
+    )
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Verbose output (show all step details)",
+    )
     return ap
 
 
@@ -85,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     pf_path: Path | None = args.file
     if pf_path is None:
         pf_path = find_promptfile()
+    if pf_path is None or not pf_path.is_file():
+        # Try with fallback before giving up
+        pf_path = find_promptfile(fallback=True)
     if pf_path is None or not pf_path.is_file():
         print("error: no Promptfile found", file=sys.stderr)
         return 1
@@ -104,6 +142,67 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         key, value = var_str.split("=", 1)
         pf.variables[key.strip()] = value.strip()
+
+    # --evaluate: evaluate an expression
+    if args.evaluate is not None:
+        from .models import _evaluate_expression, _builtin_functions
+        context = _builtin_functions()
+        context.update(pf.variables)
+        result = _evaluate_expression(args.evaluate, context)
+        print(result)
+        return 0
+
+    # --summary: compact task list
+    if args.summary:
+        for name in pf.task_order:
+            task = pf.tasks[name]
+            if not task.options.private:
+                print(name)
+        return 0
+
+    # --dump: dump parsed structure
+    if args.dump:
+        print("variables:")
+        for k, v in pf.variables.items():
+            exported = " (exported)" if k in pf.exported_vars else ""
+            print(f"  {k} = {v!r}{exported}")
+        if pf.settings.export:
+            print("  (set export: all variables exported)")
+        print()
+        print("settings:")
+        for field_name in ("dotenv_load", "shell", "working_dir", "export",
+                           "positional_arguments", "fallback", "ignore_comments",
+                           "tempdir", "quiet"):
+            val = getattr(pf.settings, field_name)
+            if val:
+                print(f"  {field_name} = {val!r}")
+        print()
+        print("tasks:")
+        for name in pf.task_order:
+            task = pf.tasks[name]
+            flags = []
+            if task.options.private:
+                flags.append("private")
+            if task.options.os_filter:
+                flags.append(f"os={task.options.os_filter}")
+            if task.options.no_cd:
+                flags.append("no-cd")
+            if task.options.confirm:
+                flags.append("confirm")
+            flag_str = f" [{', '.join(flags)}]" if flags else ""
+            deps_str = f" : {' '.join(task.dependencies)}" if task.dependencies else ""
+            args_str = ""
+            if task.arguments:
+                parts = []
+                for a in task.arguments:
+                    prefix = a.variadic or ""
+                    if a.default is not None:
+                        parts.append(f'{prefix}{a.name}="{a.default}"')
+                    else:
+                        parts.append(f"{prefix}{a.name}")
+                args_str = f"({', '.join(parts)})"
+            print(f"  {name}{args_str}{deps_str}{flag_str}")
+        return 0
 
     # List mode
     if args.list_tasks:
@@ -128,10 +227,11 @@ def main(argv: list[str] | None = None) -> int:
             if task.arguments:
                 arg_strs = []
                 for a in task.arguments:
+                    prefix = a.variadic or ""
                     if a.default is not None:
-                        arg_strs.append(f'{a.name}="{a.default}"')
+                        arg_strs.append(f'{prefix}{a.name}="{a.default}"')
                     else:
-                        arg_strs.append(a.name)
+                        arg_strs.append(f"{prefix}{a.name}")
                 parts.append(f"args: {', '.join(arg_strs)}")
             if task.docker:
                 parts.append(f"docker:{task.docker.tag}")
@@ -217,7 +317,18 @@ def main(argv: list[str] | None = None) -> int:
         task_def = pf.tasks[target]
         task_args = {}
         for idx, arg_def in enumerate(task_def.arguments):
-            if idx < len(args.task_args):
+            if arg_def.variadic:
+                # Variadic: collect remaining args
+                remaining = args.task_args[idx:]
+                if arg_def.variadic == "+" and not remaining:
+                    print(
+                        f"error: task {target!r} requires at least one value for +{arg_def.name}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                task_args[arg_def.name] = " ".join(remaining)
+                break
+            elif idx < len(args.task_args):
                 task_args[arg_def.name] = args.task_args[idx]
             elif arg_def.default is not None:
                 task_args[arg_def.name] = arg_def.default
@@ -229,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
     # Run
-    runner = Runner(pf, dispatcher)
+    runner = Runner(pf, dispatcher, quiet=args.quiet)
     try:
         result = runner.run(target, args=task_args)
     except KeyError as e:

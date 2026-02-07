@@ -116,10 +116,12 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
     return ClaudeDispatcher(model=provider.model)
 
 
-def _load_dotenv(path: str | None = None) -> None:
+def _load_dotenv(path: str | None = None, required: bool = False) -> None:
     """Load a .env file into os.environ (simple key=value parser)."""
     env_path = Path(path) if path else Path(".env")
     if not env_path.is_file():
+        if required:
+            raise FileNotFoundError(f".env file not found: {env_path}")
         return
     for raw_line in env_path.read_text().splitlines():
         line = raw_line.strip()
@@ -139,10 +141,12 @@ def _load_dotenv(path: str | None = None) -> None:
 class Runner:
     """Executes tasks from a Promptfile using a Dispatcher."""
 
-    def __init__(self, pf: Promptfile, dispatcher: Dispatcher):
+    def __init__(self, pf: Promptfile, dispatcher: Dispatcher, *, quiet: bool = False):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
         self._dotenv_loaded = False
+        self._exports_applied = False
+        self.quiet = quiet  # global quiet from CLI or settings
 
     def _get_dispatcher(self, task: Task) -> Dispatcher:
         """Return the appropriate dispatcher for a task (per-task LLM > default)."""
@@ -154,12 +158,36 @@ class Runner:
     def _ensure_dotenv(self) -> None:
         """Load .env if ``set dotenv-load`` is enabled and not yet loaded."""
         if not self._dotenv_loaded and self.pf.settings.dotenv_load:
-            _load_dotenv()
+            _load_dotenv(
+                path=self.pf.settings.dotenv_path,
+                required=self.pf.settings.dotenv_required,
+            )
             self._dotenv_loaded = True
+
+    def _apply_exports(self) -> None:
+        """Export variables to os.environ."""
+        if self._exports_applied:
+            return
+        self._exports_applied = True
+        exported = self.pf.get_exported_env()
+        for key, value in exported.items():
+            os.environ.setdefault(key, value)
 
     def _resolve_working_dir(self, task: Task) -> str | None:
         """Return effective working directory for a task."""
+        if task.options.no_cd:
+            return None
         return task.options.working_dir or self.pf.settings.working_dir
+
+    def _should_echo(self, task: Task, step: TaskStep) -> bool:
+        """Return True if a command should be echoed before execution."""
+        if step.quiet:
+            return False
+        if task.options.no_quiet:
+            return True
+        if self.quiet or self.pf.settings.quiet:
+            return False
+        return True
 
     def _prompt_confirm(self, task: Task) -> bool:
         """Prompt user for confirmation if [confirm] is set. Returns True to proceed."""
@@ -179,6 +207,7 @@ class Runner:
     def run(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
         """Run a target task and all its dependencies."""
         self._ensure_dotenv()
+        self._apply_exports()
 
         if target is None:
             target = self.pf.default_task
@@ -253,7 +282,7 @@ class Runner:
 
         for step in resolved_steps:
             if step.kind == "shell":
-                sr = self._run_shell_step(step, working_dir=working_dir)
+                sr = self._run_shell_step(step, task=task, working_dir=working_dir)
             else:
                 sr = self._run_prompt_step(step, task, dispatcher)
 
@@ -262,6 +291,8 @@ class Runner:
 
             if not sr.success:
                 success = False
+                if not task.options.no_exit_message:
+                    pass  # normal error reporting
                 break
 
         return TaskResult(
@@ -314,18 +345,47 @@ class Runner:
             step_results=step_results,
         )
 
-    def _run_shell_step(self, step: TaskStep, working_dir: str | None = None) -> StepResult:
+    def _run_shell_step(
+        self,
+        step: TaskStep,
+        task: Task | None = None,
+        working_dir: str | None = None,
+    ) -> StepResult:
         """Execute a shell command locally."""
         shell_exe = self.pf.settings.shell or None
+        cmd = step.content
+
+        # Strip inline comments if ignore-comments is set
+        if self.pf.settings.ignore_comments and "#" in cmd:
+            # Naive comment stripping — don't strip inside quotes
+            in_single = False
+            in_double = False
+            for ci, ch in enumerate(cmd):
+                if ch == "'" and not in_double:
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    in_double = not in_double
+                elif ch == "#" and not in_single and not in_double:
+                    cmd = cmd[:ci].rstrip()
+                    break
+
+        # Build environment with exported vars
+        env = None
+        exported = self.pf.get_exported_env()
+        if exported:
+            env = dict(os.environ)
+            env.update(exported)
+
         try:
             proc = subprocess.run(
-                step.content,
+                cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
                 timeout=120,
                 cwd=working_dir,
                 executable=shell_exe,
+                env=env,
             )
             output = proc.stdout
             if proc.stderr:

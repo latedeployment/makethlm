@@ -1451,3 +1451,436 @@ class TestTaskOptionsMerge:
         override = TaskOptions(confirm="Are you sure?")
         merged = base.merge(override)
         assert merged.confirm == "Are you sure?"
+
+
+# ---------------------------------------------------------------------------
+# Extended set directives (Justfile-compatible)
+# ---------------------------------------------------------------------------
+
+class TestExtendedSetDirectives:
+    def test_set_export(self):
+        pf = parse("""\
+set export
+
+project := "myapp"
+
+task build:
+    build it
+""")
+        assert pf.settings.export is True
+
+    def test_set_positional_arguments(self):
+        pf = parse("""\
+set positional-arguments
+
+task build:
+    build it
+""")
+        assert pf.settings.positional_arguments is True
+
+    def test_set_fallback(self):
+        pf = parse("""\
+set fallback
+
+task build:
+    build it
+""")
+        assert pf.settings.fallback is True
+
+    def test_set_ignore_comments(self):
+        pf = parse("""\
+set ignore-comments
+
+task build:
+    build it
+""")
+        assert pf.settings.ignore_comments is True
+
+    def test_set_tempdir(self):
+        pf = parse("""\
+set tempdir "/tmp/pf"
+
+task build:
+    build it
+""")
+        assert pf.settings.tempdir == "/tmp/pf"
+
+    def test_set_quiet(self):
+        pf = parse("""\
+set quiet
+
+task build:
+    build it
+""")
+        assert pf.settings.quiet is True
+
+    def test_set_allow_duplicate_tasks(self):
+        pf = parse("""\
+set allow-duplicate-tasks
+
+task build:
+    build v1
+
+task build:
+    build v2
+""")
+        assert pf.settings.allow_duplicate_tasks is True
+        # Second definition wins
+        assert "v2" in pf.tasks["build"].prompt
+
+    def test_set_dotenv_path(self):
+        pf = parse("""\
+set dotenv-path ".env.local"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_path == ".env.local"
+
+    def test_set_dotenv_required(self):
+        pf = parse("""\
+set dotenv-required
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_required is True
+
+
+# ---------------------------------------------------------------------------
+# Export variables
+# ---------------------------------------------------------------------------
+
+class TestExportVariables:
+    def test_export_variable(self):
+        pf = parse("""\
+export API_KEY := "secret123"
+
+task build:
+    build with {{API_KEY}}
+""")
+        assert pf.variables["API_KEY"] == "secret123"
+        assert "API_KEY" in pf.exported_vars
+
+    def test_export_bare_marks_exported(self):
+        pf = parse("""\
+MY_VAR := "value"
+export MY_VAR
+
+task build:
+    build it
+""")
+        assert "MY_VAR" in pf.exported_vars
+
+    def test_export_with_set_export(self):
+        pf = parse("""\
+set export
+
+project := "myapp"
+version := "1.0"
+
+task build:
+    build it
+""")
+        exported = pf.get_exported_env()
+        assert exported == {"project": "myapp", "version": "1.0"}
+
+    def test_export_only_marked(self):
+        pf = parse("""\
+project := "myapp"
+export secret := "key123"
+
+task build:
+    build it
+""")
+        exported = pf.get_exported_env()
+        assert "secret" in exported
+        assert "project" not in exported
+
+
+# ---------------------------------------------------------------------------
+# String concatenation
+# ---------------------------------------------------------------------------
+
+class TestStringConcatenation:
+    def test_concat_quoted_strings(self):
+        pf = parse("""\
+full := "hello" + "-" + "world"
+
+task show:
+    value is {{full}}
+""")
+        assert pf.variables["full"] == "hello-world"
+
+    def test_concat_with_variable(self):
+        pf = parse("""\
+name := "app"
+full := "my-" + name + "-v1"
+
+task show:
+    value is {{full}}
+""")
+        assert pf.variables["full"] == "my-app-v1"
+
+
+# ---------------------------------------------------------------------------
+# If/else expressions
+# ---------------------------------------------------------------------------
+
+class TestIfElseExpressions:
+    def test_if_else_in_variable(self):
+        pf = parse("""\
+mode := "production"
+greeting := if mode == "production" { "deploy carefully" } else { "test freely" }
+
+task show:
+    {{greeting}}
+""")
+        assert pf.variables["greeting"] == "deploy carefully"
+
+    def test_if_else_not_equal(self):
+        pf = parse("""\
+mode := "dev"
+msg := if mode != "production" { "testing" } else { "deploying" }
+
+task show:
+    {{msg}}
+""")
+        assert pf.variables["msg"] == "testing"
+
+    def test_if_else_in_template(self):
+        pf = parse("""\
+env := "prod"
+
+task show:
+    {{if env == "prod" { "production mode" } else { "dev mode" }}}
+""")
+        resolved = pf.resolve_prompt("show")
+        assert "production mode" in resolved
+
+    def test_if_else_else_branch(self):
+        pf = parse("""\
+mode := "dev"
+msg := if mode == "production" { "careful" } else { "fast" }
+
+task show:
+    {{msg}}
+""")
+        assert pf.variables["msg"] == "fast"
+
+
+# ---------------------------------------------------------------------------
+# Built-in functions
+# ---------------------------------------------------------------------------
+
+class TestBuiltinFunctions:
+    def test_os_function(self):
+        import platform
+        pf = parse("""\
+task show:
+    running on {{os()}}
+""")
+        resolved = pf.resolve_prompt("show")
+        expected_os = {"linux": "linux", "darwin": "macos", "windows": "windows"}.get(
+            platform.system().lower(), platform.system().lower()
+        )
+        assert expected_os in resolved
+
+    def test_arch_function(self):
+        import platform
+        pf = parse("""\
+task show:
+    arch is {{arch()}}
+""")
+        resolved = pf.resolve_prompt("show")
+        assert platform.machine() in resolved
+
+    def test_num_cpus_function(self):
+        import os
+        pf = parse("""\
+task show:
+    cpus: {{num_cpus()}}
+""")
+        resolved = pf.resolve_prompt("show")
+        assert str(os.cpu_count()) in resolved
+
+    def test_home_directory_function(self):
+        pf = parse("""\
+task show:
+    home: {{home_directory()}}
+""")
+        resolved = pf.resolve_prompt("show")
+        assert os.path.expanduser("~") in resolved
+
+
+# ---------------------------------------------------------------------------
+# Variadic arguments
+# ---------------------------------------------------------------------------
+
+class TestVariadicArguments:
+    def test_plus_variadic(self):
+        pf = parse("""\
+task greet(+names):
+    say hello to {{names}}
+""")
+        assert pf.tasks["greet"].arguments[0].variadic == "+"
+        assert pf.tasks["greet"].arguments[0].name == "names"
+
+    def test_star_variadic(self):
+        pf = parse("""\
+task greet(*names):
+    say hello to {{names}}
+""")
+        assert pf.tasks["greet"].arguments[0].variadic == "*"
+        assert pf.tasks["greet"].arguments[0].name == "names"
+
+    def test_mixed_args_and_variadic(self):
+        pf = parse("""\
+task deploy(target, +files):
+    deploy {{files}} to {{target}}
+""")
+        assert pf.tasks["deploy"].arguments[0].name == "target"
+        assert pf.tasks["deploy"].arguments[0].variadic is None
+        assert pf.tasks["deploy"].arguments[1].name == "files"
+        assert pf.tasks["deploy"].arguments[1].variadic == "+"
+
+
+# ---------------------------------------------------------------------------
+# Bare OS attributes
+# ---------------------------------------------------------------------------
+
+class TestBareOsAttributes:
+    def test_linux_attribute(self):
+        pf = parse("""\
+task build [linux]:
+    linux only
+""")
+        assert pf.tasks["build"].options.os_filter == "linux"
+
+    def test_macos_attribute(self):
+        pf = parse("""\
+task build [macos]:
+    macos only
+""")
+        assert pf.tasks["build"].options.os_filter == "macos"
+
+    def test_unix_attribute(self):
+        pf = parse("""\
+task build [unix]:
+    unix only
+""")
+        assert pf.tasks["build"].options.os_filter == "unix"
+
+    def test_unix_matches_linux(self):
+        from promptfile.models import TaskOptions
+        import platform
+        opts = TaskOptions(os_filter="unix")
+        if platform.system().lower() in ("linux", "darwin"):
+            assert opts.should_skip_for_os() is False
+        else:
+            assert opts.should_skip_for_os() is True
+
+
+# ---------------------------------------------------------------------------
+# no-cd, no-exit-message, no-quiet attributes
+# ---------------------------------------------------------------------------
+
+class TestNewAttributes:
+    def test_no_cd(self):
+        pf = parse("""\
+task build [no-cd]:
+    build it
+""")
+        assert pf.tasks["build"].options.no_cd is True
+
+    def test_no_exit_message(self):
+        pf = parse("""\
+task build [no-exit-message]:
+    build it
+""")
+        assert pf.tasks["build"].options.no_exit_message is True
+
+    def test_no_quiet(self):
+        pf = parse("""\
+task build [no-quiet]:
+    build it
+""")
+        assert pf.tasks["build"].options.no_quiet is True
+
+    def test_positional_arguments_option(self):
+        pf = parse("""\
+task build [positional-arguments]:
+    build it
+""")
+        assert pf.tasks["build"].options.positional_arguments is True
+
+
+# ---------------------------------------------------------------------------
+# Underscore private convention
+# ---------------------------------------------------------------------------
+
+class TestUnderscorePrivate:
+    def test_underscore_prefix_is_private(self):
+        pf = parse("""\
+task _helper:
+    internal stuff
+
+task build:
+    build it
+""")
+        assert pf.tasks["_helper"].options.private is True
+        assert pf.tasks["build"].options.private is False
+
+
+# ---------------------------------------------------------------------------
+# Line continuation
+# ---------------------------------------------------------------------------
+
+class TestLineContinuation:
+    def test_backslash_continuation(self):
+        pf = parse("""\
+task build:
+    this is a long \\
+    prompt that continues
+""")
+        assert "long prompt that continues" in pf.tasks["build"].prompt
+
+    def test_variable_continuation(self):
+        pf = parse("""\
+greeting := "hello" + \\
+    " world"
+
+task show:
+    {{greeting}}
+""")
+        assert pf.variables["greeting"] == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# Single-quoted strings
+# ---------------------------------------------------------------------------
+
+class TestSingleQuotedStrings:
+    def test_single_quoted_variable(self):
+        pf = parse("""\
+name := 'hello world'
+
+task show:
+    {{name}}
+""")
+        assert pf.variables["name"] == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# Quiet prefix
+# ---------------------------------------------------------------------------
+
+class TestQuietPrefix:
+    def test_at_quiet_prefix(self):
+        pf = parse("""\
+task build:
+    !@echo hello
+""")
+        step = pf.tasks["build"].steps[0]
+        assert step.quiet is True
+        assert step.content == "echo hello"

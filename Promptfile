@@ -14,9 +14,14 @@
 
 set dotenv-load
 set shell "/bin/bash"
+set export
+set ignore-comments
 
 project := "my-web-app"
 env := "staging"
+export API_URL := "https://api.example.com"
+tag := "v" + "1" + ".0"
+deploy_msg := if env == "staging" { "deploying to staging" } else { "deploying to prod" }
 
 # --------------------------------------------------------------------------
 # LLM Providers — select globally, override per-task
@@ -110,8 +115,18 @@ task _internal [private]:
     internal maintenance routine.
 
 # Dangerous deploy requires confirmation
-task prod-deploy(target): build test [confirm=Really deploy to production?, os=linux]:
+task prod-deploy(target): build test [confirm=Really deploy to production?, linux]:
     deploy {{project}} to {{target}} in production mode.
+    running on {{os()}} / {{arch()}}
+
+# Greet multiple people (variadic argument)
+task greet(+names):
+    say hello to {{names}}, you're on {{os()}} with {{num_cpus()}} cpus
+
+# Linux-only task using bare OS attribute
+task systemd-check [linux, no-exit-message]:
+    !systemctl status myapp
+    verify the service is healthy
 
 # --------------------------------------------------------------------------
 # Aliases — short names for common tasks
