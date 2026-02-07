@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from promptfile.parser import parse, ParseError
+from justprompt.parser import parse, ParseError
 
 
 # ---------------------------------------------------------------------------
@@ -1404,13 +1404,13 @@ task secret [private, model=haiku]:
 
 class TestOsFilter:
     def test_no_filter_never_skips(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         opts = TaskOptions()
         assert opts.should_skip_for_os() is False
 
     def test_matching_os_does_not_skip(self):
         import platform
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         current = platform.system().lower()
         # Map back to our naming
         reverse_map = {"linux": "linux", "darwin": "macos", "windows": "windows"}
@@ -1419,7 +1419,7 @@ class TestOsFilter:
         assert opts.should_skip_for_os() is False
 
     def test_non_matching_os_skips(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         # Use a platform that definitely won't match
         opts = TaskOptions(os_filter="freebsd")
         assert opts.should_skip_for_os() is True
@@ -1431,7 +1431,7 @@ class TestOsFilter:
 
 class TestTaskOptionsMerge:
     def test_merge_basic(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         base = TaskOptions(model="base-model", group="ci")
         override = TaskOptions(model="new-model")
         merged = base.merge(override)
@@ -1439,14 +1439,14 @@ class TestTaskOptionsMerge:
         assert merged.group == "ci"
 
     def test_merge_private(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         base = TaskOptions(private=False)
         override = TaskOptions(private=True)
         merged = base.merge(override)
         assert merged.private is True
 
     def test_merge_confirm(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         base = TaskOptions(confirm=False)
         override = TaskOptions(confirm="Are you sure?")
         merged = base.merge(override)
@@ -1772,7 +1772,7 @@ task build [unix]:
         assert pf.tasks["build"].options.os_filter == "unix"
 
     def test_unix_matches_linux(self):
-        from promptfile.models import TaskOptions
+        from justprompt.models import TaskOptions
         import platform
         opts = TaskOptions(os_filter="unix")
         if platform.system().lower() in ("linux", "darwin"):

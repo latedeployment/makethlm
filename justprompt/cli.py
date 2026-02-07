@@ -1,4 +1,4 @@
-"""CLI entry point for promptfile."""
+"""CLI entry point for justprompt."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def find_promptfile(directory: Path | None = None, *, fallback: bool = False) ->
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="promptfile",
+        prog="justprompt",
         description="A task runner where tasks are LLM prompts.",
     )
     ap.add_argument(

@@ -1,12 +1,12 @@
-# Promptfile
+# justprompt
 
 **A task runner where tasks are LLM prompts.**
 
-[![PyPI version](https://img.shields.io/pypi/v/promptfile)](https://pypi.org/project/promptfile/)
+[![PyPI version](https://img.shields.io/pypi/v/justprompt)](https://pypi.org/project/justprompt/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Promptfile is a command-line task runner in the tradition of Make and Just, but
+justprompt is a command-line task runner in the tradition of Make and Just, but
 designed for a world where tasks are described in natural language and executed
 by LLMs. Define your build, deploy, review, and maintenance workflows as
 prose, interleave them with shell commands, and let your LLM of choice do the
@@ -26,7 +26,7 @@ task build:
 
 task test: build:
     !npm test
-    if any tests failed, explain the root cause and suggest a fix.
+    if any tests failed, explain the root cause and suggest/apply a fix.
 
 task deploy(target, port="8080"): build test:
     !systemctl restart {{project}}
@@ -34,7 +34,7 @@ task deploy(target, port="8080"): build test:
 ```
 
 ```
-$ promptfile deploy staging
+$ justprompt deploy staging
 [ok] build
   ...
 [ok] test
@@ -47,7 +47,7 @@ $ promptfile deploy staging
 
 ## Table of Contents
 
-- [Why Promptfile?](#why-promptfile)
+- [Why justprompt?](#why-justprompt)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
@@ -73,14 +73,14 @@ $ promptfile deploy staging
 
 ---
 
-## Why Promptfile?
+## Why justprompt?
 
 Modern development workflows increasingly rely on LLMs for code review,
 documentation, refactoring, and operational reasoning. But invoking an LLM from
 a script usually means gluing together shell commands, API calls, prompt
 templates, and ad hoc variable substitution.
 
-Promptfile gives these workflows a proper home. It provides:
+justprompt gives these workflows a proper home. It provides:
 
 - A **declarative file format** purpose-built for LLM-driven tasks.
 - **Shell interleaving** so you can mix `npm test` with "explain the failures."
@@ -94,12 +94,12 @@ Promptfile gives these workflows a proper home. It provides:
 ## Installation
 
 ```bash
-pip install promptfile
+pip install justprompt
 ```
 
 Requires Python 3.10 or newer.
 
-By default, Promptfile uses the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) as its LLM backend. Make sure it is installed and authenticated:
+By default, justprompt uses the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) as its LLM backend. Make sure it is installed and authenticated:
 
 ```bash
 claude --version
@@ -125,32 +125,32 @@ task review:
 2. **Run it:**
 
 ```bash
-promptfile review
+justprompt review
 ```
 
 3. **Or just run the default** (the first task defined):
 
 ```bash
-promptfile
+justprompt
 ```
 
 4. **Preview without executing:**
 
 ```bash
-promptfile --dry-run review
+justprompt --dry-run review
 ```
 
 5. **List all tasks:**
 
 ```bash
-promptfile --list
+justprompt --list
 ```
 
 ---
 
 ## How It Works
 
-When you run `promptfile <task>`, the following happens:
+When you run `justprompt <task>`, the following happens:
 
 ```
                        Promptfile
@@ -256,7 +256,7 @@ task release:
 Variables can be overridden from the CLI with `--var` / `-V`:
 
 ```bash
-promptfile deploy -V env=production
+justprompt deploy -V env=production
 ```
 
 ### Tasks
@@ -273,7 +273,7 @@ task build:
 ```
 
 The **first task** defined in the file is the **default task**. Running
-`promptfile` with no arguments executes it.
+`justprompt` with no arguments executes it.
 
 Consecutive lines of natural language are merged into a single prompt and sent
 to the LLM together. Shell commands (lines starting with `!`) break prompt
@@ -308,7 +308,7 @@ task d: b c:
     do d
 ```
 
-Running `promptfile d` executes: `a`, then `b` and `c` (in dependency order),
+Running `justprompt d` executes: `a`, then `b` and `c` (in dependency order),
 then `d`.
 
 ### Task Arguments
@@ -323,13 +323,13 @@ task deploy(target, port="8080"):
 Pass arguments on the command line after the task name:
 
 ```bash
-promptfile deploy staging        # target=staging, port=8080 (default)
-promptfile deploy prod 443       # target=prod, port=443
+justprompt deploy staging        # target=staging, port=8080 (default)
+justprompt deploy prod 443       # target=prod, port=443
 ```
 
 Arguments are interpolated into both prompt text and shell commands via the
 same `{{name}}` syntax as variables. If a required argument (one without a
-default) is not provided, Promptfile exits with an error.
+default) is not provided, justprompt exits with an error.
 
 Arguments are **scoped to the target task** -- they are not passed to
 dependency tasks.
@@ -362,7 +362,7 @@ task clean:
 ```
 
 Shell commands and LLM prompts can be **freely interleaved** in a single task.
-This is one of Promptfile's defining features -- run a command, reason about
+This is one of justprompt's defining features -- run a command, reason about
 its output, run another command:
 
 ```
@@ -420,7 +420,7 @@ Functions cannot themselves contain `@use` (no recursive expansion).
 ### Docker Support
 
 The `docker` block lets you describe a Docker image in natural language. The
-LLM generates a Dockerfile, and Promptfile builds it automatically.
+LLM generates a Dockerfile, and justprompt builds it automatically.
 
 ```
 docker api-server [tag=latest]:
@@ -432,7 +432,7 @@ docker api-server [tag=latest]:
     Run with gunicorn, 4 workers, binding 0.0.0.0:8080.
 ```
 
-Running `promptfile api-server` will:
+Running `justprompt api-server` will:
 
 1. Send the description to the LLM with instructions to output a raw Dockerfile.
 2. Write the generated Dockerfile to the configured path.
@@ -465,7 +465,7 @@ task deploy: api:
 
 ### LLM Provider Selection
 
-Promptfile supports multiple LLM providers. Declare them globally and
+justprompt supports multiple LLM providers. Declare them globally and
 optionally override per task.
 
 ```
@@ -512,18 +512,18 @@ task lint [llm=openai]:
 You can also override the model from the CLI:
 
 ```bash
-promptfile review --model sonnet
+justprompt review --model sonnet
 ```
 
 Or bypass all configured providers and use an arbitrary CLI:
 
 ```bash
-promptfile review --shell 'ollama run llama3 "{prompt}"'
+justprompt review --shell 'ollama run llama3 "{prompt}"'
 ```
 
 ### Host Inventory (SSH)
 
-Promptfile includes an Ansible-like host inventory for running shell commands
+justprompt includes an Ansible-like host inventory for running shell commands
 on remote machines via SSH.
 
 **Define host groups:**
@@ -771,9 +771,9 @@ task greet(*names):
 ```
 
 ```bash
-promptfile deploy staging prod     # targets="staging prod"
-promptfile greet alice bob         # names="alice bob"
-promptfile greet                   # names="" (ok for *)
+justprompt deploy staging prod     # targets="staging prod"
+justprompt greet alice bob         # names="alice bob"
+justprompt greet                   # names="" (ok for *)
 ```
 
 ### Line Continuation
@@ -796,14 +796,14 @@ alias t := test
 alias r := review
 ```
 
-After defining an alias, `promptfile d` is equivalent to `promptfile deploy`.
+After defining an alias, `justprompt d` is equivalent to `justprompt deploy`.
 
 ---
 
 ## CLI Reference
 
 ```
-promptfile [OPTIONS] [TASK] [ARGS...]
+justprompt [OPTIONS] [TASK] [ARGS...]
 ```
 
 **Positional arguments:**
@@ -833,38 +833,38 @@ promptfile [OPTIONS] [TASK] [ARGS...]
 
 ```bash
 # Run the default task
-promptfile
+justprompt
 
 # Run a specific task
-promptfile deploy
+justprompt deploy
 
 # Run with arguments
-promptfile deploy staging 443
+justprompt deploy staging 443
 
 # Override a variable
-promptfile deploy -V env=production
+justprompt deploy -V env=production
 
 # Preview what would happen
-promptfile --dry-run deploy staging
+justprompt --dry-run deploy staging
 
 # Use a different model
-promptfile review -m sonnet
+justprompt review -m sonnet
 
 # Use a different Promptfile
-promptfile -f ops/Promptfile.pf deploy
+justprompt -f ops/Promptfile.pf deploy
 
 # Use any LLM CLI
-promptfile review --shell 'ollama run llama3 "{prompt}"'
+justprompt review --shell 'ollama run llama3 "{prompt}"'
 
 # List everything
-promptfile --list
+justprompt --list
 ```
 
 **`--list` output** includes tasks (with dependencies, arguments, options),
 functions, LLM providers (with the default marked), and host groups:
 
 ```
-$ promptfile --list
+$ justprompt --list
   build
     check if moo.md is newer than the Dockerfile...
   test (depends: build)
@@ -891,7 +891,7 @@ $ promptfile --list
 
 ## Comparison with Make and Just
 
-| Feature | Make | Just | Promptfile |
+| Feature | Make | Just | justprompt |
 |---------|------|------|------------|
 | Task definitions | Targets with recipes | Recipes with commands | Tasks with prompts + commands |
 | Task body language | Shell commands | Shell commands | Natural language + shell |
@@ -1029,28 +1029,28 @@ Run it:
 
 ```bash
 # Build and test (default)
-promptfile
+justprompt
 
 # Deploy to staging on port 8080
-promptfile deploy staging
+justprompt deploy staging
 
 # Deploy to production on port 443
-promptfile deploy prod 443
+justprompt deploy prod 443
 
 # Security review with dry run
-promptfile --dry-run review
+justprompt --dry-run review
 
 # Build the Docker image
-promptfile api-server
+justprompt api-server
 
 # Backup databases
-promptfile backup
+justprompt backup
 
 # Override env from CLI
-promptfile deploy staging -V env=production
+justprompt deploy staging -V env=production
 
 # List everything
-promptfile --list
+justprompt --list
 ```
 
 ---

@@ -1,7 +1,7 @@
 """Tests for dispatchers."""
 
-from promptfile.dispatcher import DryRunDispatcher
-from promptfile.models import Task, TaskStep, TaskOptions
+from justprompt.dispatcher import DryRunDispatcher
+from justprompt.models import Task, TaskStep, TaskOptions
 
 
 class TestDryRunDispatcher:

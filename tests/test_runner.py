@@ -7,10 +7,10 @@ from unittest.mock import patch
 
 import pytest
 
-from promptfile.parser import parse
-from promptfile.runner import Runner, StepResult, topological_sort, CycleError
-from promptfile.dispatcher import DryRunDispatcher
-from promptfile.models import TaskStep
+from justprompt.parser import parse
+from justprompt.runner import Runner, StepResult, topological_sort, CycleError
+from justprompt.dispatcher import DryRunDispatcher
+from justprompt.models import TaskStep
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ task deploy: myapp:
         mock_result = subprocess.CompletedProcess(args="docker build", returncode=0, stdout="built\n", stderr="")
         with tempfile.TemporaryDirectory() as tmpdir:
             pf.tasks["myapp"].docker.context = tmpdir
-            with patch("promptfile.runner.subprocess.run", return_value=mock_result):
+            with patch("justprompt.runner.subprocess.run", return_value=mock_result):
                 result = runner.run("deploy")
 
         names = [tr.task_name for tr in result.task_results]
@@ -506,7 +506,7 @@ task deploy [on=web]:
         mock_result = subprocess.CompletedProcess(
             args="ssh", returncode=0, stdout="up 5 days\n", stderr=""
         )
-        with patch("promptfile.runner.subprocess.run", return_value=mock_result):
+        with patch("justprompt.runner.subprocess.run", return_value=mock_result):
             result = runner.run("deploy")
 
         assert result.success
@@ -519,8 +519,8 @@ task deploy [on=web]:
         assert sr[1].host == "host2"
 
     def test_ssh_builds_correct_command(self):
-        from promptfile.runner import _build_ssh_command
-        from promptfile.models import HostGroup
+        from justprompt.runner import _build_ssh_command
+        from justprompt.models import HostGroup
 
         group = HostGroup(name="web", hosts=["h1"], user="deploy", port=2222)
         cmd = _build_ssh_command("h1", "uptime", group)
@@ -530,8 +530,8 @@ task deploy [on=web]:
         assert "uptime" in cmd
 
     def test_ssh_without_user(self):
-        from promptfile.runner import _build_ssh_command
-        from promptfile.models import HostGroup
+        from justprompt.runner import _build_ssh_command
+        from justprompt.models import HostGroup
 
         group = HostGroup(name="web", hosts=["h1"])
         cmd = _build_ssh_command("h1", "ls", group)
@@ -553,7 +553,7 @@ task check [on=web]:
         mock_result = subprocess.CompletedProcess(
             args="ssh", returncode=0, stdout="up\n", stderr=""
         )
-        with patch("promptfile.runner.subprocess.run", return_value=mock_result):
+        with patch("justprompt.runner.subprocess.run", return_value=mock_result):
             result = runner.run("check")
 
         assert result.success
@@ -576,7 +576,7 @@ task deploy [on=web]:
         mock_result = subprocess.CompletedProcess(
             args="ssh", returncode=1, stdout="", stderr="failed\n"
         )
-        with patch("promptfile.runner.subprocess.run", return_value=mock_result):
+        with patch("justprompt.runner.subprocess.run", return_value=mock_result):
             result = runner.run("deploy")
 
         assert not result.success

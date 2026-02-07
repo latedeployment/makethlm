@@ -3,14 +3,14 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "promptfile"
+name = "justprompt"
 version = "0.1.0"
 description = "A Justfile/Makefile for LLM prompts — define tasks as natural language, run them with any LLM."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Promptfile Contributors"},
+    {name = "justprompt Contributors"},
 ]
 keywords = ["llm", "task-runner", "makefile", "justfile", "ai", "prompt", "cli", "automation"]
 classifiers = [
@@ -30,15 +30,15 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/promptfile/promptfile"
-Repository = "https://github.com/promptfile/promptfile"
-Issues = "https://github.com/promptfile/promptfile/issues"
+Homepage = "https://github.com/justprompt/justprompt"
+Repository = "https://github.com/justprompt/justprompt"
+Issues = "https://github.com/justprompt/justprompt/issues"
 
 [project.scripts]
-promptfile = "promptfile.cli:main"
+justprompt = "justprompt.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["promptfile*"]
+include = ["justprompt*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
