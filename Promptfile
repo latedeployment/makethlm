@@ -1,0 +1,149 @@
+# ==========================================================================
+# Example Promptfile — a task runner where tasks are LLM prompts
+#
+# Usage:
+#   promptfile build                    # build the project
+#   promptfile deploy staging           # deploy with args
+#   promptfile --dry-run deploy prod    # preview what would run
+#   promptfile --list                   # list tasks, functions, hosts, llms
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+
+set dotenv-load
+set shell "/bin/bash"
+set export
+set ignore-comments
+
+project := "my-web-app"
+env := "staging"
+export API_URL := "https://api.example.com"
+tag := "v" + "1" + ".0"
+deploy_msg := if env == "staging" { "deploying to staging" } else { "deploying to prod" }
+
+# --------------------------------------------------------------------------
+# LLM Providers — select globally, override per-task
+# --------------------------------------------------------------------------
+
+llm claude [model=opus]
+llm openai [model=gpt-4, key=$OPENAI_API_KEY]
+llm ollama [model=llama3, base_url=http://localhost:11434]
+
+# --------------------------------------------------------------------------
+# Host Inventory — Ansible-like, tasks run via SSH
+# --------------------------------------------------------------------------
+
+hosts web [user=deploy]:
+    web1.prod.internal
+    web2.prod.internal
+    web3.prod.internal
+
+hosts db [user=postgres, port=5433]:
+    db-primary.prod.internal
+    db-replica.prod.internal
+
+# --------------------------------------------------------------------------
+# Functions — reusable prompt templates, referenced with @use
+# --------------------------------------------------------------------------
+
+fn security_review:
+    Review the code for security vulnerabilities.
+    Check specifically for:
+    - SQL injection
+    - XSS (cross-site scripting)
+    - Command injection
+    - Path traversal
+    Be concise and actionable.
+
+fn code_quality:
+    Check for code quality issues:
+    - Functions longer than 50 lines
+    - Duplicated logic
+    - Missing error handling
+    - Poor naming
+
+# --------------------------------------------------------------------------
+# Tasks — shell commands (!) interleaved with LLM prompts
+# --------------------------------------------------------------------------
+
+# Build: mix shell prep with an LLM check
+task build:
+    !mkdir -p dist
+    check if moo.md is newer than the Dockerfile.
+    if so, rebuild the docker image from scratch.
+    tag it as {{project}}:latest.
+
+# Run tests with shell, then ask LLM to analyze failures
+task test: build:
+    !@silent npm install
+    !npm test
+    if any tests failed, explain the root cause and suggest a fix.
+
+# Security review — uses opus for thoroughness
+task review [llm=claude, model=opus, temperature=0.1]:
+    @use security_review
+    Focus on the git diff for {{project}}.
+    !git diff --stat
+
+# Fast code quality check — uses a cheaper model
+task lint [llm=openai]:
+    @use code_quality
+    Apply to the src/ directory of {{project}}.
+
+# Deploy with arguments, runs on web hosts via SSH
+task deploy(target, port="8080"): build test [llm=openai, on=web]:
+    !systemctl restart {{project}}
+    verify {{project}} is running on {{target}} port {{port}}.
+    @use security_review
+
+# Database backup — runs on db hosts
+task backup [on=db]:
+    !pg_dump {{project}} > /tmp/{{project}}-backup.sql
+    !@silent gzip /tmp/{{project}}-backup.sql
+    verify the backup completed successfully.
+
+# Clean up with silent + ignore-error shell commands
+task clean [doc=Remove build artifacts, group=maintenance]:
+    !@silent rm -rf dist/
+    !@silent @ignore docker rmi {{project}}:latest
+    cleaned up build artifacts.
+
+# Private task — hidden from --list
+task _internal [private]:
+    internal maintenance routine.
+
+# Dangerous deploy requires confirmation
+task prod-deploy(target): build test [confirm=Really deploy to production?, linux]:
+    deploy {{project}} to {{target}} in production mode.
+    running on {{os()}} / {{arch()}}
+
+# Greet multiple people (variadic argument)
+task greet(+names):
+    say hello to {{names}}, you're on {{os()}} with {{num_cpus()}} cpus
+
+# Linux-only task using bare OS attribute
+task systemd-check [linux, no-exit-message]:
+    !systemctl status myapp
+    verify the service is healthy
+
+# --------------------------------------------------------------------------
+# Aliases — short names for common tasks
+# --------------------------------------------------------------------------
+
+alias b := build
+alias t := test
+alias d := deploy
+
+# --------------------------------------------------------------------------
+# Docker — describe the image, LLM generates the Dockerfile, then builds
+# --------------------------------------------------------------------------
+
+docker api-server [tag=latest]:
+    A Python 3.11 slim image.
+    Install requirements.txt with pip, no cache.
+    Copy the app/ directory to /app.
+    Set the working directory to /app.
+    Expose port 8080.
+    Run with gunicorn, 4 workers, binding 0.0.0.0:8080.
