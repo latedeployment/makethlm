@@ -1,25 +1,49 @@
 """Parser for the Promptfile format.
 
+Uses a line-by-line scanner (no regex hot-path) for speed and clarity.
+
 Syntax overview:
 
     # Comments
     project := "myapp"
+    include "common.pf"
+
+    llm claude [model=opus]
+    llm openai [model=gpt-4, key=$OPENAI_API_KEY]
+
+    hosts web [user=deploy, port=22]:
+        web1.example.com
+        web2.example.com
+
+    fn security_review:
+        Review code for security vulnerabilities.
 
     task build:
-        check if moo.md is newer, if so build docker from scratch
+        !mkdir -p dist
+        compile the project
 
-    task deploy: build
-        deploy {{project}} to production
+    task deploy(target, port="8080"): build [llm=openai, on=web]:
+        deploy {{project}} to {{target}} on port {{port}}
 
-    task review [model=opus, temperature=0.2]:
-        review the git diff for security issues
+    docker myapp [tag=latest]:
+        Python 3.11 slim image.
 """
 
 from __future__ import annotations
 
-import re
+import os
 
-from .models import Promptfile, Task, TaskOptions
+from .models import (
+    DockerConfig,
+    Function,
+    HostGroup,
+    LLMProvider,
+    Promptfile,
+    Task,
+    TaskArgument,
+    TaskOptions,
+    TaskStep,
+)
 
 
 class ParseError(Exception):
@@ -31,45 +55,34 @@ class ParseError(Exception):
         super().__init__(f"{prefix}{message}")
 
 
-# Patterns
-_COMMENT_RE = re.compile(r"^\s*#")
-_BLANK_RE = re.compile(r"^\s*$")
-_VARIABLE_RE = re.compile(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:=\s*"((?:[^"\\]|\\.)*)"\s*$')
-_TASK_RE = re.compile(
-    r"^task\s+"
-    r"([a-zA-Z_][a-zA-Z0-9_-]*)"  # task name
-    r"(?:\s*:\s*([a-zA-Z_][a-zA-Z0-9_\- ]*))?"  # optional dependencies after ':'
-    r"(?:\s*\[([^\]]*)\])?"  # optional [options]
-    r"\s*:\s*$"  # trailing colon
-)
-# Alternate: task with deps uses first colon for deps, but we need to
-# disambiguate "task name:" from "task name: dep1 dep2:".
-# Revised approach: the deps come after the name separated by colon,
-# options in brackets, then a final colon ends the header.
-#
-# Actually let's simplify. Two forms:
-#   task NAME:                          (no deps)
-#   task NAME: dep1 dep2:              (with deps — note trailing colon)
-#   task NAME [opts]:                   (no deps, with opts)
-#   task NAME: dep1 dep2 [opts]:       (deps + opts)
-#
-# The trailing colon is always required and marks end-of-header.
-# When deps are present, the first colon separates name from deps.
-#
-# Regex strategy: match greedily, then parse the interior.
+# ---------------------------------------------------------------------------
+# Low-level helpers (no regex)
+# ---------------------------------------------------------------------------
 
-_TASK_HEADER_RE = re.compile(
-    r"^task\s+([a-zA-Z_][a-zA-Z0-9_-]*)"  # 'task' keyword + name
-    r"(.*)"  # everything else
-    r":\s*$"  # must end with ':'
-)
-
-_OPTIONS_RE = re.compile(r"\[([^\]]*)\]")
+def _strip_trailing_colon(s: str) -> tuple[str, bool]:
+    """If s ends with ':', return (s[:-1].rstrip(), True), else (s, False)."""
+    stripped = s.rstrip()
+    if stripped.endswith(":"):
+        return stripped[:-1].rstrip(), True
+    return stripped, False
 
 
-def _parse_options(raw: str) -> TaskOptions:
-    """Parse a bracket-delimited options string like 'model=opus, temperature=0.2'."""
-    opts = TaskOptions()
+def _extract_brackets(s: str) -> tuple[str, str | None]:
+    """Extract [...] from a string. Returns (remaining, bracket_content | None)."""
+    start = s.find("[")
+    if start == -1:
+        return s, None
+    end = s.find("]", start)
+    if end == -1:
+        return s, None
+    bracket_content = s[start + 1 : end]
+    remaining = s[:start] + s[end + 1 :]
+    return remaining.strip(), bracket_content
+
+
+def _parse_kv_pairs(raw: str) -> dict[str, str]:
+    """Parse 'key=value, key2=value2' into a dict."""
+    result: dict[str, str] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
@@ -77,8 +90,14 @@ def _parse_options(raw: str) -> TaskOptions:
         if "=" not in pair:
             raise ParseError(f"invalid option (expected key=value): {pair!r}")
         key, value = pair.split("=", 1)
-        key = key.strip()
-        value = value.strip()
+        result[key.strip()] = value.strip()
+    return result
+
+
+def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
+    """Convert a key-value dict into TaskOptions."""
+    opts = TaskOptions()
+    for key, value in kvs.items():
         if key == "model":
             opts.model = value
         elif key == "temperature":
@@ -91,104 +110,381 @@ def _parse_options(raw: str) -> TaskOptions:
                 opts.max_tokens = int(value)
             except ValueError:
                 raise ParseError(f"max_tokens must be an integer, got {value!r}")
+        elif key == "llm":
+            opts.llm = value
+        elif key == "on":
+            opts.on = value
         else:
             raise ParseError(f"unknown option: {key!r}")
     return opts
 
 
-def parse(source: str, filename: str = "Promptfile") -> Promptfile:
+def _parse_docker_config(kvs: dict[str, str]) -> DockerConfig:
+    """Convert a key-value dict into DockerConfig."""
+    cfg = DockerConfig()
+    for key, value in kvs.items():
+        if key == "tag":
+            cfg.tag = value
+        elif key == "context":
+            cfg.context = value
+        elif key == "file":
+            cfg.file = value
+        else:
+            raise ParseError(f"unknown docker option: {key!r}")
+    return cfg
+
+
+def _parse_arguments(raw: str) -> list[TaskArgument]:
+    """Parse the inside of (arg1, arg2='default') into TaskArgument list."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    args: list[TaskArgument] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            name, default = part.split("=", 1)
+            name = name.strip()
+            default = default.strip().strip('"').strip("'")
+            args.append(TaskArgument(name=name, default=default))
+        else:
+            args.append(TaskArgument(name=part))
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Body collection
+# ---------------------------------------------------------------------------
+
+def _is_blank(line: str) -> bool:
+    return not line or line.isspace()
+
+
+def _is_indented(line: str) -> bool:
+    return len(line) > 0 and line[0] in (" ", "\t")
+
+
+def _collect_body(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Collect indented body lines from `start`. Returns (body_lines, next_index)."""
+    n = len(lines)
+    i = start
+    body: list[str] = []
+
+    while i < n:
+        line = lines[i]
+        if _is_blank(line):
+            # Include blank lines only if more indented lines follow
+            j = i + 1
+            while j < n and _is_blank(lines[j]):
+                j += 1
+            if j < n and _is_indented(lines[j]):
+                body.append("")
+                i += 1
+                continue
+            else:
+                break
+        elif _is_indented(line):
+            body.append(line)
+            i += 1
+        else:
+            break
+
+    return body, i
+
+
+def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
+    """Parse indented body lines into TaskSteps.
+
+    Lines starting with ! become shell steps.
+    Consecutive non-shell lines merge into a single prompt step.
+    """
+    steps: list[TaskStep] = []
+    prompt_accum: list[str] = []
+
+    def flush_prompt() -> None:
+        if prompt_accum:
+            text = "\n".join(prompt_accum).strip()
+            if text:
+                steps.append(TaskStep(kind="prompt", content=text))
+            prompt_accum.clear()
+
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if stripped.startswith("!"):
+            flush_prompt()
+            rest = stripped[1:]
+            # Parse @-prefixes
+            silent = False
+            ignore_error = False
+            while rest.startswith("@"):
+                space_idx = rest.find(" ")
+                if space_idx == -1:
+                    break
+                prefix = rest[:space_idx]
+                if prefix == "@silent":
+                    silent = True
+                elif prefix == "@ignore":
+                    ignore_error = True
+                rest = rest[space_idx + 1 :].lstrip()
+            steps.append(TaskStep(
+                kind="shell",
+                content=rest,
+                silent=silent,
+                ignore_error=ignore_error,
+            ))
+        else:
+            prompt_accum.append(stripped)
+
+    flush_prompt()
+    return steps
+
+
+# ---------------------------------------------------------------------------
+# Main parser — line scanner, no regex on hot path
+# ---------------------------------------------------------------------------
+
+def parse(
+    source: str,
+    filename: str = "Promptfile",
+    *,
+    _included: set[str] | None = None,
+    _base_dir: str | None = None,
+) -> Promptfile:
     """Parse a Promptfile source string into a Promptfile model."""
     pf = Promptfile()
     lines = source.split("\n")
     i = 0
     n = len(lines)
 
+    if _included is None:
+        _included = set()
+    abs_filename = os.path.abspath(filename)
+    _included.add(abs_filename)
+
+    if _base_dir is None:
+        _base_dir = os.path.dirname(abs_filename) or "."
+
     while i < n:
         line = lines[i]
-        lineno = i + 1  # 1-indexed for error messages
+        lineno = i + 1
+        stripped = line.strip()
 
         # Skip blanks and comments
-        if _BLANK_RE.match(line) or _COMMENT_RE.match(line):
+        if not stripped or stripped.startswith("#"):
             i += 1
             continue
 
-        # Try variable assignment
-        m = _VARIABLE_RE.match(line)
-        if m:
-            name, value = m.group(1), m.group(2)
-            # Unescape
-            value = value.replace('\\"', '"').replace("\\\\", "\\")
-            pf.variables[name] = value
+        # ----- include "path" -----
+        if stripped.startswith("include "):
+            rest = stripped[8:].strip()
+            if not (rest.startswith('"') and rest.endswith('"')):
+                raise ParseError(f"include path must be quoted: {rest!r}", lineno)
+            include_path = rest[1:-1]
+            resolved = os.path.normpath(os.path.join(_base_dir, include_path))
+            if resolved in _included:
+                raise ParseError(f"circular include: {include_path!r}", lineno)
+            try:
+                with open(resolved) as f:
+                    include_source = f.read()
+            except FileNotFoundError:
+                raise ParseError(f"included file not found: {include_path!r}", lineno)
+            included_pf = parse(
+                include_source, resolved,
+                _included=_included, _base_dir=os.path.dirname(resolved),
+            )
+            # Merge (included defs can be overridden by local)
+            for k, v in included_pf.variables.items():
+                pf.variables.setdefault(k, v)
+            for k, v in included_pf.functions.items():
+                pf.functions.setdefault(k, v)
+            for name in included_pf.task_order:
+                if name not in pf.tasks:
+                    pf.tasks[name] = included_pf.tasks[name]
+                    pf.task_order.append(name)
+            for k, v in included_pf.llm_providers.items():
+                pf.llm_providers.setdefault(k, v)
+            if included_pf.default_llm and not pf.default_llm:
+                pf.default_llm = included_pf.default_llm
+            for k, v in included_pf.host_groups.items():
+                pf.host_groups.setdefault(k, v)
             i += 1
             continue
 
-        # Try task header
-        m = _TASK_HEADER_RE.match(line)
-        if m:
-            task_name = m.group(1)
-            rest = m.group(2).strip()
-            # rest is everything between task name and the final ':'
-            # It may contain ': dep1 dep2 [opts]' or '[opts]' or ': dep1 dep2' or ''
+        # ----- variable := "value" -----
+        if ":=" in stripped:
+            eq_idx = stripped.index(":=")
+            var_name = stripped[:eq_idx].strip()
+            var_val_raw = stripped[eq_idx + 2 :].strip()
+            if not (var_val_raw.startswith('"') and var_val_raw.endswith('"')):
+                raise ParseError(f"variable value must be quoted: {var_val_raw!r}", lineno)
+            var_val = var_val_raw[1:-1]
+            var_val = var_val.replace('\\"', '"').replace("\\\\", "\\")
+            pf.variables[var_name] = var_val
+            i += 1
+            continue
 
+        # ----- llm <name> [opts] -----
+        if stripped.startswith("llm "):
+            rest = stripped[4:].strip()
+            rest, bracket = _extract_brackets(rest)
+            llm_name = rest.strip()
+            if not llm_name:
+                raise ParseError("llm declaration missing name", lineno)
+            llm_opts = _parse_kv_pairs(bracket) if bracket else {}
+            api_key = llm_opts.get("key")
+            if api_key and api_key.startswith("$"):
+                api_key = os.environ.get(api_key[1:], api_key)
+            provider = LLMProvider(
+                name=llm_name,
+                model=llm_opts.get("model"),
+                api_key=api_key,
+                base_url=llm_opts.get("base_url"),
+                shell_template=llm_opts.get("template"),
+            )
+            pf.llm_providers[llm_name] = provider
+            if pf.default_llm is None:
+                pf.default_llm = llm_name
+            i += 1
+            continue
+
+        # ----- hosts <name> [opts]: -----
+        if stripped.startswith("hosts "):
+            rest, has_colon = _strip_trailing_colon(stripped[6:])
+            if not has_colon:
+                raise ParseError("hosts block must end with ':'", lineno)
+            rest, bracket = _extract_brackets(rest)
+            group_name = rest.strip()
+            if not group_name:
+                raise ParseError("hosts declaration missing name", lineno)
+            host_kvs = _parse_kv_pairs(bracket) if bracket else {}
+            for k in host_kvs:
+                if k not in ("user", "port"):
+                    raise ParseError(f"unknown host option: {k!r}", lineno)
+            if group_name in pf.host_groups:
+                raise ParseError(f"duplicate host group: {group_name!r}", lineno)
+
+            i += 1
+            body_lines, i = _collect_body(lines, i)
+            host_list = [l.strip() for l in body_lines if l.strip()]
+            if not host_list:
+                raise ParseError(f"host group {group_name!r} has no hosts", lineno)
+
+            port = None
+            if "port" in host_kvs:
+                try:
+                    port = int(host_kvs["port"])
+                except ValueError:
+                    raise ParseError(f"port must be an integer", lineno)
+
+            pf.host_groups[group_name] = HostGroup(
+                name=group_name,
+                hosts=host_list,
+                user=host_kvs.get("user"),
+                port=port,
+                line_number=lineno,
+            )
+            continue
+
+        # ----- fn <name>: -----
+        if stripped.startswith("fn "):
+            rest, has_colon = _strip_trailing_colon(stripped[3:])
+            if not has_colon:
+                raise ParseError("fn block must end with ':'", lineno)
+            fn_name = rest.strip()
+            if not fn_name:
+                raise ParseError("fn declaration missing name", lineno)
+            if fn_name in pf.functions:
+                raise ParseError(f"duplicate function: {fn_name!r}", lineno)
+
+            i += 1
+            body_lines, i = _collect_body(lines, i)
+            body = "\n".join(l.strip() for l in body_lines).strip()
+            if not body:
+                raise ParseError(f"function {fn_name!r} has no body", lineno)
+            pf.functions[fn_name] = Function(name=fn_name, body=body, line_number=lineno)
+            continue
+
+        # ----- docker <name> [opts]: -----
+        if stripped.startswith("docker "):
+            rest, has_colon = _strip_trailing_colon(stripped[7:])
+            if not has_colon:
+                raise ParseError("docker block must end with ':'", lineno)
+            rest, bracket = _extract_brackets(rest)
+            docker_name = rest.strip()
+            if not docker_name:
+                raise ParseError("docker declaration missing name", lineno)
+            docker_cfg = _parse_docker_config(_parse_kv_pairs(bracket)) if bracket else DockerConfig()
+
+            if docker_name in pf.tasks:
+                raise ParseError(f"duplicate task/docker: {docker_name!r}", lineno)
+
+            i += 1
+            body_lines, i = _collect_body(lines, i)
+            description = "\n".join(l.strip() for l in body_lines).strip()
+            if not description:
+                raise ParseError(f"docker {docker_name!r} has no description", lineno)
+
+            task = Task(
+                name=docker_name,
+                steps=[TaskStep(kind="prompt", content=description)],
+                docker=docker_cfg,
+                line_number=lineno,
+            )
+            pf.tasks[docker_name] = task
+            pf.task_order.append(docker_name)
+            continue
+
+        # ----- task <name>[(args)] [: deps] [opts]: -----
+        if stripped.startswith("task "):
+            rest, has_colon = _strip_trailing_colon(stripped[5:])
+            if not has_colon:
+                raise ParseError("task header must end with ':'", lineno)
+
+            # Extract arguments (...)
+            arguments: list[TaskArgument] = []
+            paren_start = rest.find("(")
+            if paren_start != -1:
+                paren_end = rest.find(")", paren_start)
+                if paren_end == -1:
+                    raise ParseError("unclosed parenthesis in task header", lineno)
+                arguments = _parse_arguments(rest[paren_start + 1 : paren_end])
+                rest = rest[:paren_start] + rest[paren_end + 1 :]
+
+            # Extract [options]
+            rest, bracket = _extract_brackets(rest)
+            options = _parse_task_options(_parse_kv_pairs(bracket)) if bracket else TaskOptions()
+
+            # What remains: "name" or "name: dep1 dep2"
+            rest = rest.strip()
             deps: list[str] = []
-            options = TaskOptions()
-
-            # Extract options if present
-            opt_match = _OPTIONS_RE.search(rest)
-            if opt_match:
-                options = _parse_options(opt_match.group(1))
-                rest = rest[: opt_match.start()] + rest[opt_match.end() :]
-                rest = rest.strip()
-
-            # What remains could be ': dep1 dep2' or empty
-            if rest.startswith(":"):
-                dep_str = rest[1:].strip()
+            if ":" in rest:
+                colon_idx = rest.index(":")
+                task_name = rest[:colon_idx].strip()
+                dep_str = rest[colon_idx + 1 :].strip()
                 if dep_str:
                     deps = dep_str.split()
-            elif rest:
-                raise ParseError(
-                    f"unexpected content in task header: {rest!r}", lineno
-                )
+            else:
+                task_name = rest.strip()
 
+            if not task_name:
+                raise ParseError("task declaration missing name", lineno)
             if task_name in pf.tasks:
                 raise ParseError(f"duplicate task: {task_name!r}", lineno)
 
-            # Collect indented prompt lines
             i += 1
-            prompt_lines: list[str] = []
-            while i < n:
-                pline = lines[i]
-                # Prompt lines must be indented (start with whitespace)
-                # and we stop at blank-then-non-indented or non-indented
-                if _BLANK_RE.match(pline):
-                    # Blank line — include it if more indented lines follow
-                    # Peek ahead
-                    j = i + 1
-                    while j < n and _BLANK_RE.match(lines[j]):
-                        j += 1
-                    if j < n and lines[j].startswith((" ", "\t")):
-                        prompt_lines.append("")
-                        i += 1
-                        continue
-                    else:
-                        break
-                elif pline.startswith((" ", "\t")):
-                    prompt_lines.append(pline.strip())
-                    i += 1
-                else:
-                    break
-
-            prompt = "\n".join(prompt_lines).strip()
-            if not prompt:
-                raise ParseError(
-                    f"task {task_name!r} has no prompt body", lineno
-                )
+            body_lines, i = _collect_body(lines, i)
+            steps = _parse_body_steps(body_lines)
+            if not steps:
+                raise ParseError(f"task {task_name!r} has no prompt body", lineno)
 
             task = Task(
                 name=task_name,
-                prompt=prompt,
+                steps=steps,
                 dependencies=deps,
                 options=options,
+                arguments=arguments,
                 line_number=lineno,
             )
             pf.tasks[task_name] = task
@@ -197,7 +493,7 @@ def parse(source: str, filename: str = "Promptfile") -> Promptfile:
 
         raise ParseError(f"unexpected line: {line!r}", lineno)
 
-    # Validate dependencies exist
+    # --- Validation ---
     for task in pf.tasks.values():
         for dep in task.dependencies:
             if dep not in pf.tasks:
@@ -205,5 +501,23 @@ def parse(source: str, filename: str = "Promptfile") -> Promptfile:
                     f"task {task.name!r} depends on unknown task {dep!r}",
                     task.line_number,
                 )
+        # Validate @use references
+        for step in task.steps:
+            if step.kind == "prompt":
+                for text_line in step.content.split("\n"):
+                    text_line = text_line.strip()
+                    if text_line.startswith("@use "):
+                        fn_name = text_line[5:].strip()
+                        if fn_name not in pf.functions:
+                            raise ParseError(
+                                f"task {task.name!r} references unknown function {fn_name!r}",
+                                task.line_number,
+                            )
+        # Validate [on=group] references
+        if task.options.on and task.options.on not in pf.host_groups:
+            raise ParseError(
+                f"task {task.name!r} targets unknown host group {task.options.on!r}",
+                task.line_number,
+            )
 
     return pf

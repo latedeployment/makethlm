@@ -1,34 +1,111 @@
+# ==========================================================================
 # Example Promptfile — a task runner where tasks are LLM prompts
 #
 # Usage:
-#   promptfile build          # run the 'build' task
-#   promptfile deploy         # runs build -> test -> deploy
-#   promptfile --dry-run deploy  # see what would be sent
-#   promptfile --list         # list all tasks
+#   promptfile build                    # build the project
+#   promptfile deploy staging           # deploy with args
+#   promptfile --dry-run deploy prod    # preview what would run
+#   promptfile --list                   # list tasks, functions, hosts, llms
+# ==========================================================================
 
 project := "my-web-app"
 env := "staging"
 
-# Check if source files changed and rebuild the Docker image
+# --------------------------------------------------------------------------
+# LLM Providers — select globally, override per-task
+# --------------------------------------------------------------------------
+
+llm claude [model=opus]
+llm openai [model=gpt-4, key=$OPENAI_API_KEY]
+llm ollama [model=llama3, base_url=http://localhost:11434]
+
+# --------------------------------------------------------------------------
+# Host Inventory — Ansible-like, tasks run via SSH
+# --------------------------------------------------------------------------
+
+hosts web [user=deploy]:
+    web1.prod.internal
+    web2.prod.internal
+    web3.prod.internal
+
+hosts db [user=postgres, port=5433]:
+    db-primary.prod.internal
+    db-replica.prod.internal
+
+# --------------------------------------------------------------------------
+# Functions — reusable prompt templates, referenced with @use
+# --------------------------------------------------------------------------
+
+fn security_review:
+    Review the code for security vulnerabilities.
+    Check specifically for:
+    - SQL injection
+    - XSS (cross-site scripting)
+    - Command injection
+    - Path traversal
+    Be concise and actionable.
+
+fn code_quality:
+    Check for code quality issues:
+    - Functions longer than 50 lines
+    - Duplicated logic
+    - Missing error handling
+    - Poor naming
+
+# --------------------------------------------------------------------------
+# Tasks — shell commands (!) interleaved with LLM prompts
+# --------------------------------------------------------------------------
+
+# Build: mix shell prep with an LLM check
 task build:
+    !mkdir -p dist
     check if moo.md is newer than the Dockerfile.
     if so, rebuild the docker image from scratch.
     tag it as {{project}}:latest.
 
-# Run the test suite
+# Run tests with shell, then ask LLM to analyze failures
 task test: build:
-    run the test suite for {{project}}.
-    report any failures clearly.
+    !@silent npm install
+    !npm test
+    if any tests failed, explain the root cause and suggest a fix.
 
-# Security review with a high-capability model
-task review [model=opus, temperature=0.1]:
-    review the git diff for {{project}} carefully.
-    look for security vulnerabilities, especially:
-    - SQL injection
-    - XSS
-    - command injection
+# Security review — uses opus for thoroughness
+task review [llm=claude, model=opus, temperature=0.1]:
+    @use security_review
+    Focus on the git diff for {{project}}.
+    !git diff --stat
 
-# Deploy with a fast model
-task deploy: build test [model=haiku]:
-    deploy {{project}} to {{env}}.
-    verify the health check endpoint returns 200.
+# Fast code quality check — uses a cheaper model
+task lint [llm=openai]:
+    @use code_quality
+    Apply to the src/ directory of {{project}}.
+
+# Deploy with arguments, runs on web hosts via SSH
+task deploy(target, port="8080"): build test [llm=openai, on=web]:
+    !systemctl restart {{project}}
+    verify {{project}} is running on {{target}} port {{port}}.
+    @use security_review
+
+# Database backup — runs on db hosts
+task backup [on=db]:
+    !pg_dump {{project}} > /tmp/{{project}}-backup.sql
+    !@silent gzip /tmp/{{project}}-backup.sql
+    verify the backup completed successfully.
+
+# Clean up with silent + ignore-error shell commands
+task clean:
+    !@silent rm -rf dist/
+    !@silent @ignore docker rmi {{project}}:latest
+    cleaned up build artifacts.
+
+# --------------------------------------------------------------------------
+# Docker — describe the image, LLM generates the Dockerfile, then builds
+# --------------------------------------------------------------------------
+
+docker api-server [tag=latest]:
+    A Python 3.11 slim image.
+    Install requirements.txt with pip, no cache.
+    Copy the app/ directory to /app.
+    Set the working directory to /app.
+    Expose port 8080.
+    Run with gunicorn, 4 workers, binding 0.0.0.0:8080.

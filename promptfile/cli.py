@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Task to run (default: first task in file)",
     )
     ap.add_argument(
+        "task_args",
+        nargs="*",
+        default=[],
+        help="Positional arguments for the task",
+    )
+    ap.add_argument(
         "-f", "--file",
         type=Path,
         default=None,
@@ -44,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print prompts that would be sent without calling LLM",
+        help="Print prompts/commands that would be sent without executing",
     )
     ap.add_argument(
         "--list", "-l",
@@ -103,12 +109,59 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_tasks:
         for name in pf.task_order:
             task = pf.tasks[name]
-            deps = f" (depends: {', '.join(task.dependencies)})" if task.dependencies else ""
+            parts: list[str] = []
+            if task.dependencies:
+                parts.append(f"depends: {', '.join(task.dependencies)}")
+            if task.arguments:
+                arg_strs = []
+                for a in task.arguments:
+                    if a.default is not None:
+                        arg_strs.append(f'{a.name}="{a.default}"')
+                    else:
+                        arg_strs.append(a.name)
+                parts.append(f"args: {', '.join(arg_strs)}")
+            if task.docker:
+                parts.append(f"docker:{task.docker.tag}")
+            if task.options.llm:
+                parts.append(f"llm: {task.options.llm}")
+            if task.options.on:
+                parts.append(f"on: {task.options.on}")
+            suffix = f" ({'; '.join(parts)})" if parts else ""
             first_line = task.prompt.split("\n")[0]
             if len(first_line) > 60:
                 first_line = first_line[:57] + "..."
-            print(f"  {name}{deps}")
+            print(f"  {name}{suffix}")
             print(f"    {first_line}")
+
+        # List functions
+        if pf.functions:
+            print()
+            print("  functions:")
+            for fn_name, fn in pf.functions.items():
+                first_line = fn.body.split("\n")[0]
+                if len(first_line) > 60:
+                    first_line = first_line[:57] + "..."
+                print(f"    {fn_name}: {first_line}")
+
+        # List LLM providers
+        if pf.llm_providers:
+            print()
+            default = pf.default_llm
+            print("  llm providers:")
+            for pname, prov in pf.llm_providers.items():
+                marker = " (default)" if pname == default else ""
+                model_str = f" model={prov.model}" if prov.model else ""
+                print(f"    {pname}{model_str}{marker}")
+
+        # List host groups
+        if pf.host_groups:
+            print()
+            print("  host groups:")
+            for gname, group in pf.host_groups.items():
+                user_str = f" user={group.user}" if group.user else ""
+                port_str = f" port={group.port}" if group.port else ""
+                print(f"    {gname}{user_str}{port_str}: {', '.join(group.hosts)}")
+
         return 0
 
     # Build dispatcher
@@ -119,10 +172,28 @@ def main(argv: list[str] | None = None) -> int:
     else:
         dispatcher = ClaudeDispatcher(model=args.model)
 
+    # Build task arguments dict from positional CLI args
+    task_args: dict[str, str] | None = None
+    target = args.task
+    if target and target in pf.tasks and pf.tasks[target].arguments:
+        task_def = pf.tasks[target]
+        task_args = {}
+        for idx, arg_def in enumerate(task_def.arguments):
+            if idx < len(args.task_args):
+                task_args[arg_def.name] = args.task_args[idx]
+            elif arg_def.default is not None:
+                task_args[arg_def.name] = arg_def.default
+            else:
+                print(
+                    f"error: task {target!r} requires argument {arg_def.name!r}",
+                    file=sys.stderr,
+                )
+                return 1
+
     # Run
     runner = Runner(pf, dispatcher)
     try:
-        result = runner.run(args.task)
+        result = runner.run(target, args=task_args)
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -135,10 +206,13 @@ def main(argv: list[str] | None = None) -> int:
         status = "ok" if tr.success else "FAILED"
         print(f"[{status}] {tr.task_name}")
         if args.dry_run:
-            print(f"  prompt: {tr.prompt_sent}")
+            for sr in tr.step_results:
+                prefix = "!" if sr.kind == "shell" else ">"
+                print(f"  {prefix} {sr.content}")
         else:
             for line in tr.response.strip().split("\n"):
-                print(f"  {line}")
+                if line:
+                    print(f"  {line}")
         print()
 
     return 0 if result.success else 1
