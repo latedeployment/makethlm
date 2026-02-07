@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "makethlm"
+version = "0.1.0"
+description = "A Justfile/Makefile for LLM prompts — define tasks as natural language, run them with any LLM."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "makethlm Contributors"},
+]
+keywords = ["llm", "task-runner", "makefile", "justfile", "ai", "prompt", "cli", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/latedeployment/makethlm"
+Repository = "https://github.com/latedeployment/makethlm"
+Issues = "https://github.com/latedeployment/makethlm/issues"
+
+[project.scripts]
+makethlm = "makethlm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["makethlm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: SSH integration tests requiring Docker"]

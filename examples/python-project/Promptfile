@@ -1,0 +1,38 @@
+# Python Project — simple script with tests
+#
+# This example shows:
+#   - Running pytest via shell commands
+#   - Using the LLM to explain test failures
+#   - Task arguments (makethlm test mymodule)
+#
+# Try it:
+#   makethlm --list              # see available tasks
+#   makethlm --dry-run test      # preview what would happen
+#   makethlm test                # run tests + get LLM analysis
+
+llm claude [model=sonnet]
+
+# Run tests and ask the LLM to analyze any failures
+task test:
+    !python -m pytest app_test.py -v 2>&1 || true
+    Look at the test output above.
+    If all tests passed, just say "All tests passed" and nothing else.
+    If any tests failed, explain the root cause of each failure
+    and suggest a concrete fix.
+
+# Generate a docstring for a module
+task document(module):
+    !cat {{module}}.py
+    Read the Python code above and generate clear Google-style
+    docstrings for every public function and class.
+    Output the complete file with docstrings added.
+
+# Lint and suggest improvements
+task review:
+    !find . -name "*.py" -not -path "./.venv/*" | head -5
+    !cat app.py
+    Review this Python code for:
+    - bugs or edge cases
+    - style issues (PEP 8)
+    - possible simplifications
+    Be concise. Only mention real issues.

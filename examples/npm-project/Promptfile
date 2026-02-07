@@ -1,0 +1,51 @@
+# npm Project — Node.js build and review workflow
+#
+# This example shows:
+#   - Typical JS/TS build pipeline
+#   - Using the LLM for code review
+#   - Chaining build -> test -> deploy
+#
+# Try it:
+#   makethlm --list              # see available tasks
+#   makethlm --dry-run build     # preview what would happen
+#   makethlm check               # lint + review in one task
+
+project := "my-app"
+
+llm claude [model=sonnet]
+
+# Install dependencies
+task setup:
+    !npm install
+
+# Build the project
+task build: setup:
+    !npm run build
+    !echo "Built {{project}} successfully."
+
+# Run tests and analyze results
+task test: build:
+    !npm test 2>&1 || true
+    Look at the test output above.
+    If all tests passed, say "All tests passed."
+    If any failed, explain the failures clearly
+    and suggest specific fixes with code snippets.
+
+# LLM-powered code review of recent changes
+task review:
+    !git diff --stat
+    !git diff
+    Review the git diff above for:
+    - Bugs or logic errors
+    - Security issues (XSS, injection, etc.)
+    - Missing error handling
+    - Style or readability problems
+    Be concise and actionable. Skip nitpicks.
+
+# Quick health check: lint + type check + review
+task check:
+    !npx eslint src/ 2>&1 || true
+    !npx tsc --noEmit 2>&1 || true
+    Look at the linting and type-check output above.
+    Summarize the issues found, grouped by severity.
+    Suggest the top 3 most important fixes.

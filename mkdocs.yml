@@ -1,0 +1,67 @@
+site_name: makethlm
+site_description: A task runner where tasks are LLM prompts
+site_url: https://latedeployment.github.io/makethlm/
+repo_url: https://github.com/latedeployment/makethlm
+repo_name: latedeployment/makethlm
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+  - attr_list
+  - md_in_html
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Syntax Reference:
+    - Overview: syntax.md
+    - Variables: variables.md
+    - Tasks: tasks.md
+    - Shell Commands: shell-commands.md
+    - Functions: functions.md
+    - Docker: docker.md
+    - SSH & Host Inventory: ssh.md
+    - LLM Providers: llm-providers.md
+    - Settings & Directives: settings.md
+  - CLI Reference: cli.md
+  - Secrets (Planned): secrets-injection.md

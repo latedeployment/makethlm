@@ -1,0 +1,47 @@
+# C Project — hello world with a generated library
+#
+# This example shows how makethlm can:
+#   - Run shell commands (lines starting with !)
+#   - Ask an LLM to generate code
+#   - Chain tasks with dependencies
+#
+# Try it:
+#   makethlm --list              # see available tasks
+#   makethlm --dry-run build     # preview what would happen
+#   makethlm build               # actually run it
+
+project := "hello"
+
+# Use claude by default (change to ollama/openai as needed)
+llm claude [model=sonnet]
+
+# -- Tasks --
+
+# Generate a small utility library using the LLM
+task generate-lib:
+    !mkdir -p src
+    Write a small C library with a header file.
+    The library should provide two functions:
+      - char *greet(const char *name) that returns "Hello, <name>!"
+      - int add(int a, int b) that returns the sum
+    Output ONLY the contents of two files, clearly separated:
+    First src/mylib.h (the header), then src/mylib.c (the implementation).
+    Use standard C, no external dependencies.
+    Generate src/main.c for the library as well
+
+# Compile everything (run generate-lib first if src/mylib.c doesn't exist)
+task build:
+    !gcc -c src/mylib.c -o src/mylib.o
+    !gcc src/main.c src/mylib.o -o {{project}}
+    !echo "Build complete: ./{{project}}"
+
+task build-makefile:
+    generate a Makefile for the project and compile it with Makefile
+# Run the program
+task run: build:
+    !./{{project}}
+
+# Clean build artifacts
+task clean:
+    !rm -f src/*.o {{project}}
+    !echo "Cleaned."
