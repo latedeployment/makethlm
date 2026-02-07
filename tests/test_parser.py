@@ -1136,3 +1136,318 @@ docker api-image [tag=v2]:
         assert pf.get_hosts_for_task("deploy").name == "web"
         assert pf.get_hosts_for_task("backup").name == "db"
         assert pf.get_hosts_for_task("build") is None
+
+
+# ---------------------------------------------------------------------------
+# Set directives
+# ---------------------------------------------------------------------------
+
+class TestSetDirectives:
+    def test_set_dotenv_load(self):
+        src = """\
+set dotenv-load
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.dotenv_load is True
+
+    def test_set_dotenv_load_false(self):
+        src = """\
+set dotenv-load false
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.dotenv_load is False
+
+    def test_set_shell(self):
+        src = """\
+set shell "/bin/bash"
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.shell == "/bin/bash"
+
+    def test_set_shell_single_quotes(self):
+        src = """\
+set shell '/bin/zsh'
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.shell == "/bin/zsh"
+
+    def test_set_working_dir(self):
+        src = """\
+set working-dir "/tmp/myproject"
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.working_dir == "/tmp/myproject"
+
+    def test_set_unknown_raises(self):
+        src = """\
+set bogus-directive
+
+task build:
+    build it
+"""
+        with pytest.raises(ParseError, match="unknown set directive"):
+            parse(src)
+
+
+# ---------------------------------------------------------------------------
+# Aliases
+# ---------------------------------------------------------------------------
+
+class TestAliases:
+    def test_basic_alias(self):
+        src = """\
+task deploy:
+    deploy it
+
+alias d := deploy
+"""
+        pf = parse(src)
+        assert pf.aliases == {"d": "deploy"}
+        assert pf.resolve_alias("d") == "deploy"
+        assert pf.resolve_alias("deploy") == "deploy"
+
+    def test_multiple_aliases(self):
+        src = """\
+task build:
+    build it
+
+task deploy:
+    deploy it
+
+alias b := build
+alias d := deploy
+"""
+        pf = parse(src)
+        assert pf.aliases == {"b": "build", "d": "deploy"}
+
+    def test_alias_unknown_target_raises(self):
+        src = """\
+alias x := nonexistent
+
+task build:
+    build it
+"""
+        with pytest.raises(ParseError, match="unknown task"):
+            parse(src)
+
+    def test_alias_missing_name_raises(self):
+        src = """\
+task build:
+    build it
+
+alias := build
+"""
+        with pytest.raises(ParseError, match="alias missing name"):
+            parse(src)
+
+    def test_alias_missing_target_raises(self):
+        src = """\
+task build:
+    build it
+
+alias x :=
+"""
+        with pytest.raises(ParseError, match="alias missing target"):
+            parse(src)
+
+    def test_alias_bad_syntax_raises(self):
+        src = """\
+task build:
+    build it
+
+alias x = build
+"""
+        with pytest.raises(ParseError, match="alias must use ':='"):
+            parse(src)
+
+
+# ---------------------------------------------------------------------------
+# Backtick variables
+# ---------------------------------------------------------------------------
+
+class TestBacktickVariables:
+    def test_backtick_variable(self):
+        src = """\
+version := `echo hello-world`
+
+task show:
+    version is {{version}}
+"""
+        pf = parse(src)
+        assert pf.variables["version"] == "hello-world"
+
+    def test_backtick_variable_interpolation(self):
+        src = """\
+uname := `uname -s`
+
+task show:
+    os is {{uname}}
+"""
+        pf = parse(src)
+        # Should be resolved to a non-empty string
+        assert len(pf.variables["uname"]) > 0
+        resolved = pf.resolve_prompt("show")
+        assert "os is" in resolved
+        assert "{{uname}}" not in resolved
+
+
+# ---------------------------------------------------------------------------
+# Private, group, doc, confirm, os options
+# ---------------------------------------------------------------------------
+
+class TestNewTaskOptions:
+    def test_private_option_bare(self):
+        src = """\
+task internal [private]:
+    do secret stuff
+"""
+        pf = parse(src)
+        assert pf.tasks["internal"].options.private is True
+
+    def test_private_option_with_value(self):
+        src = """\
+task internal [private=true]:
+    do secret stuff
+"""
+        pf = parse(src)
+        assert pf.tasks["internal"].options.private is True
+
+    def test_group_option(self):
+        src = """\
+task build [group=ci]:
+    build it
+"""
+        pf = parse(src)
+        assert pf.tasks["build"].options.group == "ci"
+
+    def test_doc_option(self):
+        src = """\
+task build [doc=Build the project]:
+    lots of complex prompt text here
+"""
+        pf = parse(src)
+        assert pf.tasks["build"].options.doc == "Build the project"
+
+    def test_confirm_bare(self):
+        src = """\
+task deploy [confirm]:
+    deploy to production
+"""
+        pf = parse(src)
+        assert pf.tasks["deploy"].options.confirm is True
+
+    def test_confirm_with_message(self):
+        src = """\
+task deploy [confirm=Are you sure?]:
+    deploy to production
+"""
+        pf = parse(src)
+        assert pf.tasks["deploy"].options.confirm == "Are you sure?"
+
+    def test_os_filter(self):
+        src = """\
+task linuxonly [os=linux]:
+    do linux stuff
+"""
+        pf = parse(src)
+        assert pf.tasks["linuxonly"].options.os_filter == "linux"
+
+    def test_working_dir_option(self):
+        src = """\
+task build [working-dir=/tmp/build]:
+    build it
+"""
+        pf = parse(src)
+        assert pf.tasks["build"].options.working_dir == "/tmp/build"
+
+    def test_multiple_new_options(self):
+        src = """\
+task deploy [group=production, confirm, os=linux, doc=Deploy app]:
+    deploy it
+"""
+        pf = parse(src)
+        opts = pf.tasks["deploy"].options
+        assert opts.group == "production"
+        assert opts.confirm is True
+        assert opts.os_filter == "linux"
+        assert opts.doc == "Deploy app"
+
+    def test_private_with_other_options(self):
+        src = """\
+task secret [private, model=haiku]:
+    do secret stuff
+"""
+        pf = parse(src)
+        opts = pf.tasks["secret"].options
+        assert opts.private is True
+        assert opts.model == "haiku"
+
+
+# ---------------------------------------------------------------------------
+# OS filter — should_skip_for_os
+# ---------------------------------------------------------------------------
+
+class TestOsFilter:
+    def test_no_filter_never_skips(self):
+        from promptfile.models import TaskOptions
+        opts = TaskOptions()
+        assert opts.should_skip_for_os() is False
+
+    def test_matching_os_does_not_skip(self):
+        import platform
+        from promptfile.models import TaskOptions
+        current = platform.system().lower()
+        # Map back to our naming
+        reverse_map = {"linux": "linux", "darwin": "macos", "windows": "windows"}
+        os_name = reverse_map.get(current, current)
+        opts = TaskOptions(os_filter=os_name)
+        assert opts.should_skip_for_os() is False
+
+    def test_non_matching_os_skips(self):
+        from promptfile.models import TaskOptions
+        # Use a platform that definitely won't match
+        opts = TaskOptions(os_filter="freebsd")
+        assert opts.should_skip_for_os() is True
+
+
+# ---------------------------------------------------------------------------
+# TaskOptions merge
+# ---------------------------------------------------------------------------
+
+class TestTaskOptionsMerge:
+    def test_merge_basic(self):
+        from promptfile.models import TaskOptions
+        base = TaskOptions(model="base-model", group="ci")
+        override = TaskOptions(model="new-model")
+        merged = base.merge(override)
+        assert merged.model == "new-model"
+        assert merged.group == "ci"
+
+    def test_merge_private(self):
+        from promptfile.models import TaskOptions
+        base = TaskOptions(private=False)
+        override = TaskOptions(private=True)
+        merged = base.merge(override)
+        assert merged.private is True
+
+    def test_merge_confirm(self):
+        from promptfile.models import TaskOptions
+        base = TaskOptions(confirm=False)
+        override = TaskOptions(confirm="Are you sure?")
+        merged = base.merge(override)
+        assert merged.confirm == "Are you sure?"

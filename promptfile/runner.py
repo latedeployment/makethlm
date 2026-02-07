@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep
 from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, ShellDispatcher
@@ -114,12 +116,33 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
     return ClaudeDispatcher(model=provider.model)
 
 
+def _load_dotenv(path: str | None = None) -> None:
+    """Load a .env file into os.environ (simple key=value parser)."""
+    env_path = Path(path) if path else Path(".env")
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        # Strip surrounding quotes
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 class Runner:
     """Executes tasks from a Promptfile using a Dispatcher."""
 
     def __init__(self, pf: Promptfile, dispatcher: Dispatcher):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
+        self._dotenv_loaded = False
 
     def _get_dispatcher(self, task: Task) -> Dispatcher:
         """Return the appropriate dispatcher for a task (per-task LLM > default)."""
@@ -128,12 +151,42 @@ class Runner:
             return _dispatcher_for_provider(provider)
         return self.dispatcher
 
+    def _ensure_dotenv(self) -> None:
+        """Load .env if ``set dotenv-load`` is enabled and not yet loaded."""
+        if not self._dotenv_loaded and self.pf.settings.dotenv_load:
+            _load_dotenv()
+            self._dotenv_loaded = True
+
+    def _resolve_working_dir(self, task: Task) -> str | None:
+        """Return effective working directory for a task."""
+        return task.options.working_dir or self.pf.settings.working_dir
+
+    def _prompt_confirm(self, task: Task) -> bool:
+        """Prompt user for confirmation if [confirm] is set. Returns True to proceed."""
+        confirm = task.options.confirm
+        if not confirm:
+            return True
+        if isinstance(confirm, str) and confirm not in ("True", "true"):
+            message = confirm
+        else:
+            message = f"Run task {task.name!r}?"
+        try:
+            answer = input(f"{message} [y/N] ")
+            return answer.strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
     def run(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
         """Run a target task and all its dependencies."""
+        self._ensure_dotenv()
+
         if target is None:
             target = self.pf.default_task
             if target is None:
                 raise ValueError("no tasks defined in Promptfile")
+
+        # Resolve aliases
+        target = self.pf.resolve_alias(target)
 
         if target not in self.pf.tasks:
             raise KeyError(f"unknown task: {target!r}")
@@ -143,6 +196,28 @@ class Runner:
 
         for task_name in execution_order:
             task = self.pf.tasks[task_name]
+
+            # OS filter: skip tasks not meant for this OS
+            if task.options.should_skip_for_os():
+                result.task_results.append(TaskResult(
+                    task_name=task_name,
+                    prompt_sent="",
+                    response=f"[skipped] not applicable on this OS (requires {task.options.os_filter})",
+                    success=True,
+                ))
+                continue
+
+            # Confirm prompt (only for the explicitly targeted task)
+            if task_name == target and task.options.confirm:
+                if not self._prompt_confirm(task):
+                    result.task_results.append(TaskResult(
+                        task_name=task_name,
+                        prompt_sent="",
+                        response="[skipped] user declined confirmation",
+                        success=True,
+                    ))
+                    return result
+
             task_args = args if task_name == target else None
             task_result = self._run_task(task, task_args)
             result.task_results.append(task_result)
@@ -174,10 +249,11 @@ class Runner:
         all_responses: list[str] = []
         success = True
         dispatcher = self._get_dispatcher(task)
+        working_dir = self._resolve_working_dir(task)
 
         for step in resolved_steps:
             if step.kind == "shell":
-                sr = self._run_shell_step(step)
+                sr = self._run_shell_step(step, working_dir=working_dir)
             else:
                 sr = self._run_prompt_step(step, task, dispatcher)
 
@@ -238,8 +314,9 @@ class Runner:
             step_results=step_results,
         )
 
-    def _run_shell_step(self, step: TaskStep) -> StepResult:
+    def _run_shell_step(self, step: TaskStep, working_dir: str | None = None) -> StepResult:
         """Execute a shell command locally."""
+        shell_exe = self.pf.settings.shell or None
         try:
             proc = subprocess.run(
                 step.content,
@@ -247,6 +324,8 @@ class Runner:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                cwd=working_dir,
+                executable=shell_exe,
             )
             output = proc.stdout
             if proc.stderr:

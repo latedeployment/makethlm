@@ -5,11 +5,40 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "promptfile"
 version = "0.1.0"
-description = "A Justfile for LLM prompts — define tasks as natural language, run them with any LLM CLI."
+description = "A Justfile/Makefile for LLM prompts — define tasks as natural language, run them with any LLM."
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Promptfile Contributors"},
+]
+keywords = ["llm", "task-runner", "makefile", "justfile", "ai", "prompt", "cli", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/promptfile/promptfile"
+Repository = "https://github.com/promptfile/promptfile"
+Issues = "https://github.com/promptfile/promptfile/issues"
 
 [project.scripts]
 promptfile = "promptfile.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["promptfile*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

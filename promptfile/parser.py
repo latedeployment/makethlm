@@ -33,12 +33,15 @@ from __future__ import annotations
 
 import os
 
+import subprocess
+
 from .models import (
     DockerConfig,
     Function,
     HostGroup,
     LLMProvider,
     Promptfile,
+    Settings,
     Task,
     TaskArgument,
     TaskOptions,
@@ -80,17 +83,28 @@ def _extract_brackets(s: str) -> tuple[str, str | None]:
     return remaining.strip(), bracket_content
 
 
+_BOOLEAN_OPTIONS = {"private", "confirm"}
+
+
 def _parse_kv_pairs(raw: str) -> dict[str, str]:
-    """Parse 'key=value, key2=value2' into a dict."""
+    """Parse 'key=value, key2=value2, bare_flag' into a dict.
+
+    Bare keywords (no ``=``) are allowed for known boolean options like
+    ``private`` and ``confirm``; they are stored as ``key -> "true"``.
+    """
     result: dict[str, str] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair:
             continue
         if "=" not in pair:
-            raise ParseError(f"invalid option (expected key=value): {pair!r}")
-        key, value = pair.split("=", 1)
-        result[key.strip()] = value.strip()
+            if pair in _BOOLEAN_OPTIONS:
+                result[pair] = "true"
+            else:
+                raise ParseError(f"invalid option (expected key=value): {pair!r}")
+        else:
+            key, value = pair.split("=", 1)
+            result[key.strip()] = value.strip()
     return result
 
 
@@ -114,6 +128,21 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.llm = value
         elif key == "on":
             opts.on = value
+        elif key == "private":
+            opts.private = value.lower() in ("true", "yes", "1")
+        elif key == "group":
+            opts.group = value
+        elif key == "doc":
+            opts.doc = value
+        elif key == "confirm":
+            if value.lower() in ("true", "yes", "1"):
+                opts.confirm = True
+            else:
+                opts.confirm = value
+        elif key == "os":
+            opts.os_filter = value
+        elif key == "working_dir" or key == "working-dir":
+            opts.working_dir = value
         else:
             raise ParseError(f"unknown option: {key!r}")
     return opts
@@ -312,11 +341,66 @@ def parse(
             i += 1
             continue
 
-        # ----- variable := "value" -----
+        # ----- set <directive> [value] -----
+        if stripped.startswith("set "):
+            rest = stripped[4:].strip()
+            if rest.startswith("dotenv-load"):
+                val = rest[11:].strip()
+                pf.settings.dotenv_load = val.lower() not in ("false", "no", "0") if val else True
+            elif rest.startswith("shell"):
+                val = rest[5:].strip()
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                elif val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                pf.settings.shell = val if val else None
+            elif rest.startswith("working-dir") or rest.startswith("working_dir"):
+                # consume "working-dir" or "working_dir"
+                key_len = 11 if rest.startswith("working-dir") else 11
+                val = rest[key_len:].strip()
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                elif val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                pf.settings.working_dir = val if val else None
+            else:
+                raise ParseError(f"unknown set directive: {rest!r}", lineno)
+            i += 1
+            continue
+
+        # ----- alias <name> := <target> -----
+        if stripped.startswith("alias "):
+            rest = stripped[6:].strip()
+            if ":=" not in rest:
+                raise ParseError("alias must use ':=' syntax, e.g. alias d := deploy", lineno)
+            eq_idx = rest.index(":=")
+            alias_name = rest[:eq_idx].strip()
+            alias_target = rest[eq_idx + 2 :].strip()
+            if not alias_name:
+                raise ParseError("alias missing name", lineno)
+            if not alias_target:
+                raise ParseError("alias missing target", lineno)
+            pf.aliases[alias_name] = alias_target
+            i += 1
+            continue
+
+        # ----- variable := "value" or backtick variable := `command` -----
         if ":=" in stripped:
             eq_idx = stripped.index(":=")
             var_name = stripped[:eq_idx].strip()
             var_val_raw = stripped[eq_idx + 2 :].strip()
+            # Backtick command substitution
+            if var_val_raw.startswith("`") and var_val_raw.endswith("`"):
+                cmd = var_val_raw[1:-1]
+                try:
+                    proc = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True, timeout=30,
+                    )
+                    pf.variables[var_name] = proc.stdout.strip()
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    raise ParseError(f"backtick command failed: {e}", lineno)
+                i += 1
+                continue
             if not (var_val_raw.startswith('"') and var_val_raw.endswith('"')):
                 raise ParseError(f"variable value must be quoted: {var_val_raw!r}", lineno)
             var_val = var_val_raw[1:-1]
@@ -519,5 +603,10 @@ def parse(
                 f"task {task.name!r} targets unknown host group {task.options.on!r}",
                 task.line_number,
             )
+
+    # Validate alias targets
+    for alias_name, alias_target in pf.aliases.items():
+        if alias_target not in pf.tasks:
+            raise ParseError(f"alias {alias_name!r} targets unknown task {alias_target!r}")
 
     return pf

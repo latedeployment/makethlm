@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import platform
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -23,14 +24,29 @@ class LLMProvider:
 
 
 @dataclass
+class Settings:
+    """Global configuration from ``set`` directives."""
+
+    dotenv_load: bool = False
+    shell: str | None = None           # shell executable (default: sh)
+    working_dir: str | None = None     # global working directory
+
+
+@dataclass
 class TaskOptions:
     """Optional metadata attached to a task via [key=value, ...] syntax."""
 
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    llm: str | None = None  # per-task LLM provider override
-    on: str | None = None   # host group to run on (Ansible-like)
+    llm: str | None = None         # per-task LLM provider override
+    on: str | None = None          # host group to run on (Ansible-like)
+    private: bool = False          # hide from --list
+    group: str | None = None       # group name for --list display
+    doc: str | None = None         # one-line description for --list
+    confirm: str | bool = False    # True or custom message
+    os_filter: str | None = None   # "linux", "macos", "windows"
+    working_dir: str | None = None # per-task working directory
 
     def merge(self, overrides: "TaskOptions") -> "TaskOptions":
         """Return a new TaskOptions with non-None overrides applied."""
@@ -44,21 +60,36 @@ class TaskOptions:
             else self.max_tokens,
             llm=overrides.llm if overrides.llm is not None else self.llm,
             on=overrides.on if overrides.on is not None else self.on,
+            private=overrides.private or self.private,
+            group=overrides.group if overrides.group is not None else self.group,
+            doc=overrides.doc if overrides.doc is not None else self.doc,
+            confirm=overrides.confirm if overrides.confirm else self.confirm,
+            os_filter=overrides.os_filter if overrides.os_filter is not None else self.os_filter,
+            working_dir=overrides.working_dir if overrides.working_dir is not None else self.working_dir,
         )
+
+    def should_skip_for_os(self) -> bool:
+        """Return True if this task should be skipped on the current OS."""
+        if not self.os_filter:
+            return False
+        current = platform.system().lower()
+        os_map = {"linux": "linux", "macos": "darwin", "windows": "windows"}
+        expected = os_map.get(self.os_filter, self.os_filter)
+        return current != expected
 
 
 @dataclass
 class TaskStep:
     """A single step within a task body.
 
-    kind="shell"  — a line starting with !, executed as a subprocess.
-    kind="prompt" — natural-language text sent to an LLM.
+    kind="shell"  -- a line starting with !, executed as a subprocess.
+    kind="prompt" -- natural-language text sent to an LLM.
     """
 
     kind: Literal["shell", "prompt"]
     content: str
-    silent: bool = False        # @silent — suppress stdout
-    ignore_error: bool = False  # @ignore — continue on non-zero exit
+    silent: bool = False        # @silent -- suppress stdout
+    ignore_error: bool = False  # @ignore -- continue on non-zero exit
 
 
 @dataclass
@@ -132,13 +163,19 @@ class Promptfile:
     functions: dict[str, Function] = field(default_factory=dict)
     task_order: list[str] = field(default_factory=list)
     llm_providers: dict[str, LLMProvider] = field(default_factory=dict)
-    default_llm: str | None = None  # name of the default LLM provider
+    default_llm: str | None = None
     host_groups: dict[str, HostGroup] = field(default_factory=dict)
+    settings: Settings = field(default_factory=Settings)
+    aliases: dict[str, str] = field(default_factory=dict)  # alias -> target
 
     @property
     def default_task(self) -> str | None:
         """The first defined task is the default, like Make."""
         return self.task_order[0] if self.task_order else None
+
+    def resolve_alias(self, name: str) -> str:
+        """Resolve an alias to its target task name."""
+        return self.aliases.get(name, name)
 
     def get_llm_for_task(self, task_name: str) -> LLMProvider | None:
         """Return the LLM provider for a task (per-task override > global default)."""

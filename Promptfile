@@ -8,6 +8,13 @@
 #   promptfile --list                   # list tasks, functions, hosts, llms
 # ==========================================================================
 
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+
+set dotenv-load
+set shell "/bin/bash"
+
 project := "my-web-app"
 env := "staging"
 
@@ -93,10 +100,26 @@ task backup [on=db]:
     verify the backup completed successfully.
 
 # Clean up with silent + ignore-error shell commands
-task clean:
+task clean [doc=Remove build artifacts, group=maintenance]:
     !@silent rm -rf dist/
     !@silent @ignore docker rmi {{project}}:latest
     cleaned up build artifacts.
+
+# Private task — hidden from --list
+task _internal [private]:
+    internal maintenance routine.
+
+# Dangerous deploy requires confirmation
+task prod-deploy(target): build test [confirm=Really deploy to production?, os=linux]:
+    deploy {{project}} to {{target}} in production mode.
+
+# --------------------------------------------------------------------------
+# Aliases — short names for common tasks
+# --------------------------------------------------------------------------
+
+alias b := build
+alias t := test
+alias d := deploy
 
 # --------------------------------------------------------------------------
 # Docker — describe the image, LLM generates the Dockerfile, then builds

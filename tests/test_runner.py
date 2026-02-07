@@ -636,3 +636,221 @@ task build:
         task_dispatcher = runner._get_dispatcher(task)
         # No LLM configured, should fall back to the provided dispatcher
         assert task_dispatcher is fallback
+
+
+# ---------------------------------------------------------------------------
+# Runner — alias resolution
+# ---------------------------------------------------------------------------
+
+class TestRunnerAliases:
+    def test_alias_resolves_to_task(self):
+        pf = parse("""\
+task deploy:
+    deploy it
+
+alias d := deploy
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("d")
+
+        assert result.success
+        assert result.target == "deploy"
+        assert result.task_results[0].task_name == "deploy"
+
+    def test_alias_with_args(self):
+        pf = parse("""\
+task deploy(target):
+    deploy to {{target}}
+
+alias d := deploy
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("d", args={"target": "prod"})
+
+        assert result.success
+        assert "prod" in result.task_results[0].prompt_sent
+
+
+# ---------------------------------------------------------------------------
+# Runner — OS filter
+# ---------------------------------------------------------------------------
+
+class TestRunnerOsFilter:
+    def test_os_filter_skips_non_matching(self):
+        pf = parse("""\
+task linuxonly [os=freebsd]:
+    do freebsd stuff
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("linuxonly")
+
+        assert result.success
+        assert "[skipped]" in result.task_results[0].response
+
+    def test_os_filter_dep_skipped(self):
+        pf = parse("""\
+task platform_specific [os=freebsd]:
+    platform specific stuff
+
+task main: platform_specific:
+    main logic
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("main")
+
+        assert result.success
+        assert len(result.task_results) == 2
+        assert "[skipped]" in result.task_results[0].response
+        assert result.task_results[1].task_name == "main"
+
+
+# ---------------------------------------------------------------------------
+# Runner — confirm
+# ---------------------------------------------------------------------------
+
+class TestRunnerConfirm:
+    def test_confirm_declined_skips(self):
+        pf = parse("""\
+task deploy [confirm]:
+    deploy it
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+
+        # Mock input to return "n"
+        with patch("builtins.input", return_value="n"):
+            result = runner.run("deploy")
+
+        assert result.success
+        assert "[skipped]" in result.task_results[0].response
+
+    def test_confirm_accepted_runs(self):
+        pf = parse("""\
+task deploy [confirm]:
+    deploy it
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+
+        with patch("builtins.input", return_value="y"):
+            result = runner.run("deploy")
+
+        assert result.success
+        assert "[skipped]" not in result.task_results[0].response
+
+    def test_confirm_with_custom_message(self):
+        pf = parse("""\
+task deploy [confirm=Really deploy?]:
+    deploy it
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+
+        captured_prompts = []
+        def mock_input(prompt):
+            captured_prompts.append(prompt)
+            return "y"
+
+        with patch("builtins.input", side_effect=mock_input):
+            result = runner.run("deploy")
+
+        assert result.success
+        assert "Really deploy?" in captured_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# Runner — working directory
+# ---------------------------------------------------------------------------
+
+class TestRunnerWorkingDir:
+    def test_task_working_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pf = parse(f"""\
+task build [working-dir={tmpdir}]:
+    !pwd
+""")
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+            result = runner.run("build")
+
+            assert result.success
+            assert tmpdir in result.task_results[0].step_results[0].response
+
+    def test_global_working_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pf = parse(f"""\
+set working-dir "{tmpdir}"
+
+task build:
+    !pwd
+""")
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+            result = runner.run("build")
+
+            assert result.success
+            assert tmpdir in result.task_results[0].step_results[0].response
+
+
+# ---------------------------------------------------------------------------
+# Runner — dotenv loading
+# ---------------------------------------------------------------------------
+
+class TestRunnerDotenv:
+    def test_dotenv_loads_env_vars(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create .env file
+            env_path = os.path.join(tmpdir, ".env")
+            with open(env_path, "w") as f:
+                f.write('PF_DOTENV_TEST=loaded_value\n')
+
+            pf = parse("""\
+set dotenv-load
+
+task show:
+    value is ${PF_DOTENV_TEST}
+""")
+            # Remove the env var if it exists
+            os.environ.pop("PF_DOTENV_TEST", None)
+
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+
+            # Change to tmpdir to find .env
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                result = runner.run("show")
+            finally:
+                os.chdir(old_cwd)
+                os.environ.pop("PF_DOTENV_TEST", None)
+
+            assert result.success
+            assert "loaded_value" in result.task_results[0].prompt_sent
+
+
+# ---------------------------------------------------------------------------
+# Runner — set shell
+# ---------------------------------------------------------------------------
+
+class TestRunnerShell:
+    def test_set_shell_used_for_commands(self):
+        pf = parse("""\
+set shell "/bin/sh"
+
+task build:
+    !echo hello
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("build")
+
+        assert result.success
+        assert "hello" in result.task_results[0].step_results[0].response

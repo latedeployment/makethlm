@@ -107,7 +107,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # List mode
     if args.list_tasks:
+        # Collect tasks by group, filtering out private tasks
+        ungrouped: list[str] = []
+        groups: dict[str, list[str]] = {}
         for name in pf.task_order:
+            task = pf.tasks[name]
+            if task.options.private:
+                continue
+            group = task.options.group
+            if group:
+                groups.setdefault(group, []).append(name)
+            else:
+                ungrouped.append(name)
+
+        def _print_task(name: str) -> None:
             task = pf.tasks[name]
             parts: list[str] = []
             if task.dependencies:
@@ -126,12 +139,34 @@ def main(argv: list[str] | None = None) -> int:
                 parts.append(f"llm: {task.options.llm}")
             if task.options.on:
                 parts.append(f"on: {task.options.on}")
+            if task.options.os_filter:
+                parts.append(f"os: {task.options.os_filter}")
             suffix = f" ({'; '.join(parts)})" if parts else ""
-            first_line = task.prompt.split("\n")[0]
-            if len(first_line) > 60:
-                first_line = first_line[:57] + "..."
+            doc = task.options.doc
+            if doc:
+                desc = doc
+            else:
+                desc = task.prompt.split("\n")[0]
+            if len(desc) > 60:
+                desc = desc[:57] + "..."
             print(f"  {name}{suffix}")
-            print(f"    {first_line}")
+            print(f"    {desc}")
+
+        for name in ungrouped:
+            _print_task(name)
+
+        for group_name, task_names in groups.items():
+            print()
+            print(f"  [{group_name}]")
+            for name in task_names:
+                _print_task(name)
+
+        # List aliases
+        if pf.aliases:
+            print()
+            print("  aliases:")
+            for alias_name, alias_target in pf.aliases.items():
+                print(f"    {alias_name} -> {alias_target}")
 
         # List functions
         if pf.functions:
@@ -175,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
     # Build task arguments dict from positional CLI args
     task_args: dict[str, str] | None = None
     target = args.task
+    # Resolve alias
+    if target:
+        target = pf.resolve_alias(target)
     if target and target in pf.tasks and pf.tasks[target].arguments:
         task_def = pf.tasks[target]
         task_args = {}
