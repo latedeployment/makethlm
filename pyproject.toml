@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "promptfile"
+version = "0.1.0"
+description = "A Justfile for LLM prompts — define tasks as natural language, run them with any LLM CLI."
+requires-python = ">=3.10"
+
+[project.scripts]
+promptfile = "promptfile.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

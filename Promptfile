@@ -1,0 +1,34 @@
+# Example Promptfile — a task runner where tasks are LLM prompts
+#
+# Usage:
+#   promptfile build          # run the 'build' task
+#   promptfile deploy         # runs build -> test -> deploy
+#   promptfile --dry-run deploy  # see what would be sent
+#   promptfile --list         # list all tasks
+
+project := "my-web-app"
+env := "staging"
+
+# Check if source files changed and rebuild the Docker image
+task build:
+    check if moo.md is newer than the Dockerfile.
+    if so, rebuild the docker image from scratch.
+    tag it as {{project}}:latest.
+
+# Run the test suite
+task test: build:
+    run the test suite for {{project}}.
+    report any failures clearly.
+
+# Security review with a high-capability model
+task review [model=opus, temperature=0.1]:
+    review the git diff for {{project}} carefully.
+    look for security vulnerabilities, especially:
+    - SQL injection
+    - XSS
+    - command injection
+
+# Deploy with a fast model
+task deploy: build test [model=haiku]:
+    deploy {{project}} to {{env}}.
+    verify the health check endpoint returns 200.
