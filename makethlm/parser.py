@@ -5,7 +5,8 @@ Uses a line-by-line scanner (no regex hot-path) for speed and clarity.
 Syntax overview (Justfile-compatible + LLM extensions):
 
     # Comments
-    set dotenv-load
+    set dotenv-load                 # load .env
+    set dotenv-load ".env.local"    # load specific file
     set shell "/bin/bash"
     set export
     set positional-arguments
@@ -400,18 +401,39 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
     val = rest[len(matched_key):].strip()
     val = _strip_quotes(val)
 
-    # Boolean directives
+    _BOOL_VALUES = {"true", "false", "yes", "no", "0", "1"}
+
+    # Pure boolean directives: bare ``set X`` means True, ``set X false`` means False
     bool_fields = {
-        "dotenv_load", "dotenv_required", "export",
+        "dotenv_required", "export",
         "positional_arguments", "ignore_comments",
         "quiet", "allow_duplicate_tasks", "allow_duplicate_variables",
     }
-    if matched_field in bool_fields:
+
+    # Optional-bool directives: boolean when bare or given true/false,
+    # but also accept a string value that implies True + sets a companion field.
+    # Maps field -> companion field that receives the string value.
+    optional_bool_fields = {
+        "dotenv_load": "dotenv_path",
+    }
+
+    if matched_field in optional_bool_fields:
+        if val and val.lower() not in _BOOL_VALUES:
+            # Non-boolean value: enable the flag and store the value in the companion
+            setattr(pf.settings, matched_field, True)
+            setattr(pf.settings, optional_bool_fields[matched_field], val)
+        else:
+            bool_val = val.lower() not in ("false", "no", "0") if val else True
+            setattr(pf.settings, matched_field, bool_val)
+    elif matched_field in bool_fields:
         bool_val = val.lower() not in ("false", "no", "0") if val else True
         setattr(pf.settings, matched_field, bool_val)
     else:
         # String directives
         setattr(pf.settings, matched_field, val if val else None)
+        # Setting dotenv-path implicitly enables dotenv-load
+        if matched_field == "dotenv_path" and val:
+            pf.settings.dotenv_load = True
 
 
 # ---------------------------------------------------------------------------

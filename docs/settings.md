@@ -6,6 +6,7 @@ Global configuration directives that affect the entire Promptfile:
 
 ```
 set dotenv-load
+set dotenv-load ".env.local"
 set shell "bash"
 set working-dir "/home/deploy/app"
 ```
@@ -14,9 +15,10 @@ set working-dir "/home/deploy/app"
 
 | Directive | Description |
 |-----------|-------------|
-| `set dotenv-load` | Automatically load a `.env` file from the working directory |
-| `set dotenv-path "path"` | Custom `.env` file path |
-| `set dotenv-required` | Error if `.env` is missing |
+| `set dotenv-load` | Automatically load `.env` from the working directory |
+| `set dotenv-load "path"` | Load a specific env file (enables loading and sets the path) |
+| `set dotenv-path "path"` | Custom env file path (implicitly enables `dotenv-load`) |
+| `set dotenv-required` | Error if the env file is missing |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set working-dir "path"` | Set the working directory for all tasks |
 | `set export` | Export all variables to the environment |

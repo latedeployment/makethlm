@@ -1616,6 +1616,61 @@ task build:
 """)
         assert pf.settings.dotenv_path == ".env.local"
 
+    def test_set_dotenv_path_implies_dotenv_load(self):
+        """Setting dotenv-path should implicitly enable dotenv-load."""
+        pf = parse("""\
+set dotenv-path ".env.production"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_path == ".env.production"
+        assert pf.settings.dotenv_load is True
+
+    def test_set_dotenv_load_with_path(self):
+        """dotenv-load accepts a file path to both enable loading and set the path."""
+        pf = parse("""\
+set dotenv-load ".env.local"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_load is True
+        assert pf.settings.dotenv_path == ".env.local"
+
+    def test_set_dotenv_load_with_unquoted_path(self):
+        """dotenv-load accepts an unquoted file path."""
+        pf = parse("""\
+set dotenv-load .env.staging
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_load is True
+        assert pf.settings.dotenv_path == ".env.staging"
+
+    def test_set_dotenv_load_with_path_directory(self):
+        """dotenv-load accepts a path with directories."""
+        pf = parse("""\
+set dotenv-load "config/.env"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_load is True
+        assert pf.settings.dotenv_path == "config/.env"
+
+    def test_set_dotenv_load_true_does_not_set_path(self):
+        """dotenv-load with explicit 'true' should not set dotenv_path."""
+        pf = parse("""\
+set dotenv-load true
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_load is True
+        assert pf.settings.dotenv_path is None
+
     def test_set_dotenv_required(self):
         pf = parse("""\
 set dotenv-required
