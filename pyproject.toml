@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makethlm"
-version = "0.1.0"
+version = "0.0.1"
 description = "A Justfile/Makefile for LLM prompts — define tasks as natural language, run them with any LLM."
 readme = "README.md"
 license = "MIT"
