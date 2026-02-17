@@ -599,15 +599,17 @@ Global configuration directives that affect the entire Promptfile:
 
 ```
 set dotenv-load
+set dotenv-load ".env.local"
 set shell "bash"
 set working-dir "/home/deploy/app"
 ```
 
 | Directive | Description |
 |-----------|-------------|
-| `set dotenv-load` | Automatically load a `.env` file from the working directory |
-| `set dotenv-path "path"` | Custom `.env` file path |
-| `set dotenv-required` | Error if `.env` is missing |
+| `set dotenv-load` | Automatically load `.env` from the working directory |
+| `set dotenv-load "path"` | Load a specific env file (enables loading and sets the path) |
+| `set dotenv-path "path"` | Custom env file path (implicitly enables `dotenv-load`) |
+| `set dotenv-required` | Error if the env file is missing |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set working-dir "path"` | Set the working directory for all tasks |
 | `set export` | Export all variables to the environment |
@@ -617,6 +619,16 @@ set working-dir "/home/deploy/app"
 | `set tempdir "path"` | Temporary directory for recipes |
 | `set allow-duplicate-tasks` | Allow redefining tasks (last wins) |
 | `set allow-duplicate-variables` | Allow redefining variables |
+
+`dotenv-load` accepts an optional file path. When a path is provided, it both enables loading and sets the file — equivalent to `set dotenv-load` plus `set dotenv-path`. Setting `dotenv-path` alone also implicitly enables loading. At runtime, dotenv paths also support `$ENV_VAR` and `~` expansion.
+
+String directive values support the same expressions as variable declarations — concatenation with `+`, backtick commands, and if/else:
+
+```
+project := "/opt/myapp"
+set working-dir project + "/src"
+set dotenv-load project + "/.env.production"
+```
 
 ### Export Variables
 
@@ -918,6 +930,7 @@ export secret := "key"
 
 # Set directives (Justfile-compatible)
 set dotenv-load
+set dotenv-load ".env.local"
 set shell "bash"
 set working-dir "/path"
 set export

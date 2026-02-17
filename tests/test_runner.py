@@ -913,6 +913,94 @@ task show:
             assert result.success
             assert "loaded_value" in result.task_results[0].prompt_sent
 
+    def test_dotenv_load_with_path(self):
+        """dotenv-load with a file path loads that specific file."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = os.path.join(tmpdir, ".env.custom")
+            with open(env_path, "w") as f:
+                f.write('PF_DOTENV_CUSTOM=custom_value\n')
+
+            pf = parse(f"""\
+set dotenv-load "{env_path}"
+
+task show:
+    value is ${{PF_DOTENV_CUSTOM}}
+""")
+            os.environ.pop("PF_DOTENV_CUSTOM", None)
+
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+
+            try:
+                result = runner.run("show")
+            finally:
+                os.environ.pop("PF_DOTENV_CUSTOM", None)
+
+            assert result.success
+            assert "custom_value" in result.task_results[0].prompt_sent
+
+    def test_dotenv_path_expands_env_vars(self):
+        """dotenv path supports $VAR and ${VAR} expansion."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = os.path.join(tmpdir, ".env.expanded")
+            with open(env_path, "w") as f:
+                f.write('PF_DOTENV_EXPANDED=it_works\n')
+
+            pf = parse("""\
+set dotenv-load "$PF_TEST_DOTENV_DIR/.env.expanded"
+
+task show:
+    value is ${PF_DOTENV_EXPANDED}
+""")
+            os.environ.pop("PF_DOTENV_EXPANDED", None)
+            os.environ["PF_TEST_DOTENV_DIR"] = tmpdir
+
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+
+            try:
+                result = runner.run("show")
+            finally:
+                os.environ.pop("PF_DOTENV_EXPANDED", None)
+                os.environ.pop("PF_TEST_DOTENV_DIR", None)
+
+            assert result.success
+            assert "it_works" in result.task_results[0].prompt_sent
+
+    def test_dotenv_path_expands_tilde(self):
+        """dotenv path supports ~ (home directory) expansion."""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = os.path.join(tmpdir, ".env.tilde")
+            with open(env_path, "w") as f:
+                f.write('PF_DOTENV_TILDE=tilde_works\n')
+
+            # Use ~ in the path and mock expanduser to point at our tmpdir
+            tilde_path = "~/.env.tilde"
+
+            pf = parse(f"""\
+set dotenv-load "{tilde_path}"
+
+task show:
+    value is ${{PF_DOTENV_TILDE}}
+""")
+            os.environ.pop("PF_DOTENV_TILDE", None)
+
+            dispatcher = DryRunDispatcher()
+            runner = Runner(pf, dispatcher)
+
+            with mock.patch("os.path.expanduser", side_effect=lambda p: p.replace("~", tmpdir, 1)):
+                try:
+                    result = runner.run("show")
+                finally:
+                    os.environ.pop("PF_DOTENV_TILDE", None)
+
+            assert result.success
+            assert "tilde_works" in result.task_results[0].prompt_sent
+
 
 # ---------------------------------------------------------------------------
 # Runner — set shell

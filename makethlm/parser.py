@@ -360,6 +360,20 @@ def _strip_quotes(val: str) -> str:
     return val
 
 
+def _resolve_set_value(raw: str, pf: "Promptfile", lineno: int) -> str:
+    """Resolve a set-directive string value.
+
+    Supports the same expressions as variable declarations (quoted strings,
+    backtick commands, concatenation with ``+``, if/else, variable references)
+    while also accepting bare unquoted tokens like ``docker`` or ``bash``.
+    """
+    try:
+        return _parse_var_value(raw, pf, lineno)
+    except ParseError:
+        # Bare unquoted value (e.g. ``set sandbox docker``) — use as-is
+        return raw.strip()
+
+
 def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
     """Parse a 'set <directive> [value]' line."""
     # Map directive names to settings fields
@@ -398,8 +412,8 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
     if matched_key is None:
         raise ParseError(f"unknown set directive: {rest!r}", lineno)
 
-    val = rest[len(matched_key):].strip()
-    val = _strip_quotes(val)
+    raw_val = rest[len(matched_key):].strip()
+    stripped_val = _strip_quotes(raw_val)
 
     _BOOL_VALUES = {"true", "false", "yes", "no", "0", "1"}
 
@@ -418,21 +432,25 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
     }
 
     if matched_field in optional_bool_fields:
-        if val and val.lower() not in _BOOL_VALUES:
-            # Non-boolean value: enable the flag and store the value in the companion
+        if stripped_val and stripped_val.lower() not in _BOOL_VALUES:
+            resolved = _resolve_set_value(raw_val, pf, lineno)
             setattr(pf.settings, matched_field, True)
-            setattr(pf.settings, optional_bool_fields[matched_field], val)
+            setattr(pf.settings, optional_bool_fields[matched_field], resolved)
         else:
-            bool_val = val.lower() not in ("false", "no", "0") if val else True
+            bool_val = stripped_val.lower() not in ("false", "no", "0") if stripped_val else True
             setattr(pf.settings, matched_field, bool_val)
     elif matched_field in bool_fields:
-        bool_val = val.lower() not in ("false", "no", "0") if val else True
+        bool_val = stripped_val.lower() not in ("false", "no", "0") if stripped_val else True
         setattr(pf.settings, matched_field, bool_val)
     else:
-        # String directives
-        setattr(pf.settings, matched_field, val if val else None)
+        # String directives: resolve variables, concatenation, backticks, etc.
+        if raw_val:
+            resolved = _resolve_set_value(raw_val, pf, lineno)
+            setattr(pf.settings, matched_field, resolved)
+        else:
+            setattr(pf.settings, matched_field, None)
         # Setting dotenv-path implicitly enables dotenv-load
-        if matched_field == "dotenv_path" and val:
+        if matched_field == "dotenv_path" and raw_val:
             pf.settings.dotenv_load = True
 
 

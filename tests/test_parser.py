@@ -1681,6 +1681,93 @@ task build:
         assert pf.settings.dotenv_required is True
 
 
+class TestSetDirectiveVariableResolution:
+    """Set directive string values support the same expressions as variables."""
+
+    def test_set_directive_uses_variable_concat(self):
+        """String directive values can reference variables declared above via +."""
+        pf = parse("""\
+project_dir := "/opt/myapp"
+set working-dir project_dir + "/src"
+
+task build:
+    build it
+""")
+        assert pf.settings.working_dir == "/opt/myapp/src"
+
+    def test_set_dotenv_load_uses_variable_concat(self):
+        """dotenv-load path supports variable concatenation."""
+        pf = parse("""\
+config_dir := "/etc/myapp"
+set dotenv-load config_dir + "/.env"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_load is True
+        assert pf.settings.dotenv_path == "/etc/myapp/.env"
+
+    def test_set_dotenv_path_uses_variable_concat(self):
+        """dotenv-path supports variable concatenation."""
+        pf = parse("""\
+base := "/opt"
+set dotenv-path base + "/config/.env"
+
+task build:
+    build it
+""")
+        assert pf.settings.dotenv_path == "/opt/config/.env"
+        assert pf.settings.dotenv_load is True
+
+    def test_set_directive_if_else_expression(self):
+        """String directive values support if/else expressions."""
+        pf = parse("""\
+env := "prod"
+set working-dir if env == "prod" { "/opt/app" } else { "/tmp/app" }
+
+task build:
+    build it
+""")
+        assert pf.settings.working_dir == "/opt/app"
+
+    def test_set_directive_multi_variable_concat(self):
+        """String directive values support multi-part concatenation."""
+        pf = parse("""\
+home := "/home/deploy"
+project := "myapp"
+set working-dir home + "/" + project
+
+task build:
+    build it
+""")
+        assert pf.settings.working_dir == "/home/deploy/myapp"
+
+    def test_set_directive_bare_value_still_works(self):
+        """Bare unquoted values still work (e.g. set sandbox docker)."""
+        pf = parse("""\
+task build:
+    build it
+""")
+        # Verify existing bare-value directives still parse
+        pf2 = parse("""\
+set sandbox docker
+
+task build:
+    build it
+""")
+        assert pf2.settings.sandbox == "docker"
+
+    def test_set_directive_quoted_string_still_works(self):
+        """Plain quoted strings still work as before."""
+        pf = parse("""\
+set shell "/bin/bash"
+
+task build:
+    build it
+""")
+        assert pf.settings.shell == "/bin/bash"
+
+
 # ---------------------------------------------------------------------------
 # Export variables
 # ---------------------------------------------------------------------------

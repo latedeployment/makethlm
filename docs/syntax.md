@@ -11,6 +11,7 @@ A Promptfile consists of these top-level constructs:
 name := "value"                  # Variables
 export secret := "key"           # Exported variables
 set dotenv-load                  # Set directives
+set dotenv-load ".env.local"     # Set directives (with value)
 include "other.pf"               # Includes
 llm claude [model=opus]          # LLM providers
 hosts web [user=deploy]:         # Host groups
@@ -61,6 +62,7 @@ export secret := "key"
 
 # Set directives
 set dotenv-load
+set dotenv-load ".env.local"
 set shell "bash"
 set working-dir "/path"
 set export

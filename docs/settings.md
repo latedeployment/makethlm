@@ -29,6 +29,66 @@ set working-dir "/home/deploy/app"
 | `set allow-duplicate-tasks` | Allow redefining tasks (last wins) |
 | `set allow-duplicate-variables` | Allow redefining variables |
 
+### Variable References in Directives
+
+String directive values support the same expressions as variable declarations: quoted strings, variable references via `+` concatenation, backtick commands, and if/else expressions. Variables declared above the directive are available:
+
+```
+project := "/opt/myapp"
+env := "production"
+
+set working-dir project + "/src"
+set dotenv-load project + "/.env." + env
+set tempdir project + "/tmp"
+set shell if env == "production" { "/bin/bash" } else { "/bin/sh" }
+```
+
+### Environment Files (dotenv)
+
+By default, environment files are not loaded. Use `set dotenv-load` to enable loading:
+
+```
+# Load the default .env file
+set dotenv-load
+
+# Load a specific file instead of .env
+set dotenv-load ".env.local"
+set dotenv-load ".env.production"
+set dotenv-load "config/.env"
+
+# Use variables declared above
+config_dir := "/etc/myapp"
+set dotenv-load config_dir + "/.env"
+
+# At runtime, paths also support $ENV_VAR and ~ expansion
+set dotenv-load "$HOME/.env"
+set dotenv-load "~/.config/myapp/.env"
+```
+
+When a path is passed directly to `dotenv-load`, it both enables loading and sets the file path in a single directive. This is equivalent to writing both `set dotenv-load` and `set dotenv-path`:
+
+```
+# These two forms are equivalent:
+set dotenv-load ".env.local"
+
+set dotenv-load
+set dotenv-path ".env.local"
+```
+
+Setting `dotenv-path` on its own implicitly enables `dotenv-load` — there is no need to specify both:
+
+```
+# dotenv-path implies dotenv-load
+set dotenv-path ".env.staging"
+```
+
+Add `set dotenv-required` to raise an error if the env file is missing (by default a missing file is silently ignored):
+
+```
+set dotenv-load ".env.production"
+set dotenv-required
+```
+
 ## Includes
 
 Split large Promptfiles across multiple files with the `include` directive:

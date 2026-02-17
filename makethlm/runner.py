@@ -188,8 +188,15 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
 
 
 def _load_dotenv(path: str | None = None, required: bool = False) -> None:
-    """Load a .env file into os.environ (simple key=value parser)."""
-    env_path = Path(path) if path else Path(".env")
+    """Load a .env file into os.environ (simple key=value parser).
+
+    The *path* supports environment variable expansion (``$HOME``, ``${VAR}``)
+    and user home expansion (``~``).
+    """
+    if path:
+        env_path = Path(os.path.expandvars(os.path.expanduser(path)))
+    else:
+        env_path = Path(".env")
     if not env_path.is_file():
         if required:
             raise FileNotFoundError(f".env file not found: {env_path}")
