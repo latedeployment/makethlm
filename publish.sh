@@ -80,8 +80,8 @@ else
 fi
 
 # --- Build ---
-echo "==> Building sdist and wheel for makethlm ${VERSION}..."
-uv build
+echo "==> Building wheel for makethlm ${VERSION}..."
+uv build --wheel
 echo "    Built:"
 ls -lh "$DIST_DIR"/
 
