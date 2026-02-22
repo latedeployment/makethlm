@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-makethlm is a command-line task runner in the tradition of Make and Just, but
+makethlm is a command-line task runner in the tradition of [Make](https://www.gnu.org/software/make/) and [Just](https://github.com/casey/just), but
 designed for a world where tasks are described in natural language and executed
 by LLMs. Define your build, deploy, review, and maintenance workflows as
 prose, interleave them with shell commands, and let your LLM of choice do the
