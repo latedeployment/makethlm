@@ -122,3 +122,9 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `no-exit-message` | flag | Suppress error message on failure |
 | `no-quiet` | flag | Override global `set quiet` for this task |
 | `positional-arguments` | flag | Per-task override for positional argument passing |
+| `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
+| `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
+| `rollback` | string | Task to run if this task fails |
+| `ssh-key` | string | SSH identity file for this task's remote shell steps |
+| `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
+| `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |

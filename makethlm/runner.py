@@ -14,11 +14,12 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep, evaluate_condition
+from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep, evaluate_condition, parse_duration_seconds
 from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, CodexDispatcher, ShellDispatcher
 from .subprocess_util import run_subprocess as _run_subprocess
 
@@ -108,13 +109,10 @@ def topological_levels(pf: Promptfile, target: str) -> list[list[str]]:
 
 def _parse_cache_duration(duration: str) -> float:
     """Parse a cache duration string like '1h', '30m', '1d' into seconds."""
-    m = re.match(r'^(\d+)\s*([smhd])$', duration.strip())
-    if not m:
+    try:
+        return parse_duration_seconds(duration)
+    except ValueError:
         raise ValueError(f"invalid cache duration: {duration!r} (expected e.g. '1h', '30m', '1d')")
-    value = int(m.group(1))
-    unit = m.group(2)
-    multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
-    return value * multipliers[unit]
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +167,15 @@ _DOCKER_GENERATE_PREFIX = (
 def _build_ssh_command(host: str, command: str, group: HostGroup) -> str:
     """Build an SSH command string for remote execution."""
     parts = ["ssh"]
+    if group.identity_file:
+        identity_file = os.path.expandvars(os.path.expanduser(group.identity_file))
+        parts.extend(["-i", shlex.quote(identity_file)])
     if group.port:
         parts.extend(["-p", str(group.port)])
     parts.append("-o")
     parts.append("BatchMode=yes")
+    if group.strict_host_key_checking:
+        parts.extend(["-o", f"StrictHostKeyChecking={group.strict_host_key_checking}"])
     target = f"{group.user}@{host}" if group.user else host
     parts.append(target)
     parts.append(command)
@@ -239,6 +242,7 @@ class Runner:
         self.promptfile_path = promptfile_path
         self.artifacts: dict[str, dict[str, str]] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
         self._cache_dir = Path(os.path.expanduser("~/.cache/makethlm"))
+        self._rollback_stack: set[str] = set()
 
     def _cache_key(self, task: Task) -> str:
         """Generate a cache key for a task based on its name and inputs."""
@@ -357,6 +361,48 @@ class Runner:
             return None
         return task.options.working_dir or self.pf.settings.working_dir
 
+    def _shell_timeout(self, task: Task | None) -> float:
+        """Return the effective timeout for local shell and SSH steps."""
+        if task and task.options.timeout:
+            return parse_duration_seconds(task.options.timeout)
+        return 120
+
+    def _secret_values(self) -> list[str]:
+        """Return likely secret values for log/artifact redaction."""
+        secret_keys = re.compile(r"(SECRET|TOKEN|PASSWORD|PASS|API_KEY|KEY)", re.IGNORECASE)
+        values: set[str] = set()
+        for key, value in os.environ.items():
+            if secret_keys.search(key) and len(value) >= 4:
+                values.add(value)
+        for key, value in self.pf.get_exported_env().items():
+            if secret_keys.search(key) and len(value) >= 4:
+                values.add(value)
+        return sorted(values, key=len, reverse=True)
+
+    def _redact(self, text: str) -> str:
+        """Redact likely secrets from command, prompt, webhook, and artifact output."""
+        redacted = text
+        for value in self._secret_values():
+            redacted = redacted.replace(value, "[redacted]")
+        return redacted
+
+    @staticmethod
+    def _effective_host_group(task: Task, host_group: HostGroup) -> HostGroup:
+        """Return host settings with task-level SSH overrides applied."""
+        return HostGroup(
+            name=host_group.name,
+            hosts=list(host_group.hosts),
+            user=host_group.user,
+            port=host_group.port,
+            identity_file=task.options.ssh_identity or host_group.identity_file,
+            strict_host_key_checking=(
+                task.options.ssh_strict_host_key_checking
+                or host_group.strict_host_key_checking
+            ),
+            timeout=task.options.timeout,
+            line_number=host_group.line_number,
+        )
+
     def _should_echo(self, task: Task, step: TaskStep) -> bool:
         """Return True if a command should be echoed before execution."""
         if step.quiet:
@@ -381,6 +427,32 @@ class Runner:
             return answer.strip().lower() in ("y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
+
+    def _run_rollback(self, failed_task: Task, result: RunResult) -> None:
+        """Run a task's configured rollback hook after failure."""
+        rollback_target = failed_task.options.rollback
+        if not rollback_target:
+            return
+        rollback_target = self.pf.resolve_alias(rollback_target)
+        if failed_task.name in self._rollback_stack or rollback_target in self._rollback_stack:
+            if self.verbose:
+                _log(f"         rollback skipped for {failed_task.name} (cycle guard)", dim=True)
+            return
+        if rollback_target not in self.pf.tasks:
+            if self.verbose:
+                _log(f"         rollback target not found: {rollback_target}", dim=True)
+            return
+
+        if self.verbose:
+            _log(f"         running rollback task {rollback_target} for {failed_task.name}", dim=True)
+
+        self._rollback_stack.update({failed_task.name, rollback_target})
+        try:
+            rollback_result = self.run(rollback_target)
+            result.task_results.extend(rollback_result.task_results)
+        finally:
+            self._rollback_stack.discard(failed_task.name)
+            self._rollback_stack.discard(rollback_target)
 
     def run(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
         """Run a target task and all its dependencies."""
@@ -513,6 +585,7 @@ class Runner:
                 _log(f"  [{idx}/{total}] {task_name} {status} ({_fmt_elapsed(elapsed)})")
 
             if not task_result.success:
+                self._run_rollback(task, result)
                 break
 
         return result
@@ -655,6 +728,9 @@ class Runner:
             status = "done" if task_result.success else "FAILED"
             _log(f"  [{idx}/{total}] {task_name} {status} ({_fmt_elapsed(elapsed)})")
 
+        if not task_result.success:
+            self._run_rollback(task, result)
+
         return task_result
 
     async def _run_level_parallel(
@@ -750,6 +826,7 @@ class Runner:
         all_responses: list[str] = []
         success = True
         dispatcher = self._get_dispatcher(task)
+        effective_group = self._effective_host_group(task, host_group)
 
         for step in resolved_steps:
             if step.kind == "echo":
@@ -758,16 +835,32 @@ class Runner:
                 step_results.append(sr)
                 continue
             elif step.kind == "shell":
-                # Execute on each host
-                for host in host_group.hosts:
+                # Execute on each host. In parallel mode all hosts for this
+                # step are attempted; failure stops the next task step.
+                if task.options.ssh_parallel and len(effective_group.hosts) > 1:
                     if self.verbose:
-                        _log(f"         $ {step.content} (on {host})", dim=True)
-                    sr = self._run_ssh_step(step, host, host_group)
-                    step_results.append(sr)
-                    all_responses.append(sr.response)
-                    if not sr.success:
+                        _log(f"         $ {step.content} (on {len(effective_group.hosts)} hosts in parallel)", dim=True)
+                    with ThreadPoolExecutor(max_workers=len(effective_group.hosts)) as executor:
+                        host_results = list(
+                            executor.map(
+                                lambda h: self._run_ssh_step(step, h, effective_group),
+                                effective_group.hosts,
+                            )
+                        )
+                    step_results.extend(host_results)
+                    all_responses.extend(sr.response for sr in host_results)
+                    if any(not sr.success for sr in host_results):
                         success = False
-                        break
+                else:
+                    for host in effective_group.hosts:
+                        if self.verbose:
+                            _log(f"         $ {step.content} (on {host})", dim=True)
+                        sr = self._run_ssh_step(step, host, effective_group)
+                        step_results.append(sr)
+                        all_responses.append(sr.response)
+                        if not sr.success:
+                            success = False
+                            break
                 if not success:
                     break
             else:
@@ -878,12 +971,13 @@ class Runner:
         env.setdefault("HOME", os.path.expanduser("~"))
 
         try:
+            timeout = self._shell_timeout(task)
             proc = _run_subprocess(
                 cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=timeout,
                 cwd=working_dir,
                 executable=shell_exe,
                 env=env,
@@ -895,27 +989,29 @@ class Runner:
             return StepResult(
                 kind="shell",
                 content=step.content,
-                response=output.strip() if not step.silent else "",
+                response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
             )
         except subprocess.TimeoutExpired:
+            timeout = self._shell_timeout(task)
             return StepResult(
                 kind="shell",
                 content=step.content,
-                response="error: command timed out after 120s",
+                response=f"error: command timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
             )
 
     def _run_ssh_step(self, step: TaskStep, host: str, group: HostGroup) -> StepResult:
         """Execute a shell command on a remote host via SSH."""
         ssh_cmd = _build_ssh_command(host, step.content, group)
+        timeout = parse_duration_seconds(group.timeout) if group.timeout else 120
         try:
             proc = _run_subprocess(
                 ssh_cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=timeout,
             )
             output = proc.stdout
             if proc.stderr:
@@ -924,7 +1020,7 @@ class Runner:
             return StepResult(
                 kind="ssh",
                 content=step.content,
-                response=output.strip() if not step.silent else "",
+                response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
                 host=host,
             )
@@ -932,7 +1028,7 @@ class Runner:
             return StepResult(
                 kind="ssh",
                 content=step.content,
-                response=f"error: SSH to {host} timed out after 120s",
+                response=f"error: SSH to {host} timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
                 host=host,
             )
@@ -943,7 +1039,7 @@ class Runner:
         return StepResult(
             kind="prompt",
             content=step.content,
-            response=dr.response,
+            response=self._redact(dr.response),
             success=dr.success,
         )
 
@@ -968,7 +1064,7 @@ class Runner:
         step_results.append(StepResult(
             kind="docker-generate",
             content=generate_prompt,
-            response=dr.response,
+            response=self._redact(dr.response),
             success=dr.success,
         ))
 
@@ -976,7 +1072,7 @@ class Runner:
             return TaskResult(
                 task_name=task.name,
                 prompt_sent=prompt_sent,
-                response=dr.response,
+                response=self._redact(dr.response),
                 success=False,
                 step_results=step_results,
             )
@@ -1013,7 +1109,7 @@ class Runner:
         tag = f"{task.name}:{docker.tag}"
         build_cmd = f"docker build -t {tag} -f {dockerfile_path} {docker.context}"
         build_step = TaskStep(kind="shell", content=build_cmd)
-        build_result = self._run_shell_step(build_step)
+        build_result = self._run_shell_step(build_step, task=task)
         build_result.kind = "docker-build"
         step_results.append(build_result)
 
@@ -1070,19 +1166,63 @@ class Runner:
             "task": task.name,
             "status": status,
             "exit_code": 0 if task_result.success else 1,
-            "stdout": task_result.response[:4096],  # limit size
+            "stdout": self._redact(task_result.response)[:4096],  # limit size
             "duration_ms": int(elapsed * 1000),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                webhook_url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+            preset = None
+            url = webhook_url
+            if ":" in webhook_url:
+                maybe_preset, maybe_url = webhook_url.split(":", 1)
+                if maybe_preset in ("ntfy", "gotify", "discord", "slack") and maybe_url.startswith(("http://", "https://")):
+                    preset = maybe_preset
+                    url = maybe_url
+
+            if preset == "ntfy":
+                body = f"{task.name}: {status}\n{payload['stdout']}".encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={
+                        "Title": f"makethlm {task.name}",
+                        "Tags": "white_check_mark" if task_result.success else "warning",
+                    },
+                    method="POST",
+                )
+            elif preset == "gotify":
+                data = json.dumps({
+                    "title": f"makethlm {task.name}: {status}",
+                    "message": payload["stdout"],
+                    "priority": 5 if task_result.success else 8,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+            elif preset in ("discord", "slack"):
+                data = json.dumps({
+                    "content" if preset == "discord" else "text": (
+                        f"makethlm `{task.name}` {status}\n{payload['stdout']}"
+                    )
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+            else:
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
             urllib.request.urlopen(req, timeout=10)
         except (urllib.error.URLError, OSError) as e:
             if self.verbose:

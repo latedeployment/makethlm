@@ -73,6 +73,12 @@ class TaskOptions:
     webhook_on: str = "always"     # "always", "success", or "failure"
     when: list[str] = field(default_factory=list)  # conditional execution expressions
     cache: str | None = None          # cache duration e.g. "1h", "30m", "1d"
+    timeout: str | None = None        # shell/SSH timeout e.g. "30s", "5m"
+    llm_timeout: str | None = None    # prompt/LLM timeout e.g. "5m"
+    rollback: str | None = None       # task to run if this task fails
+    ssh_identity: str | None = None   # SSH identity file for remote shell steps
+    ssh_strict_host_key_checking: str | None = None  # yes, no, or accept-new
+    ssh_parallel: bool = False        # run each shell step across hosts concurrently
     sandbox: str | None = None       # "docker", "systemd", "bwrap", or "none"
     sandbox_image: str | None = None  # docker image (default: ubuntu:latest)
     sandbox_mount: str | None = None  # extra mount (src:dst)
@@ -106,6 +112,12 @@ class TaskOptions:
             webhook_on=overrides.webhook_on if overrides.webhook_on != "always" else self.webhook_on,
             when=overrides.when if overrides.when else self.when,
             cache=overrides.cache if overrides.cache is not None else self.cache,
+            timeout=overrides.timeout if overrides.timeout is not None else self.timeout,
+            llm_timeout=overrides.llm_timeout if overrides.llm_timeout is not None else self.llm_timeout,
+            rollback=overrides.rollback if overrides.rollback is not None else self.rollback,
+            ssh_identity=overrides.ssh_identity if overrides.ssh_identity is not None else self.ssh_identity,
+            ssh_strict_host_key_checking=overrides.ssh_strict_host_key_checking if overrides.ssh_strict_host_key_checking is not None else self.ssh_strict_host_key_checking,
+            ssh_parallel=overrides.ssh_parallel or self.ssh_parallel,
             sandbox=overrides.sandbox if overrides.sandbox is not None else self.sandbox,
             sandbox_image=overrides.sandbox_image if overrides.sandbox_image is not None else self.sandbox_image,
             sandbox_mount=overrides.sandbox_mount if overrides.sandbox_mount is not None else self.sandbox_mount,
@@ -205,6 +217,9 @@ class HostGroup:
     hosts: list[str] = field(default_factory=list)
     user: str | None = None     # SSH user override
     port: int | None = None     # SSH port override
+    identity_file: str | None = None  # SSH identity file
+    strict_host_key_checking: str | None = None  # yes, no, or accept-new
+    timeout: str | None = None  # effective SSH command timeout
     line_number: int = 0
 
 
@@ -245,6 +260,17 @@ def _builtin_functions() -> dict[str, str]:
     result["num_cpus()"] = str(os.cpu_count() or 1)
     result["home_directory()"] = str(os.path.expanduser("~"))
     return result
+
+
+def parse_duration_seconds(duration: str) -> float:
+    """Parse a duration like '30s', '5m', '1h', '2d', or bare seconds."""
+    m = re.fullmatch(r"(\d+)\s*([smhd])?", duration.strip())
+    if not m:
+        raise ValueError(f"invalid duration: {duration!r} (expected e.g. '30s', '5m', '1h')")
+    value = int(m.group(1))
+    unit = m.group(2) or "s"
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return value * multipliers[unit]
 
 
 # ---------------------------------------------------------------------------

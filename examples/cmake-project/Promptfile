@@ -1,0 +1,17 @@
+project := "native-app"
+
+llm codex [model=gpt-5-codex]
+
+task configure [doc=Configure CMake build directory]:
+    !cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+task build: configure [timeout=2m, doc=Build with CMake]:
+    !cmake --build build -j
+
+task test: build [timeout=2m, doc=Run CTest and explain failures]:
+    !ctest --test-dir build --output-on-failure
+    If any C or C++ tests failed, explain the likely root cause and suggest the smallest fix.
+
+task review-compile-commands [llm=codex, doc=Review compile_commands.json for risky flags]:
+    Read build/compile_commands.json if it exists.
+    Look for missing warnings, unsafe optimization/debug combinations, and portability risks.

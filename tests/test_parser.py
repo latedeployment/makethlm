@@ -1086,6 +1086,19 @@ task backup [on=db]:
         assert group.port == 2222
         assert group.hosts == ["db-primary.internal", "db-replica.internal"]
 
+    def test_host_group_with_ssh_options(self):
+        src = """\
+hosts web [identity-file=/tmp/id_ed25519, strict-host-key-checking=no]:
+    web1.example.com
+
+task deploy [on=web]:
+    !uptime
+"""
+        pf = parse(src)
+        group = pf.host_groups["web"]
+        assert group.identity_file == "/tmp/id_ed25519"
+        assert group.strict_host_key_checking == "no"
+
     def test_multiple_host_groups(self):
         src = """\
 hosts web:
@@ -1393,6 +1406,16 @@ task show:
         assert "os is" in resolved
         assert "{{uname}}" not in resolved
 
+    def test_backtick_disabled_when_not_allowed(self):
+        src = """\
+version := `echo hello-world`
+
+task show:
+    version is {{version}}
+"""
+        with pytest.raises(ParseError, match="backtick command substitution is disabled"):
+            parse(src, allow_backticks=False)
+
 
 # ---------------------------------------------------------------------------
 # Private, group, doc, confirm, os options
@@ -1474,6 +1497,58 @@ task deploy [group=production, confirm, os=linux, doc=Deploy app]:
         assert opts.confirm is True
         assert opts.os_filter == "linux"
         assert opts.doc == "Deploy app"
+
+    def test_timeout_options(self):
+        src = """\
+task slow [timeout=30s, llm-timeout=5m]:
+    !sleep 1
+    explain the result
+"""
+        pf = parse(src)
+        opts = pf.tasks["slow"].options
+        assert opts.timeout == "30s"
+        assert opts.llm_timeout == "5m"
+
+    def test_invalid_timeout_raises(self):
+        src = """\
+task slow [timeout=soon]:
+    !sleep 1
+"""
+        with pytest.raises(ParseError, match="invalid duration"):
+            parse(src)
+
+    def test_rollback_option(self):
+        src = """\
+task rollback:
+    undo deploy
+
+task deploy [rollback=rollback]:
+    deploy
+"""
+        pf = parse(src)
+        assert pf.tasks["deploy"].options.rollback == "rollback"
+
+    def test_unknown_rollback_raises(self):
+        src = """\
+task deploy [rollback=missing]:
+    deploy
+"""
+        with pytest.raises(ParseError, match="rollback targets unknown task"):
+            parse(src)
+
+    def test_ssh_task_options(self):
+        src = """\
+hosts web:
+    h1
+
+task deploy [on=web, ssh-key=/tmp/id_ed25519, ssh-strict-host-key-checking=accept-new, ssh-parallel]:
+    !uptime
+"""
+        pf = parse(src)
+        opts = pf.tasks["deploy"].options
+        assert opts.ssh_identity == "/tmp/id_ed25519"
+        assert opts.ssh_strict_host_key_checking == "accept-new"
+        assert opts.ssh_parallel is True
 
     def test_private_with_other_options(self):
         src = """\

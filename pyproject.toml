@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makethlm"
-version = "0.0.1"
+version = "0.1.0"
 description = "A Justfile/Makefile for LLM prompts — define tasks as natural language, run them with any LLM."
 readme = "README.md"
 license = "MIT"
@@ -42,3 +42,11 @@ include = ["makethlm*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["integration: SSH integration tests requiring Docker"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

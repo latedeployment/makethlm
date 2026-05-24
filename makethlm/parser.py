@@ -66,6 +66,7 @@ from .models import (
     TaskOptions,
     TaskStep,
     _evaluate_expression,
+    parse_duration_seconds,
 )
 from .inventory import parse_ansible_inventory
 
@@ -109,6 +110,7 @@ _BOOLEAN_OPTIONS = {
     "no-exit-message", "no_exit_message",
     "no-quiet", "no_quiet",
     "positional-arguments", "positional_arguments",
+    "ssh-parallel", "ssh_parallel",
     # OS-specific attributes (Justfile-compatible)
     "linux", "macos", "windows", "unix",
 }
@@ -193,6 +195,30 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.webhook_on = value
         elif key == "cache":
             opts.cache = value
+        elif key == "timeout":
+            try:
+                parse_duration_seconds(value)
+            except ValueError as e:
+                raise ParseError(str(e))
+            opts.timeout = value
+        elif key in ("llm-timeout", "llm_timeout"):
+            try:
+                parse_duration_seconds(value)
+            except ValueError as e:
+                raise ParseError(str(e))
+            opts.llm_timeout = value
+        elif key == "rollback":
+            opts.rollback = value
+        elif key in ("ssh-key", "ssh_key", "identity-file", "identity_file"):
+            opts.ssh_identity = value
+        elif key in ("ssh-strict-host-key-checking", "ssh_strict_host_key_checking"):
+            if value not in ("yes", "no", "accept-new"):
+                raise ParseError(
+                    f"ssh_strict_host_key_checking must be 'yes', 'no', or 'accept-new', got {value!r}"
+                )
+            opts.ssh_strict_host_key_checking = value
+        elif key in ("ssh-parallel", "ssh_parallel"):
+            opts.ssh_parallel = value.lower() in ("true", "yes", "1")
         elif key == "sandbox":
             if value not in ("docker", "systemd", "bwrap", "none"):
                 raise ParseError(f"sandbox must be 'docker', 'systemd', 'bwrap', or 'none', got {value!r}")
@@ -360,7 +386,7 @@ def _strip_quotes(val: str) -> str:
     return val
 
 
-def _resolve_set_value(raw: str, pf: "Promptfile", lineno: int) -> str:
+def _resolve_set_value(raw: str, pf: "Promptfile", lineno: int, *, allow_backticks: bool = True) -> str:
     """Resolve a set-directive string value.
 
     Supports the same expressions as variable declarations (quoted strings,
@@ -368,13 +394,13 @@ def _resolve_set_value(raw: str, pf: "Promptfile", lineno: int) -> str:
     while also accepting bare unquoted tokens like ``docker`` or ``bash``.
     """
     try:
-        return _parse_var_value(raw, pf, lineno)
+        return _parse_var_value(raw, pf, lineno, allow_backticks=allow_backticks)
     except ParseError:
         # Bare unquoted value (e.g. ``set sandbox docker``) — use as-is
         return raw.strip()
 
 
-def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
+def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True) -> None:
     """Parse a 'set <directive> [value]' line."""
     # Map directive names to settings fields
     directives = {
@@ -433,7 +459,7 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
 
     if matched_field in optional_bool_fields:
         if stripped_val and stripped_val.lower() not in _BOOL_VALUES:
-            resolved = _resolve_set_value(raw_val, pf, lineno)
+            resolved = _resolve_set_value(raw_val, pf, lineno, allow_backticks=allow_backticks)
             setattr(pf.settings, matched_field, True)
             setattr(pf.settings, optional_bool_fields[matched_field], resolved)
         else:
@@ -445,7 +471,7 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int) -> None:
     else:
         # String directives: resolve variables, concatenation, backticks, etc.
         if raw_val:
-            resolved = _resolve_set_value(raw_val, pf, lineno)
+            resolved = _resolve_set_value(raw_val, pf, lineno, allow_backticks=allow_backticks)
             setattr(pf.settings, matched_field, resolved)
         else:
             setattr(pf.settings, matched_field, None)
@@ -464,6 +490,7 @@ def parse(
     *,
     _included: set[str] | None = None,
     _base_dir: str | None = None,
+    allow_backticks: bool = True,
 ) -> Promptfile:
     """Parse a Promptfile source string into a Promptfile model."""
     pf = Promptfile()
@@ -510,6 +537,7 @@ def parse(
             included_pf = parse(
                 include_source, resolved,
                 _included=_included, _base_dir=os.path.dirname(resolved),
+                allow_backticks=allow_backticks,
             )
             # Merge (included defs can be overridden by local)
             for k, v in included_pf.variables.items():
@@ -538,7 +566,7 @@ def parse(
 
         # ----- set <directive> [value] -----
         if stripped.startswith("set "):
-            _parse_set_directive(stripped[4:].strip(), pf, lineno)
+            _parse_set_directive(stripped[4:].strip(), pf, lineno, allow_backticks=allow_backticks)
             i += 1
             continue
 
@@ -565,7 +593,7 @@ def parse(
                 eq_idx = rest.index(":=")
                 var_name = rest[:eq_idx].strip()
                 var_val_raw = rest[eq_idx + 2 :].strip()
-                var_val = _parse_var_value(var_val_raw, pf, lineno)
+                var_val = _parse_var_value(var_val_raw, pf, lineno, allow_backticks=allow_backticks)
                 pf.variables[var_name] = var_val
                 pf.exported_vars.add(var_name)
                 i += 1
@@ -583,7 +611,7 @@ def parse(
             eq_idx = stripped.index(":=")
             var_name = stripped[:eq_idx].strip()
             var_val_raw = stripped[eq_idx + 2 :].strip()
-            var_val = _parse_var_value(var_val_raw, pf, lineno)
+            var_val = _parse_var_value(var_val_raw, pf, lineno, allow_backticks=allow_backticks)
             pf.variables[var_name] = var_val
             i += 1
             continue
@@ -717,7 +745,13 @@ def parse(
                 raise ParseError("hosts declaration missing name", lineno)
             host_kvs = _parse_kv_pairs(bracket) if bracket else {}
             for k in host_kvs:
-                if k not in ("user", "port"):
+                if k not in (
+                    "user", "port",
+                    "identity-file", "identity_file",
+                    "ssh-key", "ssh_key",
+                    "strict-host-key-checking", "strict_host_key_checking",
+                    "ssh-strict-host-key-checking", "ssh_strict_host_key_checking",
+                ):
                     raise ParseError(f"unknown host option: {k!r}", lineno)
             if group_name in pf.host_groups:
                 raise ParseError(f"duplicate host group: {group_name!r}", lineno)
@@ -735,11 +769,32 @@ def parse(
                 except ValueError:
                     raise ParseError(f"port must be an integer", lineno)
 
+            strict_host_key_checking = (
+                host_kvs.get("strict-host-key-checking")
+                or host_kvs.get("strict_host_key_checking")
+                or host_kvs.get("ssh-strict-host-key-checking")
+                or host_kvs.get("ssh_strict_host_key_checking")
+            )
+            if strict_host_key_checking and strict_host_key_checking not in ("yes", "no", "accept-new"):
+                raise ParseError(
+                    f"strict_host_key_checking must be 'yes', 'no', or 'accept-new'",
+                    lineno,
+                )
+
+            identity_file = (
+                host_kvs.get("identity-file")
+                or host_kvs.get("identity_file")
+                or host_kvs.get("ssh-key")
+                or host_kvs.get("ssh_key")
+            )
+
             pf.host_groups[group_name] = HostGroup(
                 name=group_name,
                 hosts=host_list,
                 user=host_kvs.get("user"),
                 port=port,
+                identity_file=identity_file,
+                strict_host_key_checking=strict_host_key_checking,
                 line_number=lineno,
             )
             continue
@@ -915,6 +970,12 @@ def parse(
                 f"task {task.name!r} references unknown agent {task.options.agent!r}",
                 task.line_number,
             )
+        # Validate rollback hooks
+        if task.options.rollback and task.options.rollback not in pf.tasks:
+            raise ParseError(
+                f"task {task.name!r} rollback targets unknown task {task.options.rollback!r}",
+                task.line_number,
+            )
 
     # Validate alias targets
     for alias_name, alias_target in pf.aliases.items():
@@ -947,7 +1008,7 @@ def _join_continuations(source: str) -> str:
     return "\n".join(result)
 
 
-def _parse_var_value(raw: str, pf: Promptfile, lineno: int) -> str:
+def _parse_var_value(raw: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True) -> str:
     """Parse a variable value: quoted string, backtick command, or expression."""
     raw = raw.strip()
 
@@ -959,6 +1020,8 @@ def _parse_var_value(raw: str, pf: Promptfile, lineno: int) -> str:
 
     # Version from command: v`command`
     if raw.startswith("v`") and raw.endswith("`"):
+        if not allow_backticks:
+            raise ParseError("backtick command substitution is disabled in safe mode", lineno)
         cmd = raw[2:-1]
         try:
             proc = subprocess.run(
@@ -970,6 +1033,8 @@ def _parse_var_value(raw: str, pf: Promptfile, lineno: int) -> str:
 
     # Backtick command substitution
     if raw.startswith("`") and raw.endswith("`"):
+        if not allow_backticks:
+            raise ParseError("backtick command substitution is disabled in safe mode", lineno)
         cmd = raw[1:-1]
         try:
             proc = subprocess.run(

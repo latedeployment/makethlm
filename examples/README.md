@@ -19,6 +19,9 @@ makethlm test            # run it for real
 | **python-project/** | Run pytest, then ask the LLM to explain any failures |
 | **npm-project/** | Typical JS build pipeline with LLM-powered code review |
 | **blog-generator/** | Non-code use case: generate blog posts, summaries, tweet threads |
+| **cmake-project/** | C/C++ CMake configure/build/test workflow with Codex review |
+| **compiler-diagnostics/** | Capture compiler failures as artifacts and ask an LLM to explain them |
+| **python-ci/** | Python lint, compile, test, and security-review workflow |
 
 ## How Promptfiles work
 

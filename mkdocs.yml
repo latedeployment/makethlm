@@ -63,5 +63,6 @@ nav:
     - SSH & Host Inventory: ssh.md
     - LLM Providers: llm-providers.md
     - Settings & Directives: settings.md
+    - Security: security.md
   - CLI Reference: cli.md
   - Secrets (Planned): secrets-injection.md

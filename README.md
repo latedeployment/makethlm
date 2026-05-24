@@ -468,7 +468,7 @@ on remote machines via SSH.
 **Define host groups:**
 
 ```
-hosts web [user=deploy, port=22]:
+hosts web [user=deploy, port=22, identity-file=~/.ssh/deploy, strict-host-key-checking=accept-new]:
     web1.prod.internal
     web2.prod.internal
     web3.prod.internal
@@ -489,7 +489,7 @@ task deploy [on=web]:
 When a task has `[on=<group>]`:
 
 - **Shell commands** (`!` lines) execute on **every host** in the group via
-  SSH, sequentially. If any host fails, execution stops.
+  SSH, sequentially by default. If any host fails, execution stops.
 - **Prompt steps** (natural language) still execute **locally** via the LLM.
 
 This lets you interleave remote operations with local LLM reasoning:
@@ -507,8 +507,20 @@ task deploy [on=web]:
 |--------|---------|-------------|
 | `user` | (none -- uses SSH default) | SSH username |
 | `port` | (none -- uses SSH default of 22) | SSH port |
+| `identity-file` | (none -- uses SSH default) | SSH identity file |
+| `strict-host-key-checking` | (none -- uses SSH default) | SSH host key policy: `yes`, `no`, or `accept-new` |
 
 SSH connections use `BatchMode=yes` for non-interactive operation.
+
+Task-level SSH options can override host group settings:
+
+```
+task deploy [on=web, ssh-key=~/.ssh/deploy, ssh-strict-host-key-checking=yes, ssh-parallel, timeout=45s]:
+    !systemctl restart myapp
+```
+
+`ssh-parallel` runs each shell step across all hosts concurrently, then waits
+for every host before moving to the next step.
 
 ### Includes
 
@@ -598,6 +610,12 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `no-exit-message` | flag | Suppress error message on failure |
 | `no-quiet` | flag | Override global `set quiet` for this task |
 | `positional-arguments` | flag | Per-task override for positional argument passing |
+| `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
+| `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
+| `rollback` | string | Task to run if this task fails |
+| `ssh-key` | string | SSH identity file for this task's remote shell steps |
+| `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
+| `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
 
 Options can be combined with dependencies:
 
@@ -830,12 +848,24 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--list` | `-l` | List all tasks, functions, LLM providers, and host groups |
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
+| `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
+| `--graph` | | Print a task dependency graph and exit |
+| `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
+| `--history [N]` | | Show recent local run history and exit |
+| `--no-history` | | Do not record this run in local history |
+| `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
+| `--safe` | | Enable restrictive safety checks before execution |
+| `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
+| `--allow-shell` | | Allow local shell steps in safe mode |
+| `--allow-ssh` | | Allow SSH shell steps in safe mode |
+| `--allow-docker` | | Allow docker blocks in safe mode |
+| `--allow-llm` | | Allow LLM prompt execution in safe mode |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -856,6 +886,23 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Preview the execution plan without running anything
+makethlm --plan deploy staging
+
+# Print dependency graphs
+makethlm --graph deploy
+makethlm --graph --graph-format dot deploy
+
+# Show local run history
+makethlm history
+makethlm --history 50
+
+# Run with explicit safety permissions
+makethlm --safe --allow-shell --allow-llm test
+
+# Start the local self-hosted UI/API
+makethlm --serve 127.0.0.1:8765
 
 # Use a different model
 makethlm review -m sonnet

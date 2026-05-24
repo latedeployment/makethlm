@@ -8,7 +8,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .models import Task
+from .models import Task, parse_duration_seconds
 from .subprocess_util import run_subprocess
 
 
@@ -64,6 +64,13 @@ class DryRunDispatcher(Dispatcher):
         return DispatchResult(response=f"[dry-run] {task.name}: {prompt}", success=True)
 
 
+def _llm_timeout(task: Task, default: float = 300) -> float:
+    """Return the prompt/LLM timeout for a task."""
+    if task.options.llm_timeout:
+        return parse_duration_seconds(task.options.llm_timeout)
+    return default
+
+
 class ClaudeDispatcher(Dispatcher):
     """Dispatches prompts to the Claude CLI (`claude -p`)."""
 
@@ -89,7 +96,7 @@ class ClaudeDispatcher(Dispatcher):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=_llm_timeout(task),
             )
             return DispatchResult(
                 response=result.stdout,
@@ -102,7 +109,7 @@ class ClaudeDispatcher(Dispatcher):
             )
         except subprocess.TimeoutExpired:
             return DispatchResult(
-                response="error: claude CLI timed out after 300s",
+                response=f"error: claude CLI timed out after {_llm_timeout(task):.0f}s",
                 success=False,
             )
 
@@ -137,7 +144,7 @@ class CodexDispatcher(Dispatcher):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=_llm_timeout(task),
                 input=prompt,
             )
             response = result.stdout
@@ -154,7 +161,7 @@ class CodexDispatcher(Dispatcher):
             )
         except subprocess.TimeoutExpired:
             return DispatchResult(
-                response="error: codex CLI timed out after 300s",
+                response=f"error: codex CLI timed out after {_llm_timeout(task):.0f}s",
                 success=False,
             )
 
@@ -264,7 +271,7 @@ class ShellDispatcher(Dispatcher):
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=_llm_timeout(task),
             )
             return DispatchResult(
                 response=result.stdout,
@@ -272,6 +279,6 @@ class ShellDispatcher(Dispatcher):
             )
         except subprocess.TimeoutExpired:
             return DispatchResult(
-                response=f"error: command timed out after 300s",
+                response=f"error: command timed out after {_llm_timeout(task):.0f}s",
                 success=False,
             )

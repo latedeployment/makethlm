@@ -173,3 +173,22 @@ class TestCodexDispatcher:
 
         cmd = mock_run.call_args.args[0]
         assert ["--model", "gpt-5.1-codex"] == cmd[cmd.index("--model"):cmd.index("--model") + 2]
+
+    @patch("makethlm.dispatcher.run_subprocess")
+    def test_llm_timeout_option_is_used(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+        task = Task(
+            name="review",
+            steps=[TaskStep(kind="prompt", content="review it")],
+            options=TaskOptions(llm_timeout="2m"),
+        )
+        d = CodexDispatcher()
+
+        d.dispatch("review it", task)
+
+        assert mock_run.call_args.kwargs["timeout"] == 120

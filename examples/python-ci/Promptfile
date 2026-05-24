@@ -1,0 +1,14 @@
+project := "python-service"
+
+task lint [timeout=2m]:
+    !ruff check .
+
+task typecheck [timeout=2m]:
+    !python -m compileall makethlm tests
+
+task test: lint typecheck [timeout=5m]:
+    !pytest -q
+    If tests failed, summarize the first failing test and the smallest likely fix.
+
+task security-review [llm=codex, llm-timeout=5m]:
+    Review the current Python diff for unsafe subprocess use, secret leakage, and path handling.

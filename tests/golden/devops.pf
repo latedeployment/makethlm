@@ -1,0 +1,15 @@
+project := "demo"
+
+hosts web [user=deploy, identity-file=~/.ssh/deploy, strict-host-key-checking=accept-new]:
+    web1.example.com
+    web2.example.com
+
+task build [timeout=30s]:
+    !echo build {{project}}
+
+task rollback:
+    !echo rollback
+
+task deploy(env): build [on=web, ssh-parallel, llm-timeout=2m, rollback=rollback]:
+    !echo deploy {{env}}
+    verify {{project}} on {{env}}

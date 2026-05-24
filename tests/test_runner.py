@@ -330,6 +330,22 @@ task quiet:
         sr = result.task_results[0].step_results
         assert sr[0].response == ""  # output suppressed
 
+    @patch("makethlm.runner._run_subprocess")
+    def test_shell_timeout_option_is_used(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args="sleep 1", returncode=0, stdout="ok\n", stderr=""
+        )
+        pf = parse("""\
+task slow [timeout=30s]:
+    !sleep 1
+""")
+        runner = Runner(pf, DryRunDispatcher())
+
+        result = runner.run("slow")
+
+        assert result.success
+        assert mock_run.call_args.kwargs["timeout"] == 30
+
     def test_shell_with_variable_interpolation(self):
         pf = parse("""\
 project := "myapp"
@@ -607,6 +623,20 @@ task deploy [on=web]:
         assert "deploy@h1" in cmd
         assert "uptime" in cmd
 
+    def test_ssh_builds_command_with_identity_and_host_key_policy(self):
+        from makethlm.runner import _build_ssh_command
+        from makethlm.models import HostGroup
+
+        group = HostGroup(
+            name="web",
+            hosts=["h1"],
+            identity_file="/tmp/id_ed25519",
+            strict_host_key_checking="accept-new",
+        )
+        cmd = _build_ssh_command("h1", "uptime", group)
+        assert "-i /tmp/id_ed25519" in cmd
+        assert "-o StrictHostKeyChecking=accept-new" in cmd
+
     def test_ssh_without_user(self):
         from makethlm.runner import _build_ssh_command
         from makethlm.models import HostGroup
@@ -662,6 +692,28 @@ task deploy [on=web]:
         # Should stop after first host failure
         assert len(sr) == 1
         assert sr[0].host == "host1"
+
+    def test_ssh_parallel_runs_all_hosts_for_step(self):
+        pf = parse("""\
+hosts web:
+    host1
+    host2
+
+task deploy [on=web, ssh-parallel]:
+    !uptime
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        def _fake_ssh(step, host, group):
+            return StepResult(kind="ssh", content=step.content, response=host, success=True, host=host)
+
+        with patch.object(runner, "_run_ssh_step", side_effect=_fake_ssh) as mock_ssh:
+            result = runner.run("deploy")
+
+        assert result.success
+        assert mock_ssh.call_count == 2
+        hosts = [sr.host for sr in result.task_results[0].step_results]
+        assert hosts == ["host1", "host2"]
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1130,22 @@ task show:
 
         assert result.success
         assert "all_exported" in result.task_results[0].step_results[0].response
+
+
+class TestSecretRedaction:
+    def test_shell_output_redacts_exported_secret(self):
+        pf = parse("""\
+export API_KEY := "secret123"
+
+task show:
+    !echo secret123
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+
+        assert "[redacted]" in result.task_results[0].response
+        assert "secret123" not in result.task_results[0].response
 
 
 # ---------------------------------------------------------------------------
@@ -1749,6 +1817,20 @@ task deploy [webhook=https://hooks.example.com/test]:
             assert payload["task"] == "deploy"
             assert payload["status"] == "success"
 
+    def test_ntfy_webhook_preset(self):
+        pf = parse("""\
+task deploy [webhook=ntfy:https://ntfy.sh/test-topic]:
+    !echo deployed
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        with patch("makethlm.runner.urllib.request.urlopen") as mock_urlopen:
+            runner.run("deploy")
+            req = mock_urlopen.call_args[0][0]
+            assert req.full_url == "https://ntfy.sh/test-topic"
+            assert req.get_method() == "POST"
+            assert req.headers["Title"] == "makethlm deploy"
+
     def test_webhook_on_success_skips_failure(self):
         pf = parse("""\
 task failing [webhook=https://hooks.example.com/test, webhook-on=success]:
@@ -1780,6 +1862,43 @@ task ok [webhook=https://hooks.example.com/test, webhook-on=failure]:
 task t [webhook=https://example.com, webhook-on=bogus]:
     do it
 """)
+
+
+# ---------------------------------------------------------------------------
+# Rollback hooks
+# ---------------------------------------------------------------------------
+
+class TestRollback:
+    def test_failed_task_runs_rollback_task(self):
+        pf = parse("""\
+task rollback:
+    !echo rolled-back
+
+task deploy [rollback=rollback]:
+    !false
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("deploy")
+
+        assert not result.success
+        assert [tr.task_name for tr in result.task_results] == ["deploy", "rollback"]
+        assert "rolled-back" in result.task_results[1].response
+
+    def test_successful_task_does_not_run_rollback_task(self):
+        pf = parse("""\
+task rollback:
+    !echo rolled-back
+
+task deploy [rollback=rollback]:
+    !true
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("deploy")
+
+        assert result.success
+        assert [tr.task_name for tr in result.task_results] == ["deploy"]
 
 
 # ---------------------------------------------------------------------------

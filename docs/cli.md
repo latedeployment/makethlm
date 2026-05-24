@@ -19,12 +19,24 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--list` | `-l` | List all tasks, functions, LLM providers, and host groups |
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
+| `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
+| `--graph` | | Print a task dependency graph and exit |
+| `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
+| `--history [N]` | | Show recent local run history and exit |
+| `--no-history` | | Do not record this run in local history |
+| `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
+| `--safe` | | Enable restrictive safety checks before execution |
+| `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
+| `--allow-shell` | | Allow local shell steps in safe mode |
+| `--allow-ssh` | | Allow SSH shell steps in safe mode |
+| `--allow-docker` | | Allow docker blocks in safe mode |
+| `--allow-llm` | | Allow LLM prompt execution in safe mode |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -45,6 +57,23 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Preview the execution plan without running anything
+makethlm --plan deploy staging
+
+# Print dependency graphs
+makethlm --graph deploy
+makethlm --graph --graph-format dot deploy
+
+# Show local run history
+makethlm history
+makethlm --history 50
+
+# Run with explicit safety permissions
+makethlm --safe --allow-shell --allow-llm test
+
+# Start the local self-hosted UI/API
+makethlm --serve 127.0.0.1:8765
 
 # Use a different model
 makethlm review -m sonnet

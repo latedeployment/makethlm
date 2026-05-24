@@ -1,0 +1,11 @@
+compiler := "gcc"
+
+task build -> compile:
+    !{{compiler}} -Wall -Wextra -Werror -g src/*.c -o app
+
+task explain: build [when=compile.success == "false", llm=codex]:
+    Explain the compiler diagnostics from {{compile.stdout}}.
+    Suggest a minimal patch and mention any undefined behavior risks.
+
+task clean:
+    !rm -f app
