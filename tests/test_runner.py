@@ -715,6 +715,23 @@ task build:
         # No LLM configured, should fall back to the provided dispatcher
         assert task_dispatcher is fallback
 
+    def test_codex_provider_routes_to_codex_dispatcher(self):
+        from makethlm.dispatcher import CodexDispatcher
+
+        pf = parse("""\
+llm codex [model=gpt-5-codex]
+
+task review:
+    review the code
+""")
+        fallback = DryRunDispatcher()
+        runner = Runner(pf, fallback)
+
+        task_dispatcher = runner._get_dispatcher(pf.tasks["review"])
+
+        assert isinstance(task_dispatcher, CodexDispatcher)
+        assert task_dispatcher.default_model == "gpt-5-codex"
+
 
 # ---------------------------------------------------------------------------
 # Runner — alias resolution

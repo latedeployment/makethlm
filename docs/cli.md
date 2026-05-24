@@ -24,6 +24,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
+| `--codex` | | Use the Codex CLI as the default LLM dispatcher |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -53,6 +54,9 @@ makethlm -f ops/Promptfile.pf deploy
 
 # Use any LLM CLI
 makethlm review --shell 'ollama run llama3 "{prompt}"'
+
+# Use Codex CLI
+makethlm review --codex
 
 # List everything
 makethlm --list

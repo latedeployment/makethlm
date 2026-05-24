@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .parser import parse, ParseError
 from .runner import Runner, CycleError, topological_sort, _dispatcher_for_provider
-from .dispatcher import ClaudeDispatcher, Dispatcher, DryRunDispatcher, ShellDispatcher
+from .dispatcher import ClaudeDispatcher, CodexDispatcher, Dispatcher, DryRunDispatcher, ShellDispatcher
 from .models import Promptfile, _evaluate_expression, _builtin_functions
 
 
@@ -84,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--shell",
         default=None,
         help='Shell template for LLM CLI, e.g. \'openai chat -p "{prompt}"\'',
+    )
+    ap.add_argument(
+        "--codex",
+        action="store_true",
+        help="Use the Codex CLI as the default LLM dispatcher",
     )
     ap.add_argument(
         "--var", "-V",
@@ -389,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
         dispatcher = DryRunDispatcher()
     elif args.shell:
         dispatcher = ShellDispatcher(args.shell)
+    elif args.codex:
+        dispatcher = CodexDispatcher(model=args.model)
     else:
         dispatcher = ClaudeDispatcher(model=args.model)
 

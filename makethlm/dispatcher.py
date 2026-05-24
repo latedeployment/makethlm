@@ -107,11 +107,110 @@ class ClaudeDispatcher(Dispatcher):
             )
 
 
+class CodexDispatcher(Dispatcher):
+    """Dispatches prompts to the Codex CLI (`codex exec`)."""
+
+    def __init__(self, model: str | None = None, sandbox: str = "workspace-write"):
+        self.default_model = model
+        self.sandbox = sandbox
+
+    def validate_tool(self) -> str | None:
+        if shutil.which("codex") is None:
+            return "error: 'codex' CLI not found on PATH. Install Codex CLI and run 'codex login'"
+        return None
+
+    def dispatch(self, prompt: str, task: Task) -> DispatchResult:
+        model = task.options.model or self.default_model
+        cmd = [
+            "codex",
+            "--ask-for-approval", "never",
+            "exec",
+            "--sandbox", self.sandbox,
+            "--color", "never",
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
+
+        try:
+            result = run_subprocess(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                input=prompt,
+            )
+            response = result.stdout
+            if result.returncode != 0 and result.stderr and not response:
+                response = result.stderr
+            return DispatchResult(
+                response=response,
+                success=result.returncode == 0,
+            )
+        except FileNotFoundError:
+            return DispatchResult(
+                response="error: 'codex' CLI not found on PATH",
+                success=False,
+            )
+        except subprocess.TimeoutExpired:
+            return DispatchResult(
+                response="error: codex CLI timed out after 300s",
+                success=False,
+            )
+
+
 _NONINTERACTIVE_FLAGS: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
-    "codex": "--full-auto",
     "gemini": "--yolo",
 }
+
+
+_CODEX_SUBCOMMANDS = {
+    "exec", "review", "login", "logout", "mcp", "plugin", "mcp-server",
+    "app-server", "remote-control", "completion", "update", "sandbox",
+    "debug", "apply", "resume", "fork", "cloud", "exec-server",
+    "features", "help",
+}
+
+
+def _inject_codex_exec(template: str) -> str | None:
+    """Rewrite simple Codex templates to use non-interactive `codex exec`."""
+    m = re.match(r"^((?:\S*/)?codex)\b", template)
+    if not m:
+        return None
+
+    tool = m.group(1)
+    rest = template[m.end():]
+    stripped = rest.lstrip()
+    first = stripped.split(None, 1)[0] if stripped else ""
+
+    def _root_flags() -> str:
+        return "" if "--ask-for-approval" in template else " --ask-for-approval never"
+
+    def _exec_flags() -> str:
+        flags = ""
+        if "--sandbox" not in template:
+            flags += " --sandbox workspace-write"
+        if "--color" not in template:
+            flags += " --color never"
+        return flags
+
+    if first == "exec":
+        exec_match = re.match(r"^(\s+exec\b)(.*)$", rest)
+        if exec_match:
+            return (
+                tool
+                + _root_flags()
+                + exec_match.group(1)
+                + _exec_flags()
+                + exec_match.group(2)
+            )
+        return template
+
+    if first in _CODEX_SUBCOMMANDS:
+        return template
+
+    return tool + _root_flags() + " exec" + _exec_flags() + rest
 
 
 def _inject_noninteractive_flags(template: str) -> str:
@@ -121,6 +220,10 @@ def _inject_noninteractive_flags(template: str) -> str:
     are hidden from the user. This injects the appropriate skip-permissions
     flag for known tools so they run non-interactively.
     """
+    codex_template = _inject_codex_exec(template)
+    if codex_template is not None:
+        return codex_template
+
     for tool, flag in _NONINTERACTIVE_FLAGS.items():
         # Match the tool name as the first command token (possibly path-qualified)
         pattern = rf"^((?:\S*/)?{re.escape(tool)})\b"

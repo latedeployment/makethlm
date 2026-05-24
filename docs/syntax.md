@@ -72,6 +72,7 @@ set quiet
 
 # LLM providers
 llm <name> [model=..., key=$..., base_url=..., template=...]
+llm codex [model=gpt-5-codex]
 
 # Host groups
 hosts <name> [user=..., port=...]:

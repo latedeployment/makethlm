@@ -1,12 +1,15 @@
 """Tests for dispatchers."""
 
+import subprocess
 from unittest.mock import patch
 
 from makethlm.dispatcher import (
     ClaudeDispatcher,
+    CodexDispatcher,
     DryRunDispatcher,
     ShellDispatcher,
     _extract_tool_name,
+    _inject_noninteractive_flags,
 )
 from makethlm.models import Task, TaskStep, TaskOptions
 
@@ -72,6 +75,19 @@ class TestValidateTool:
         assert "claude" in err
 
     @patch("makethlm.dispatcher.shutil.which", return_value="/usr/bin/codex")
+    def test_codex_found(self, mock_which):
+        d = CodexDispatcher()
+        assert d.validate_tool() is None
+        mock_which.assert_called_with("codex")
+
+    @patch("makethlm.dispatcher.shutil.which", return_value=None)
+    def test_codex_not_found(self, mock_which):
+        d = CodexDispatcher()
+        err = d.validate_tool()
+        assert err is not None
+        assert "codex" in err
+
+    @patch("makethlm.dispatcher.shutil.which", return_value="/usr/bin/codex")
     def test_shell_tool_found(self, mock_which):
         d = ShellDispatcher('codex "{prompt}"')
         assert d.validate_tool() is None
@@ -87,3 +103,73 @@ class TestValidateTool:
     def test_shell_empty_template(self):
         d = ShellDispatcher("")
         assert d.validate_tool() is None
+
+
+class TestNoninteractiveFlags:
+    def test_codex_template_uses_exec(self):
+        cmd = _inject_noninteractive_flags('codex "{prompt}"')
+        assert cmd == (
+            'codex --ask-for-approval never exec '
+            '--sandbox workspace-write --color never "{prompt}"'
+        )
+
+    def test_codex_exec_template_gets_safe_defaults(self):
+        cmd = _inject_noninteractive_flags('codex exec "{prompt}"')
+        assert cmd == (
+            'codex --ask-for-approval never exec '
+            '--sandbox workspace-write --color never "{prompt}"'
+        )
+
+    def test_codex_exec_template_preserves_explicit_sandbox(self):
+        cmd = _inject_noninteractive_flags('codex exec --sandbox read-only "{prompt}"')
+        assert cmd == (
+            'codex --ask-for-approval never exec '
+            '--color never --sandbox read-only "{prompt}"'
+        )
+
+
+class TestCodexDispatcher:
+    @patch("makethlm.dispatcher.run_subprocess")
+    def test_dispatch_uses_codex_exec_with_prompt_on_stdin(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+        task = Task(name="review", steps=[TaskStep(kind="prompt", content="review it")])
+        d = CodexDispatcher(model="gpt-5-codex")
+
+        result = d.dispatch("review it", task)
+
+        assert result.success
+        assert result.response == "done"
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:4] == ["codex", "--ask-for-approval", "never", "exec"]
+        assert "--sandbox" in cmd
+        assert "workspace-write" in cmd
+        assert "--color" in cmd
+        assert "never" in cmd
+        assert ["--model", "gpt-5-codex"] == cmd[cmd.index("--model"):cmd.index("--model") + 2]
+        assert cmd[-1] == "-"
+        assert mock_run.call_args.kwargs["input"] == "review it"
+
+    @patch("makethlm.dispatcher.run_subprocess")
+    def test_task_model_overrides_default_model(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+        task = Task(
+            name="review",
+            steps=[TaskStep(kind="prompt", content="review it")],
+            options=TaskOptions(model="gpt-5.1-codex"),
+        )
+        d = CodexDispatcher(model="gpt-5-codex")
+
+        d.dispatch("review it", task)
+
+        cmd = mock_run.call_args.args[0]
+        assert ["--model", "gpt-5.1-codex"] == cmd[cmd.index("--model"):cmd.index("--model") + 2]

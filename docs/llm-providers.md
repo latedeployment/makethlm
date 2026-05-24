@@ -6,6 +6,7 @@ makethlm supports multiple LLM providers. Declare them globally and optionally o
 
 ```
 llm claude [model=opus]
+llm codex [model=gpt-5-codex]
 llm openai [model=gpt-4, key=$OPENAI_API_KEY]
 llm ollama [model=llama3, base_url=http://localhost:11434]
 llm custom [template=my-cli {prompt}]
@@ -21,6 +22,20 @@ The **first declared provider** is the default for all tasks.
 | `key` | API key (prefix with `$` to read from an environment variable) |
 | `base_url` | Custom API endpoint URL |
 | `template` | Shell command template for custom CLI providers (see below) |
+
+## Codex CLI
+
+Codex is supported as a first-class CLI provider:
+
+```
+llm codex [model=gpt-5-codex]
+
+task review [llm=codex]:
+    review the current diff and suggest fixes
+```
+
+makethlm invokes `codex exec` non-interactively and sends the prompt on stdin.
+Install and authenticate Codex first with `codex login`.
 
 ## Custom CLI Providers
 
@@ -59,4 +74,10 @@ Or bypass all configured providers with an arbitrary CLI:
 
 ```bash
 makethlm review --shell 'ollama run llama3 "{prompt}"'
+```
+
+To use Codex as the default dispatcher for a run:
+
+```bash
+makethlm review --codex
 ```

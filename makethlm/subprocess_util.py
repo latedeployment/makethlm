@@ -17,6 +17,7 @@ def run_subprocess(
     cwd: str | None = None,
     executable: str | None = None,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess that dies immediately on Ctrl-C.
 
@@ -28,6 +29,7 @@ def run_subprocess(
     proc = subprocess.Popen(
         cmd,
         shell=shell,
+        stdin=subprocess.PIPE if input is not None else None,
         stdout=subprocess.PIPE if capture_output else None,
         stderr=subprocess.PIPE if capture_output else None,
         text=text,
@@ -37,7 +39,7 @@ def run_subprocess(
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()

@@ -396,6 +396,7 @@ optionally override per task.
 
 ```
 llm claude [model=opus]
+llm codex [model=gpt-5-codex]
 llm openai [model=gpt-4, key=$OPENAI_API_KEY]
 llm ollama [model=llama3, base_url=http://localhost:11434]
 llm custom [template=my-cli {prompt}]
@@ -411,6 +412,18 @@ The **first declared provider** is the default for all tasks.
 | `key` | API key (prefix with `$` to read from an environment variable) |
 | `base_url` | Custom API endpoint URL |
 | `template` | Shell command template for custom CLI providers (see below) |
+
+**Codex CLI** can be used as a first-class provider:
+
+```
+llm codex [model=gpt-5-codex]
+
+task review [llm=codex]:
+    review the current diff and suggest fixes
+```
+
+makethlm invokes `codex exec` non-interactively. Install and authenticate
+Codex first with `codex login`.
 
 **Custom CLI providers** let you use any LLM tool that accepts a prompt on the
 command line. The `{prompt}` placeholder is replaced with the actual prompt
@@ -822,6 +835,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
+| `--codex` | | Use the Codex CLI as the default LLM dispatcher |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -851,6 +865,9 @@ makethlm -f ops/Promptfile.pf deploy
 
 # Use any LLM CLI
 makethlm review --shell 'ollama run llama3 "{prompt}"'
+
+# Use Codex CLI
+makethlm review --codex
 
 # List everything
 makethlm --list

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep, evaluate_condition
-from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, ShellDispatcher
+from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, CodexDispatcher, ShellDispatcher
 from .subprocess_util import run_subprocess as _run_subprocess
 
 
@@ -183,6 +183,8 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
     """Create a Dispatcher from an LLMProvider configuration."""
     if provider.shell_template:
         return ShellDispatcher(provider.shell_template)
+    if provider.name.lower() == "codex":
+        return CodexDispatcher(model=provider.model)
     # Default: use Claude CLI dispatcher
     return ClaudeDispatcher(model=provider.model)
 
