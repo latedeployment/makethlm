@@ -155,3 +155,19 @@ task build:
 
     assert code == 0
     assert "[ok] build" in out
+
+
+def test_dry_run_does_not_execute_shell_steps(tmp_path, capsys):
+    marker = tmp_path / "marker"
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text(f"""\
+task build:
+    !touch {marker}
+""")
+
+    code = main(["-f", str(promptfile), "--dry-run", "build"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert f"! touch {marker}" in out
+    assert not marker.exists()

@@ -817,7 +817,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Run
-    runner = Runner(pf, dispatcher, quiet=args.quiet, verbose=not args.dry_run, promptfile_path=str(pf_path))
+    runner = Runner(
+        pf,
+        dispatcher,
+        quiet=args.quiet,
+        verbose=not args.dry_run,
+        promptfile_path=str(pf_path),
+        dry_run=args.dry_run,
+    )
     try:
         started = time.monotonic()
         result = runner.run(target, args=task_args)

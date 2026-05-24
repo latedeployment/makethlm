@@ -232,6 +232,7 @@ class Runner:
         quiet: bool = False,
         verbose: bool = True,
         promptfile_path: str | None = None,
+        dry_run: bool = False,
     ):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
@@ -240,6 +241,7 @@ class Runner:
         self.quiet = quiet  # global quiet from CLI or settings
         self.verbose = verbose and not quiet  # show progress unless quiet
         self.promptfile_path = promptfile_path
+        self.dry_run = dry_run
         self.artifacts: dict[str, dict[str, str]] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
         self._cache_dir = Path(os.path.expanduser("~/.cache/makethlm"))
         self._rollback_stack: set[str] = set()
@@ -305,6 +307,9 @@ class Runner:
 
         Priority: agent LLM/model > per-task LLM > default LLM > fallback.
         """
+        if self.dry_run:
+            return self.dispatcher
+
         agent = self.pf.get_agent_for_task(task.name)
         provider = self.pf.get_llm_for_task(task.name)
 
@@ -788,7 +793,10 @@ class Runner:
                 if self.verbose:
                     cmd_preview = step.content if len(step.content) <= 60 else step.content[:57] + "..."
                     _log(f"         $ {cmd_preview}", dim=True)
-                sr = self._run_shell_step(step, task=task, working_dir=working_dir)
+                if self.dry_run:
+                    sr = StepResult(kind="shell", content=step.content, response="", success=True)
+                else:
+                    sr = self._run_shell_step(step, task=task, working_dir=working_dir)
             else:
                 if self.verbose:
                     prompt_preview = step.content.split("\n")[0]
@@ -837,7 +845,16 @@ class Runner:
             elif step.kind == "shell":
                 # Execute on each host. In parallel mode all hosts for this
                 # step are attempted; failure stops the next task step.
-                if task.options.ssh_parallel and len(effective_group.hosts) > 1:
+                if self.dry_run:
+                    for host in effective_group.hosts:
+                        step_results.append(StepResult(
+                            kind="ssh",
+                            content=step.content,
+                            response="",
+                            success=True,
+                            host=host,
+                        ))
+                elif task.options.ssh_parallel and len(effective_group.hosts) > 1:
                     if self.verbose:
                         _log(f"         $ {step.content} (on {len(effective_group.hosts)} hosts in parallel)", dim=True)
                     with ThreadPoolExecutor(max_workers=len(effective_group.hosts)) as executor:
@@ -1060,6 +1077,28 @@ class Runner:
 
         if self.verbose:
             _log(f"         > generating Dockerfile via LLM ...", dim=True)
+        if self.dry_run:
+            step_results.append(StepResult(
+                kind="docker-generate",
+                content=generate_prompt,
+                response="[dry-run] generate Dockerfile",
+                success=True,
+            ))
+            build_cmd = f"docker build -t {task.name}:{docker.tag} -f {os.path.join(docker.context, docker.file)} {docker.context}"
+            step_results.append(StepResult(
+                kind="docker-build",
+                content=build_cmd,
+                response="[dry-run] build Docker image",
+                success=True,
+            ))
+            return TaskResult(
+                task_name=task.name,
+                prompt_sent=prompt_sent,
+                response="\n".join(sr.response for sr in step_results),
+                success=True,
+                step_results=step_results,
+            )
+
         dr = dispatcher.dispatch(generate_prompt, task)
         step_results.append(StepResult(
             kind="docker-generate",

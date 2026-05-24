@@ -38,3 +38,7 @@ Pull requests should include a clear description, mention affected syntax or CLI
 ## Security & Configuration Tips
 
 Do not commit secrets, `.env` files, API keys, or generated credentials. Be careful with Promptfile backtick variables and shell steps: they execute local commands during parsing or task runs. Use dry runs when reviewing examples that call external LLM tools.
+
+## Pre-Commit Security Review
+
+Before committing code changes, run a security-focused review of the staged diff. Use `makethlm --dry-run pre-commit-security-review` to inspect the gate, then run the task or equivalent local checks. Look specifically for secret leakage, unsafe subprocess usage, path traversal, risky shell/SSH/Docker execution, and changes that weaken safe mode or redaction.

@@ -20,6 +20,7 @@
 - Ruff configuration and golden Promptfile tests.
 - Workflow examples for CMake, compiler diagnostics, and Python CI.
 - Repository contributor guide in `AGENTS.md`.
+- Pre-commit security review task and contributor workflow.
 
 ### Changed
 

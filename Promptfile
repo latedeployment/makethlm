@@ -130,6 +130,17 @@ task systemd-check [linux, no-exit-message]:
     !systemctl status myapp
     verify the service is healthy
 
+# Security gate for contributors and agents before committing code changes
+task pre-commit-security-review [doc=Review staged changes for security before committing, group=security]:
+    !git diff --check
+    !git diff --cached --check
+    !bash -lc 'if git grep -n -I -E "(AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----|ghp_[A-Za-z0-9_]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{20,})" -- . ":!dist" ":!site"; then echo "Potential secret pattern found" >&2; exit 1; fi'
+    Review the staged diff from a security perspective.
+    Focus on secret leakage, unsafe subprocess usage, path traversal,
+    shell/SSH/Docker execution, webhook payloads, safe mode bypasses,
+    and redaction regressions.
+    !git diff --cached --stat
+
 # --------------------------------------------------------------------------
 # Aliases — short names for common tasks
 # --------------------------------------------------------------------------

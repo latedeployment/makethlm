@@ -784,6 +784,18 @@ task review:
         assert isinstance(task_dispatcher, CodexDispatcher)
         assert task_dispatcher.default_model == "gpt-5-codex"
 
+    def test_dry_run_uses_fallback_dispatcher_even_with_provider(self):
+        pf = parse("""\
+llm claude [model=opus]
+
+task review:
+    review the code
+""")
+        fallback = DryRunDispatcher()
+        runner = Runner(pf, fallback, dry_run=True)
+
+        assert runner._get_dispatcher(pf.tasks["review"]) is fallback
+
 
 # ---------------------------------------------------------------------------
 # Runner — alias resolution
