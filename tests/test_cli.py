@@ -36,6 +36,26 @@ task deploy(env): build [on=web, timeout=30s, llm-timeout=2m, ssh-parallel]:
     assert "> verify demo on staging" in out
 
 
+def test_plan_masks_secret_placeholders(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("MAKETHLM_HISTORY_DB", str(tmp_path / "history.sqlite"))
+    monkeypatch.setenv("PLAN_SECRET", "supersecret")
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+set secrets "env"
+
+task review:
+    !echo {{#secret:PLAN_SECRET}}
+    review {{#secret:PLAN_SECRET}}
+""")
+
+    code = main(["-f", str(promptfile), "--plan", "review"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "supersecret" not in out
+    assert "***" in out
+
+
 def test_graph_outputs_mermaid_for_target(tmp_path, capsys):
     promptfile = tmp_path / "Promptfile"
     promptfile.write_text("""\

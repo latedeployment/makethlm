@@ -1159,6 +1159,43 @@ task show:
         assert "[redacted]" in result.task_results[0].response
         assert "secret123" not in result.task_results[0].response
 
+    def test_secret_injection_env_backend_is_redacted(self, monkeypatch):
+        monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
+        pf = parse("""\
+set secrets "env"
+
+task show:
+    !echo {{#secret:PF_TEST_SECRET}}
+    reveal {{#secret:PF_TEST_SECRET}}
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+
+        assert result.success
+        assert "supersecret" not in result.task_results[0].prompt_sent
+        assert "[redacted]" in result.task_results[0].prompt_sent
+        assert "supersecret" not in result.task_results[0].response
+        assert "[redacted]" in result.task_results[0].response
+        assert result.task_results[0].step_results[0].response == "[redacted]"
+
+    def test_secret_injection_masks_in_dry_run(self, monkeypatch):
+        monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
+        pf = parse("""\
+set secrets "env"
+
+task show:
+    reveal {{#secret:PF_TEST_SECRET}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher, verbose=False, dry_run=True)
+
+        result = runner.run("show")
+
+        assert result.success
+        assert dispatcher.dispatched[0][0] == "reveal ***"
+        assert result.task_results[0].prompt_sent == "reveal ***"
+
 
 # ---------------------------------------------------------------------------
 # Runner — default makethlm env vars

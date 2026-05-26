@@ -12,6 +12,10 @@ by LLMs. Define your build, deploy, review, and maintenance workflows as
 prose, interleave them with shell commands, and let your LLM of choice do the
 heavy lifting.
 
+Recent additions include Codex support, execution previews, local history, a
+small self-hosted UI/API server, stricter safety controls, and ready-made
+workflow examples for C, CMake, and Python projects.
+
 ```
 # Promptfile
 
@@ -133,6 +137,9 @@ makethlm --list         # see all tasks
 Lines starting with `!` are shell commands. Everything else is a prompt sent to the LLM. Tasks can depend on each other (`run: build` means "run build first").
 
 More examples in [`examples/`](examples/).
+See also [`examples/cmake-project/`](examples/cmake-project/),
+[`examples/compiler-diagnostics/`](examples/compiler-diagnostics/), and
+[`examples/python-ci/`](examples/python-ci/).
 
 
 ## Promptfile Syntax Reference
@@ -631,6 +638,7 @@ Global configuration directives that affect the entire Promptfile:
 ```
 set dotenv-load
 set dotenv-load ".env.local"
+set secrets "env"
 set shell "bash"
 set working-dir "/home/deploy/app"
 ```
@@ -641,6 +649,11 @@ set working-dir "/home/deploy/app"
 | `set dotenv-load "path"` | Load a specific env file (enables loading and sets the path) |
 | `set dotenv-path "path"` | Custom env file path (implicitly enables `dotenv-load`) |
 | `set dotenv-required` | Error if the env file is missing |
+| `set secrets "backend"` | Select a secrets backend such as `env`, `infisical`, `1password`, or `sops` |
+| `set secrets-project "name"` | Infisical project name or ID |
+| `set secrets-environment "name"` | Infisical environment name |
+| `set secrets-vault "name"` | 1Password vault name |
+| `set secrets-file "path"` | SOPS encrypted secrets file |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set working-dir "path"` | Set the working directory for all tasks |
 | `set export` | Export all variables to the environment |
@@ -652,6 +665,16 @@ set working-dir "/home/deploy/app"
 | `set allow-duplicate-variables` | Allow redefining variables |
 
 `dotenv-load` accepts an optional file path. When a path is provided, it both enables loading and sets the file — equivalent to `set dotenv-load` plus `set dotenv-path`. Setting `dotenv-path` alone also implicitly enables loading. At runtime, dotenv paths also support `$ENV_VAR` and `~` expansion.
+
+Secrets can be injected with `{{#secret:NAME}}`. The placeholder is resolved at
+runtime and masked in dry-run and plan output:
+
+```make
+set secrets "env"
+
+task deploy:
+    !curl -H "Authorization: Bearer {{#secret:DEPLOY_TOKEN}}" https://api.example.com/deploy
+```
 
 String directive values support the same expressions as variable declarations — concatenation with `+`, backtick commands, and if/else:
 

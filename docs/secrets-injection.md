@@ -1,8 +1,5 @@
 # Secrets Injection
 
-!!! warning "Planned Feature"
-    This feature is not yet implemented.
-
 ## Syntax
 
 ```
@@ -36,8 +33,8 @@ Some backends organize secrets hierarchically. Use `/` separators:
 
 ## Backend Configuration
 
-A new `set secrets` directive configures the backend. The CLI tool is
-assumed to be already authenticated in the current session.
+Use `set secrets` to choose a backend. The CLI tool is assumed to be already
+authenticated in the current session.
 
 ```
 set secrets "infisical"
@@ -125,6 +122,6 @@ Maps to: `os.environ["DEPLOY_TOKEN"]`
 
 - Secrets are never stored in the Promptfile's variable context
 - Secrets never appear in logs (redacted as `***`)
-- `--dry-run` shows `{{#secret:NAME}}` as `***` rather than resolving
+- `--plan` and `--dry-run` show `{{#secret:NAME}}` as `***` rather than resolving
 - `--dump` / `--list` do not resolve secrets
 - Secrets are never written to cache files or webhook payloads

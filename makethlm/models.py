@@ -35,6 +35,11 @@ class Settings:
     dotenv_load: bool = False
     dotenv_path: str | None = None      # custom .env path
     dotenv_required: bool = False        # error if .env missing
+    secrets: str | None = None          # secrets backend name
+    secrets_project: str | None = None  # backend-specific project/name
+    secrets_environment: str | None = None
+    secrets_vault: str | None = None
+    secrets_file: str | None = None
     shell: str | None = None             # shell executable (default: sh)
     working_dir: str | None = None       # global working directory
     export: bool = False                 # export all variables to env
@@ -71,6 +76,7 @@ class TaskOptions:
     register: str | None = None    # register task output as named artifact
     webhook: str | None = None     # webhook URL to call on task completion
     webhook_on: str = "always"     # "always", "success", or "failure"
+    secrets: str | None = None      # per-task secrets backend override
     when: list[str] = field(default_factory=list)  # conditional execution expressions
     cache: str | None = None          # cache duration e.g. "1h", "30m", "1d"
     timeout: str | None = None        # shell/SSH timeout e.g. "30s", "5m"
@@ -110,6 +116,7 @@ class TaskOptions:
             register=overrides.register if overrides.register is not None else self.register,
             webhook=overrides.webhook if overrides.webhook is not None else self.webhook,
             webhook_on=overrides.webhook_on if overrides.webhook_on != "always" else self.webhook_on,
+            secrets=overrides.secrets if overrides.secrets is not None else self.secrets,
             when=overrides.when if overrides.when else self.when,
             cache=overrides.cache if overrides.cache is not None else self.cache,
             timeout=overrides.timeout if overrides.timeout is not None else self.timeout,
@@ -243,6 +250,12 @@ class Task:
     @property
     def has_shell_steps(self) -> bool:
         return any(s.kind == "shell" for s in self.steps)
+
+
+class SecretError(Exception):
+    """Raised when a configured secrets backend cannot resolve a value."""
+
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +935,102 @@ class Promptfile:
         text = re.sub(r"\$\{(\w+)\}", _braced, text)
         return text
 
+    def _secret_backend_for_task(self, task: Task) -> str:
+        """Return the secrets backend for a task."""
+        return task.options.secrets or self.settings.secrets or "env"
+
+    def _resolve_secret(
+        self,
+        secret_ref: str,
+        task: Task,
+        *,
+        promptfile_path: str | None = None,
+    ) -> str:
+        """Resolve a single ``{{#secret:...}}`` reference."""
+        backend = self._secret_backend_for_task(task)
+        ref = secret_ref.strip()
+
+        if backend == "env":
+            value = os.environ.get(ref)
+            if value is None and "/" in ref:
+                value = os.environ.get(ref.replace("/", "_"))
+            if value is None:
+                raise SecretError(f"secret not found in environment: {ref!r}")
+            return value
+
+        if backend == "infisical":
+            cmd = ["infisical", "secrets", "get", ref, "--plain"]
+            if self.settings.secrets_project:
+                cmd.append(f"--projectId={self.settings.secrets_project}")
+            if self.settings.secrets_environment:
+                cmd.append(f"--env={self.settings.secrets_environment}")
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            except FileNotFoundError:
+                raise SecretError("secret backend tool not found: infisical")
+            except subprocess.CalledProcessError as e:
+                msg = (e.stderr or e.stdout or "").strip()
+                raise SecretError(f"infisical failed to resolve {ref!r}: {msg or e}") from e
+            return proc.stdout.strip()
+
+        if backend == "1password":
+            vault = self.settings.secrets_vault
+            if "/" in ref:
+                op_path = ref
+            elif vault:
+                op_path = f"{vault}/{ref}"
+            else:
+                raise SecretError("1password secrets require set secrets-vault or a full op:// path")
+            cmd = ["op", "read", f"op://{op_path}"]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            except FileNotFoundError:
+                raise SecretError("secret backend tool not found: op")
+            except subprocess.CalledProcessError as e:
+                msg = (e.stderr or e.stdout or "").strip()
+                raise SecretError(f"1password failed to resolve {ref!r}: {msg or e}") from e
+            return proc.stdout.strip()
+
+        if backend == "sops":
+            secrets_file = self.settings.secrets_file
+            if not secrets_file:
+                raise SecretError("sops secrets require set secrets-file")
+            base_dir = os.path.dirname(os.path.abspath(promptfile_path)) if promptfile_path else os.getcwd()
+            resolved_file = os.path.normpath(os.path.join(base_dir, secrets_file))
+            extract = "".join(f'["{part}"]' for part in ref.split("/"))
+            cmd = ["sops", "decrypt", "--extract", extract, resolved_file]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            except FileNotFoundError:
+                raise SecretError("secret backend tool not found: sops")
+            except subprocess.CalledProcessError as e:
+                msg = (e.stderr or e.stdout or "").strip()
+                raise SecretError(f"sops failed to resolve {ref!r}: {msg or e}") from e
+            return proc.stdout.strip()
+
+        raise SecretError(f"unknown secrets backend: {backend!r}")
+
+    def _resolve_secrets(
+        self,
+        text: str,
+        task: Task,
+        *,
+        promptfile_path: str | None = None,
+        mask_only: bool = False,
+        secret_callback: Callable[[str], None] | None = None,
+    ) -> str:
+        """Resolve ``{{#secret:NAME}}`` placeholders in text."""
+        def _replace(m: re.Match) -> str:
+            secret_ref = m.group(1).strip()
+            if mask_only:
+                return "***"
+            value = self._resolve_secret(secret_ref, task, promptfile_path=promptfile_path)
+            if secret_callback:
+                secret_callback(value)
+            return value
+
+        return re.sub(r"\{\{#secret:(.+?)\}\}", _replace, text)
+
     def _build_context(
         self,
         task_name: str,
@@ -1043,6 +1152,8 @@ class Promptfile:
         args: dict[str, str] | None = None,
         *,
         promptfile_path: str | None = None,
+        mask_secrets: bool = False,
+        secret_callback: Callable[[str], None] | None = None,
     ) -> str:
         """Return the prompt for a task with @use, {{variables}}, and env vars resolved."""
         task = self.tasks[task_name]
@@ -1052,6 +1163,13 @@ class Promptfile:
         context = self._build_context(task_name, args, promptfile_path=promptfile_path)
         prompt = self._interpolate(prompt, context)
         prompt = self._resolve_env_vars(prompt)
+        prompt = self._resolve_secrets(
+            prompt,
+            task,
+            promptfile_path=promptfile_path,
+            mask_only=mask_secrets,
+            secret_callback=secret_callback,
+        )
 
         return prompt
 
@@ -1061,6 +1179,8 @@ class Promptfile:
         args: dict[str, str] | None = None,
         *,
         promptfile_path: str | None = None,
+        mask_secrets: bool = False,
+        secret_callback: Callable[[str], None] | None = None,
     ) -> list[TaskStep]:
         """Return fully-resolved steps (shell commands get {{var}} interpolation only)."""
         task = self.tasks[task_name]
@@ -1083,6 +1203,13 @@ class Promptfile:
                     content = self.guidance + "\n\n" + content
             else:
                 content = self._interpolate(content, context)
+            content = self._resolve_secrets(
+                content,
+                task,
+                promptfile_path=promptfile_path,
+                mask_only=mask_secrets,
+                secret_callback=secret_callback,
+            )
 
             resolved.append(TaskStep(
                 kind=step.kind,

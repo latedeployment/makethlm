@@ -7,6 +7,7 @@ Global configuration directives that affect the entire Promptfile:
 ```
 set dotenv-load
 set dotenv-load ".env.local"
+set secrets "env"
 set shell "bash"
 set working-dir "/home/deploy/app"
 ```
@@ -19,6 +20,11 @@ set working-dir "/home/deploy/app"
 | `set dotenv-load "path"` | Load a specific env file (enables loading and sets the path) |
 | `set dotenv-path "path"` | Custom env file path (implicitly enables `dotenv-load`) |
 | `set dotenv-required` | Error if the env file is missing |
+| `set secrets "backend"` | Select a secrets backend such as `env`, `infisical`, `1password`, or `sops` |
+| `set secrets-project "name"` | Infisical project name or ID |
+| `set secrets-environment "name"` | Infisical environment name |
+| `set secrets-vault "name"` | 1Password vault name |
+| `set secrets-file "path"` | SOPS encrypted secrets file |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set working-dir "path"` | Set the working directory for all tasks |
 | `set export` | Export all variables to the environment |
@@ -41,6 +47,16 @@ set working-dir project + "/src"
 set dotenv-load project + "/.env." + env
 set tempdir project + "/tmp"
 set shell if env == "production" { "/bin/bash" } else { "/bin/sh" }
+```
+
+Secrets are available with `{{#secret:NAME}}` and are masked in plan/dry-run
+output:
+
+```
+set secrets "env"
+
+task deploy:
+    !curl -H "Authorization: Bearer {{#secret:DEPLOY_TOKEN}}" https://api.example.com/deploy
 ```
 
 ### Environment Files (dotenv)

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import HostGroup, LLMProvider, Promptfile, Task, TaskStep, evaluate_condition, parse_duration_seconds
+from .models import HostGroup, LLMProvider, Promptfile, SecretError, Task, TaskStep, evaluate_condition, parse_duration_seconds
 from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, CodexDispatcher, ShellDispatcher
 from .subprocess_util import run_subprocess as _run_subprocess
 
@@ -245,6 +245,7 @@ class Runner:
         self.artifacts: dict[str, dict[str, str]] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
         self._cache_dir = Path(os.path.expanduser("~/.cache/makethlm"))
         self._rollback_stack: set[str] = set()
+        self._runtime_secret_values: set[str] = set()
 
     def _cache_key(self, task: Task) -> str:
         """Generate a cache key for a task based on its name and inputs."""
@@ -256,9 +257,14 @@ class Runner:
         # Include resolved variables used by this task
         return h.hexdigest()[:16]
 
+    def _register_secret_value(self, value: str) -> None:
+        """Record a resolved secret for later redaction."""
+        if value:
+            self._runtime_secret_values.add(value)
+
     def _get_cached_result(self, task: Task) -> TaskResult | None:
         """Return a cached TaskResult if valid, else None."""
-        if not task.options.cache:
+        if not task.options.cache or self._task_uses_secret_resolution(task):
             return None
         try:
             duration = _parse_cache_duration(task.options.cache)
@@ -382,6 +388,7 @@ class Runner:
         for key, value in self.pf.get_exported_env().items():
             if secret_keys.search(key) and len(value) >= 4:
                 values.add(value)
+        values.update(v for v in self._runtime_secret_values if len(v) >= 4)
         return sorted(values, key=len, reverse=True)
 
     def _redact(self, text: str) -> str:
@@ -458,6 +465,15 @@ class Runner:
         finally:
             self._rollback_stack.discard(failed_task.name)
             self._rollback_stack.discard(rollback_target)
+
+    def _task_uses_secret_resolution(self, task: Task) -> bool:
+        """Return True if a task declares or references secrets."""
+        if any("{{#secret:" in step.content for step in task.steps):
+            return True
+        agent = self.pf.get_agent_for_task(task.name)
+        if agent and "{{#secret:" in agent.instructions:
+            return True
+        return bool(self.pf.guidance and "{{#secret:" in self.pf.guidance)
 
     def run(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
         """Run a target task and all its dependencies."""
@@ -763,8 +779,20 @@ class Runner:
 
     def _run_task(self, task: Task, args: dict[str, str] | None) -> TaskResult:
         """Execute a single task's steps."""
-        resolved_steps = self.pf.resolve_steps(task.name, args, promptfile_path=self.promptfile_path)
-        prompt_sent = self.pf.resolve_prompt(task.name, args, promptfile_path=self.promptfile_path)
+        resolved_steps = self.pf.resolve_steps(
+            task.name,
+            args,
+            promptfile_path=self.promptfile_path,
+            mask_secrets=self.dry_run,
+            secret_callback=self._register_secret_value if not self.dry_run else None,
+        )
+        prompt_sent = self.pf.resolve_prompt(
+            task.name,
+            args,
+            promptfile_path=self.promptfile_path,
+            mask_secrets=self.dry_run,
+            secret_callback=self._register_secret_value if not self.dry_run else None,
+        )
 
         if task.docker:
             return self._run_docker_task(task, resolved_steps, prompt_sent)
@@ -787,11 +815,12 @@ class Runner:
 
         for step in resolved_steps:
             if step.kind == "echo":
-                _log(f"         {step.content}")
+                _log(f"         {self._redact(step.content)}")
                 sr = StepResult(kind="echo", content=step.content, response="", success=True)
             elif step.kind == "shell":
                 if self.verbose:
-                    cmd_preview = step.content if len(step.content) <= 60 else step.content[:57] + "..."
+                    redacted_cmd = self._redact(step.content)
+                    cmd_preview = redacted_cmd if len(redacted_cmd) <= 60 else redacted_cmd[:57] + "..."
                     _log(f"         $ {cmd_preview}", dim=True)
                 if self.dry_run:
                     sr = StepResult(kind="shell", content=step.content, response="", success=True)
@@ -816,7 +845,7 @@ class Runner:
 
         return TaskResult(
             task_name=task.name,
-            prompt_sent=prompt_sent,
+            prompt_sent=self._redact(prompt_sent),
             response="\n".join(all_responses),
             success=success,
             step_results=step_results,
@@ -838,7 +867,7 @@ class Runner:
 
         for step in resolved_steps:
             if step.kind == "echo":
-                _log(f"         {step.content}")
+                _log(f"         {self._redact(step.content)}")
                 sr = StepResult(kind="echo", content=step.content, response="", success=True)
                 step_results.append(sr)
                 continue
@@ -856,7 +885,7 @@ class Runner:
                         ))
                 elif task.options.ssh_parallel and len(effective_group.hosts) > 1:
                     if self.verbose:
-                        _log(f"         $ {step.content} (on {len(effective_group.hosts)} hosts in parallel)", dim=True)
+                        _log(f"         $ {self._redact(step.content)} (on {len(effective_group.hosts)} hosts in parallel)", dim=True)
                     with ThreadPoolExecutor(max_workers=len(effective_group.hosts)) as executor:
                         host_results = list(
                             executor.map(
@@ -871,7 +900,7 @@ class Runner:
                 else:
                     for host in effective_group.hosts:
                         if self.verbose:
-                            _log(f"         $ {step.content} (on {host})", dim=True)
+                            _log(f"         $ {self._redact(step.content)} (on {host})", dim=True)
                         sr = self._run_ssh_step(step, host, effective_group)
                         step_results.append(sr)
                         all_responses.append(sr.response)
@@ -893,7 +922,7 @@ class Runner:
 
         return TaskResult(
             task_name=task.name,
-            prompt_sent=prompt_sent,
+            prompt_sent=self._redact(prompt_sent),
             response="\n".join(all_responses),
             success=success,
             step_results=step_results,
@@ -1093,7 +1122,7 @@ class Runner:
             ))
             return TaskResult(
                 task_name=task.name,
-                prompt_sent=prompt_sent,
+                prompt_sent=self._redact(prompt_sent),
                 response="\n".join(sr.response for sr in step_results),
                 success=True,
                 step_results=step_results,
@@ -1110,7 +1139,7 @@ class Runner:
         if not dr.success:
             return TaskResult(
                 task_name=task.name,
-                prompt_sent=prompt_sent,
+                prompt_sent=self._redact(prompt_sent),
                 response=self._redact(dr.response),
                 success=False,
                 step_results=step_results,
@@ -1155,7 +1184,7 @@ class Runner:
         all_responses = [sr.response for sr in step_results if sr.response]
         return TaskResult(
             task_name=task.name,
-            prompt_sent=prompt_sent,
+            prompt_sent=self._redact(prompt_sent),
             response="\n".join(all_responses),
             success=build_result.success,
             step_results=step_results,

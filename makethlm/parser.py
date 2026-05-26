@@ -209,6 +209,8 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.llm_timeout = value
         elif key == "rollback":
             opts.rollback = value
+        elif key == "secrets":
+            opts.secrets = value
         elif key in ("ssh-key", "ssh_key", "identity-file", "identity_file"):
             opts.ssh_identity = value
         elif key in ("ssh-strict-host-key-checking", "ssh_strict_host_key_checking"):
@@ -407,6 +409,11 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
         "dotenv-load": "dotenv_load",
         "dotenv-path": "dotenv_path",
         "dotenv-required": "dotenv_required",
+        "secrets": "secrets",
+        "secrets-project": "secrets_project",
+        "secrets-environment": "secrets_environment",
+        "secrets-vault": "secrets_vault",
+        "secrets-file": "secrets_file",
         "shell": "shell",
         "working-dir": "working_dir",
         "working_dir": "working_dir",

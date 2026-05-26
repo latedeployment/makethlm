@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from .parser import parse, ParseError
 from .runner import Runner, CycleError, topological_sort, _dispatcher_for_provider
 from .dispatcher import ClaudeDispatcher, CodexDispatcher, Dispatcher, DryRunDispatcher, ShellDispatcher
-from .models import Promptfile, _evaluate_expression, _builtin_functions
+from .models import Promptfile, SecretError, _evaluate_expression, _builtin_functions
 from .history import list_runs, record_run
 
 
@@ -308,6 +308,8 @@ def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, p
             options.append(f"ssh-key={task.options.ssh_identity}")
         if task.options.ssh_strict_host_key_checking:
             options.append(f"ssh-strict-host-key-checking={task.options.ssh_strict_host_key_checking}")
+        if task.options.secrets:
+            options.append(f"secrets={task.options.secrets}")
 
         print(f"  {idx}. {task_name}")
         print(f"     provider: {_provider_label(pf, task_name)}")
@@ -317,7 +319,12 @@ def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, p
         if options:
             print(f"     options: {', '.join(options)}")
         print("     steps:")
-        for step in pf.resolve_steps(task_name, args, promptfile_path=promptfile_path):
+        for step in pf.resolve_steps(
+            task_name,
+            args,
+            promptfile_path=promptfile_path,
+            mask_secrets=True,
+        ):
             if step.kind == "shell":
                 print(f"       ! {step.content}")
             elif step.kind == "echo":
@@ -569,9 +576,21 @@ def main(argv: list[str] | None = None) -> int:
             print("  (set export: all variables exported)")
         print()
         print("settings:")
-        for field_name in ("dotenv_load", "shell", "working_dir", "export",
-                           "positional_arguments", "ignore_comments",
-                           "tempdir", "quiet"):
+        for field_name in (
+            "dotenv_load",
+            "secrets",
+            "secrets_project",
+            "secrets_environment",
+            "secrets_vault",
+            "secrets_file",
+            "shell",
+            "working_dir",
+            "export",
+            "positional_arguments",
+            "ignore_comments",
+            "tempdir",
+            "quiet",
+        ):
             val = getattr(pf.settings, field_name)
             if val:
                 print(f"  {field_name} = {val!r}")
@@ -659,6 +678,8 @@ def main(argv: list[str] | None = None) -> int:
                 parts.append(f"agent: {task.options.agent}")
             if task.options.on:
                 parts.append(f"on: {task.options.on}")
+            if task.options.secrets:
+                parts.append(f"secrets: {task.options.secrets}")
             if task.options.os_filter:
                 parts.append(f"os: {task.options.os_filter}")
             suffix = f" ({'; '.join(parts)})" if parts else ""
@@ -832,6 +853,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except SecretError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

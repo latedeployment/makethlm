@@ -157,6 +157,19 @@ redacted from command output, prompt output, artifacts, and webhook payloads.
 `docs/security.md` documents executable Promptfile risks and safer review
 workflows.
 
+### Secrets Injection
+
+`{{#secret:NAME}}` placeholders are resolved at runtime with configurable
+backends:
+
+- `env`
+- `infisical`
+- `1password`
+- `sops`
+
+Secrets are masked in `--plan` and `--dry-run`, and tasks using secrets bypass
+the result cache to avoid stale secret-dependent outputs.
+
 ## Language/Workflow Examples Added
 
 - `examples/cmake-project/Promptfile`: C/C++ CMake configure/build/test flow.

@@ -1294,6 +1294,32 @@ task build:
         pf = parse(src)
         assert pf.settings.working_dir == "/tmp/myproject"
 
+    def test_set_secrets_backend(self):
+        src = """\
+set secrets "infisical"
+set secrets-project "my-project"
+set secrets-environment "production"
+set secrets-vault "DevOps"
+set secrets-file "secrets.yaml"
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert pf.settings.secrets == "infisical"
+        assert pf.settings.secrets_project == "my-project"
+        assert pf.settings.secrets_environment == "production"
+        assert pf.settings.secrets_vault == "DevOps"
+        assert pf.settings.secrets_file == "secrets.yaml"
+
+    def test_task_secrets_override(self):
+        src = """\
+task deploy [secrets=sops]:
+    deploy it
+"""
+        pf = parse(src)
+        assert pf.tasks["deploy"].options.secrets == "sops"
+
     def test_set_unknown_raises(self):
         src = """\
 set bogus-directive
