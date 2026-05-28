@@ -11,6 +11,7 @@
 - Bare Just-style shell recipes, e.g. `build:` with plain shell command lines.
 - Just compatibility tracking documentation.
 - Promptfile validation with `--check`.
+- Step-level shell output capture with `!cmd -> name`, `{{last.stdout}}`, and `!cmd |>` prompt piping.
 
 ## 0.1.0 - 2026-05-24
 

@@ -162,6 +162,8 @@ class TaskStep:
     silent: bool = False        # @silent -- suppress stdout
     ignore_error: bool = False  # @ignore -- continue on non-zero exit
     quiet: bool = False         # @ prefix -- suppress command echoing
+    capture: str | None = None  # -> name -- expose output as {{name.stdout}}
+    pipe_output: bool = False   # |> -- prepend output to the next prompt step
 
 
 @dataclass
@@ -1217,6 +1219,8 @@ class Promptfile:
                 silent=step.silent,
                 ignore_error=step.ignore_error,
                 quiet=step.quiet,
+                capture=step.capture,
+                pipe_output=step.pipe_output,
             ))
 
         return resolved

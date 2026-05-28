@@ -866,7 +866,7 @@ def _step_result_payload(step: StepResult) -> dict[str, object]:
         "content": step.content,
         "response": step.response,
         "success": step.success,
-        "exit_code": 0 if step.success else 1,
+        "exit_code": step.exit_code if step.exit_code is not None else (0 if step.success else 1),
         "host": step.host,
     }
 

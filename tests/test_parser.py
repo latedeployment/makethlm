@@ -564,6 +564,41 @@ task pipeline:
         assert steps[2].kind == "shell"
         assert steps[3].kind == "prompt"
 
+    def test_shell_step_capture_syntax(self):
+        pf = parse("""\
+task analyze:
+    !git diff --name-only -> changed
+    review {{changed.stdout}}
+""")
+        step = pf.tasks["analyze"].steps[0]
+        assert step.kind == "shell"
+        assert step.content == "git diff --name-only"
+        assert step.capture == "changed"
+
+    def test_shell_step_pipe_syntax(self):
+        pf = parse("""\
+task analyze:
+    !git diff --name-only |>
+    review changed files
+""")
+        steps = pf.tasks["analyze"].steps
+        assert steps[0].kind == "shell"
+        assert steps[0].content == "git diff --name-only"
+        assert steps[0].pipe_output is True
+        assert steps[1].kind == "prompt"
+
+    def test_shell_step_inline_pipe_prompt(self):
+        pf = parse("""\
+task analyze:
+    !git diff --name-only |> review changed files
+""")
+        steps = pf.tasks["analyze"].steps
+        assert len(steps) == 2
+        assert steps[0].kind == "shell"
+        assert steps[0].pipe_output is True
+        assert steps[1].kind == "prompt"
+        assert steps[1].content == "review changed files"
+
 
 # ---------------------------------------------------------------------------
 # Functions

@@ -88,6 +88,8 @@ fn <name>:
 # Tasks
 task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
     !shell command
+    !shell command -> captured
+    !shell command |>
     !@silent command
     !@ignore command
     @echo "message"

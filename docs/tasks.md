@@ -28,7 +28,7 @@ LLM prompt lines.
 
 The **first task** defined in the file is the **default task**. Running `makethlm` with no arguments executes it.
 
-Consecutive lines of natural language are merged into a single prompt and sent to the LLM together. Shell commands (`!` lines) break prompt boundaries, so prompts before and after a shell command become separate LLM calls.
+Consecutive lines of natural language are merged into a single prompt and sent to the LLM together. Shell commands (`!` lines) break prompt boundaries, so prompts before and after a shell command become separate LLM calls. Shell output can be captured for later prompt steps with `!cmd -> name`, then referenced as `{{name.stdout}}`, or piped into the next prompt with `!cmd |>`.
 
 ## Dependencies
 

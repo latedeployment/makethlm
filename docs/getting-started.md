@@ -45,10 +45,11 @@ The real power of makethlm is interleaving shell commands with LLM reasoning:
 
 ```
 task analyze:
-    !git diff --name-only > /tmp/changed.txt
-    review the changed files listed in /tmp/changed.txt for security issues
-    !npm test
-    if any tests failed, explain the root cause
+    !git diff --name-only |>
+    review the changed files for security issues
+
+    !npm test 2>&1 || true |>
+    if tests failed, explain the root cause
 ```
 
 Lines starting with `!` are shell commands. Everything else is a prompt sent to the LLM. Shell commands and prompts alternate naturally -- run a command, reason about its output, run another command.

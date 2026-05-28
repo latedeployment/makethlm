@@ -314,10 +314,21 @@ its output, run another command:
 
 ```
 task analyze:
-    !git diff --name-only > /tmp/changed.txt
-    review the changed files listed in /tmp/changed.txt for security issues
-    !npm test
-    if any tests failed, explain the root cause
+    !git diff --name-only -> changed
+    review these changed files for security issues:
+    {{changed.stdout}}
+
+    !npm test 2>&1 || true -> tests
+    if tests failed, explain the root cause:
+    {{tests.stdout}}
+```
+
+Use `|>` to pass a command's output directly into the next prompt:
+
+```
+task review:
+    !git diff --name-only |>
+    review the changed files for security issues
 ```
 
 Variable interpolation (`{{name}}`) works inside shell commands:
@@ -1075,6 +1086,8 @@ fn <name>:
 # Tasks
 task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
     !shell command
+    !shell command -> captured   # later: {{captured.stdout}}
+    !shell command |>            # pipe output into next prompt
     !@silent command            # suppress output
     !@ignore command            # continue on failure
     !@command                   # quiet (suppress echoing)

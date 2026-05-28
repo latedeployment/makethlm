@@ -127,6 +127,7 @@ class StepResult:
     response: str
     success: bool
     host: str | None = None  # set for SSH-executed steps
+    exit_code: int | None = None
 
 
 @dataclass
@@ -423,6 +424,40 @@ class Runner:
         if self.quiet or self.pf.settings.quiet:
             return False
         return True
+
+    @staticmethod
+    def _step_runtime_values(sr: StepResult) -> dict[str, str]:
+        """Return interpolation values for a completed shell/SSH step."""
+        return {
+            "stdout": sr.response,
+            "stderr": "",
+            "output": sr.response,
+            "exit_code": str(sr.exit_code if sr.exit_code is not None else (0 if sr.success else 1)),
+            "success": "true" if sr.success else "false",
+        }
+
+    def _record_step_context(
+        self,
+        context: dict[str, str],
+        step: TaskStep,
+        sr: StepResult,
+        step_index: int,
+    ) -> None:
+        """Expose a completed shell/SSH step to later prompt interpolation."""
+        if sr.kind not in ("shell", "ssh", "docker-build"):
+            return
+
+        values = self._step_runtime_values(sr)
+        for key, value in values.items():
+            context[f"last.{key}"] = value
+            context[f"step{step_index}.{key}"] = value
+            if step.capture:
+                context[f"{step.capture}.{key}"] = value
+
+    @staticmethod
+    def _format_pipe_context(step: TaskStep, sr: StepResult) -> str:
+        label = step.capture or "previous command"
+        return f"Shell output from {label}:\n{sr.response}".strip()
 
     def _prompt_confirm(self, task: Task) -> bool:
         """Prompt user for confirmation if [confirm] is set. Returns True to proceed."""
@@ -820,11 +855,14 @@ class Runner:
         """Run steps locally."""
         step_results: list[StepResult] = []
         all_responses: list[str] = []
+        prompt_parts: list[str] = []
+        runtime_context: dict[str, str] = {}
+        pending_pipe_outputs: list[str] = []
         success = True
         dispatcher = self._get_dispatcher(task)
         working_dir = self._resolve_working_dir(task)
 
-        for step in resolved_steps:
+        for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
                 sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
@@ -837,13 +875,19 @@ class Runner:
                     sr = StepResult(kind="shell", content=self._redact(step.content), response="", success=True)
                 else:
                     sr = self._run_shell_step(step, task=task, working_dir=working_dir)
+                self._record_step_context(runtime_context, step, sr, step_index)
+                if step.pipe_output and sr.response:
+                    pending_pipe_outputs.append(self._format_pipe_context(step, sr))
             else:
                 if self.verbose:
                     prompt_preview = step.content.split("\n")[0]
                     if len(prompt_preview) > 60:
                         prompt_preview = prompt_preview[:57] + "..."
                     _log(f"         > sending prompt to LLM ...", dim=True)
-                sr = self._run_prompt_step(step, task, dispatcher)
+                pipe_context = "\n\n".join(pending_pipe_outputs)
+                pending_pipe_outputs.clear()
+                sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
+                prompt_parts.append(sr.content)
 
             step_results.append(sr)
             all_responses.append(sr.response)
@@ -856,7 +900,7 @@ class Runner:
 
         return TaskResult(
             task_name=task.name,
-            prompt_sent=self._redact(prompt_sent),
+            prompt_sent=self._redact("\n\n".join(prompt_parts) or prompt_sent),
             response="\n".join(all_responses),
             success=success,
             step_results=step_results,
@@ -872,11 +916,14 @@ class Runner:
         """Run shell steps on each host via SSH. Prompt steps run locally."""
         step_results: list[StepResult] = []
         all_responses: list[str] = []
+        prompt_parts: list[str] = []
+        runtime_context: dict[str, str] = {}
+        pending_pipe_outputs: list[str] = []
         success = True
         dispatcher = self._get_dispatcher(task)
         effective_group = self._effective_host_group(task, host_group)
 
-        for step in resolved_steps:
+        for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
                 sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
@@ -906,34 +953,59 @@ class Runner:
                         )
                     step_results.extend(host_results)
                     all_responses.extend(sr.response for sr in host_results)
+                    combined = StepResult(
+                        kind="ssh",
+                        content=self._redact(step.content),
+                        response="\n".join(sr.response for sr in host_results if sr.response).strip(),
+                        success=not any(not sr.success for sr in host_results),
+                        exit_code=next((sr.exit_code for sr in host_results if sr.exit_code), 0),
+                    )
+                    self._record_step_context(runtime_context, step, combined, step_index)
+                    if step.pipe_output and combined.response:
+                        pending_pipe_outputs.append(self._format_pipe_context(step, combined))
                     if any(not sr.success for sr in host_results):
                         success = False
                 else:
+                    host_step_results: list[StepResult] = []
                     for host in effective_group.hosts:
                         if self.verbose:
                             _log(f"         $ {self._redact(step.content)} (on {host})", dim=True)
                         sr = self._run_ssh_step(step, host, effective_group)
                         step_results.append(sr)
                         all_responses.append(sr.response)
+                        host_step_results.append(sr)
                         if not sr.success:
                             success = False
                             break
+                    combined = StepResult(
+                        kind="ssh",
+                        content=self._redact(step.content),
+                        response="\n".join(sr.response for sr in host_step_results if sr.response).strip(),
+                        success=not any(not sr.success for sr in host_step_results),
+                        exit_code=next((sr.exit_code for sr in host_step_results if sr.exit_code), 0),
+                    )
+                    self._record_step_context(runtime_context, step, combined, step_index)
+                    if step.pipe_output and combined.response:
+                        pending_pipe_outputs.append(self._format_pipe_context(step, combined))
                 if not success:
                     break
             else:
                 # Prompt steps still run locally via LLM
                 if self.verbose:
                     _log(f"         > sending prompt to LLM ...", dim=True)
-                sr = self._run_prompt_step(step, task, dispatcher)
+                pipe_context = "\n\n".join(pending_pipe_outputs)
+                pending_pipe_outputs.clear()
+                sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
                 step_results.append(sr)
                 all_responses.append(sr.response)
+                prompt_parts.append(sr.content)
                 if not sr.success:
                     success = False
                     break
 
         return TaskResult(
             task_name=task.name,
-            prompt_sent=self._redact(prompt_sent),
+            prompt_sent=self._redact("\n\n".join(prompt_parts) or prompt_sent),
             response="\n".join(all_responses),
             success=success,
             step_results=step_results,
@@ -1048,6 +1120,7 @@ class Runner:
                 content=self._redact(step.content),
                 response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
+                exit_code=proc.returncode,
             )
         except subprocess.TimeoutExpired:
             timeout = self._shell_timeout(task)
@@ -1056,6 +1129,7 @@ class Runner:
                 content=self._redact(step.content),
                 response=f"error: command timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
+                exit_code=124,
             )
 
     def _run_ssh_step(self, step: TaskStep, host: str, group: HostGroup) -> StepResult:
@@ -1080,6 +1154,7 @@ class Runner:
                 response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
                 host=host,
+                exit_code=proc.returncode,
             )
         except subprocess.TimeoutExpired:
             return StepResult(
@@ -1088,14 +1163,27 @@ class Runner:
                 response=f"error: SSH to {host} timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
                 host=host,
+                exit_code=124,
             )
 
-    def _run_prompt_step(self, step: TaskStep, task: Task, dispatcher: Dispatcher) -> StepResult:
+    def _run_prompt_step(
+        self,
+        step: TaskStep,
+        task: Task,
+        dispatcher: Dispatcher,
+        runtime_context: dict[str, str] | None = None,
+        pipe_context: str | None = None,
+    ) -> StepResult:
         """Send a prompt step to the LLM dispatcher."""
-        dr = dispatcher.dispatch(step.content, task)
+        prompt = step.content
+        if runtime_context:
+            prompt = self.pf._interpolate(prompt, runtime_context)
+        if pipe_context:
+            prompt = f"{pipe_context}\n\n{prompt}"
+        dr = dispatcher.dispatch(prompt, task)
         return StepResult(
             kind="prompt",
-            content=self._redact(step.content),
+            content=self._redact(prompt),
             response=self._redact(dr.response),
             success=dr.success,
         )
@@ -1216,7 +1304,9 @@ class Runner:
                 stdout_parts.append(sr.response)
             elif sr.kind == "prompt":
                 response_parts.append(sr.response)
-            if not sr.success:
+            if sr.exit_code is not None:
+                last_exit_code = str(sr.exit_code)
+            elif not sr.success:
                 last_exit_code = "1"
 
         self.artifacts[artifact_name] = {

@@ -201,6 +201,31 @@ the result cache to avoid stale secret-dependent outputs.
 - `examples/compiler-diagnostics/Promptfile`: compiler output artifact analysis.
 - `examples/python-ci/Promptfile`: Python lint, compile, test, and security review.
 
+## LLM Workflow Features Implemented
+
+### Step-Level Output Capture
+
+Shell output can be captured and used by later prompts in the same task:
+
+```make
+task analyze:
+    !git diff --name-only -> changed
+    review {{changed.stdout}}
+```
+
+Every shell step also updates `{{last.stdout}}`, `{{last.exit_code}}`, and
+`{{last.success}}`.
+
+### Shell-to-Prompt Piping
+
+Use `|>` to prepend a command's output to the next LLM prompt:
+
+```make
+task analyze:
+    !npm test 2>&1 || true |>
+    explain any failing tests
+```
+
 ## Just Compatibility Implemented
 
 ### Bare Recipes

@@ -1830,6 +1830,78 @@ task build -> output:
 """)
         assert pf.tasks["build"].options.register == "output"
 
+    def test_shell_capture_available_to_later_prompt_in_same_task(self):
+        pf = parse("""\
+task analyze:
+    !printf 'changed-a\\nchanged-b\\n' -> changed
+    Review these changed files:
+    {{changed.stdout}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("analyze")
+
+        prompt = result.task_results[0].step_results[1].content
+        assert "changed-a" in prompt
+        assert "changed-b" in prompt
+        assert "{{changed.stdout}}" not in prompt
+
+    def test_last_stdout_available_to_later_prompt_in_same_task(self):
+        pf = parse("""\
+task analyze:
+    !printf 'last-output\\n'
+    Explain this output:
+    {{last.stdout}}
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("analyze")
+
+        prompt = result.task_results[0].step_results[1].content
+        assert "last-output" in prompt
+        assert "{{last.stdout}}" not in prompt
+
+    def test_last_exit_code_preserves_ignored_shell_failure(self):
+        pf = parse("""\
+task analyze:
+    !@ignore sh -c 'exit 7'
+    Explain exit code {{last.exit_code}}.
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("analyze")
+
+        prompt = result.task_results[0].step_results[1].content
+        assert "exit code 7" in prompt
+
+    def test_pipe_output_prepends_next_prompt(self):
+        pf = parse("""\
+task analyze:
+    !printf 'src/app.py\\n' -> changed |>
+    Review these files for security issues.
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("analyze")
+
+        prompt = result.task_results[0].step_results[1].content
+        assert prompt.startswith("Shell output from changed:")
+        assert "src/app.py" in prompt
+        assert "Review these files for security issues." in prompt
+
+    def test_inline_pipe_prompt_runs_as_next_prompt(self):
+        pf = parse("""\
+task analyze:
+    !printf 'test failure\\n' |> explain the failure
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        result = runner.run("analyze")
+
+        prompt = result.task_results[0].step_results[1].content
+        assert "test failure" in prompt
+        assert "explain the failure" in prompt
+
 
 # ---------------------------------------------------------------------------
 # Webhooks

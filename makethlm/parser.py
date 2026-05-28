@@ -51,6 +51,7 @@ Syntax overview (Justfile-compatible + LLM extensions):
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 from .models import (
@@ -319,6 +320,28 @@ def _collect_body(lines: list[str], start: int) -> tuple[list[str], int]:
     return body, i
 
 
+_STEP_CAPTURE_RE = re.compile(r"^(?P<cmd>.+?)\s+->\s+(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s*$")
+
+
+def _extract_step_routing(command: str) -> tuple[str, str | None, bool, str | None]:
+    """Return command text plus optional capture name and pipe prompt."""
+    pipe_prompt: str | None = None
+    pipe_output = False
+    if "|>" in command:
+        before, after = command.rsplit("|>", 1)
+        command = before.rstrip()
+        pipe_output = True
+        pipe_prompt = after.strip() or None
+
+    capture: str | None = None
+    match = _STEP_CAPTURE_RE.match(command)
+    if match:
+        command = match.group("cmd").rstrip()
+        capture = match.group("name")
+
+    return command, capture, pipe_output, pipe_prompt
+
+
 def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
     """Parse indented body lines into TaskSteps.
 
@@ -367,13 +390,18 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
                 elif prefix == "@quiet":
                     quiet = True
                 rest = rest[space_idx + 1 :].lstrip()
+            rest, capture, pipe_output, pipe_prompt = _extract_step_routing(rest)
             steps.append(TaskStep(
                 kind="shell",
                 content=rest,
                 silent=silent,
                 ignore_error=ignore_error,
                 quiet=quiet,
+                capture=capture,
+                pipe_output=pipe_output,
             ))
+            if pipe_prompt:
+                steps.append(TaskStep(kind="prompt", content=pipe_prompt))
         else:
             prompt_accum.append(stripped)
 
@@ -401,11 +429,13 @@ def _parse_just_body_steps(raw_lines: list[str]) -> list[TaskStep]:
                 stripped = stripped[1:].lstrip()
 
         if stripped:
+            stripped, capture, _pipe_output, _pipe_prompt = _extract_step_routing(stripped)
             steps.append(TaskStep(
                 kind="shell",
                 content=stripped,
                 ignore_error=ignore_error,
                 quiet=quiet,
+                capture=capture,
             ))
     return steps
 

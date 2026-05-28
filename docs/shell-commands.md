@@ -35,10 +35,35 @@ Shell commands and LLM prompts can be **freely interleaved** in a single task. T
 
 ```
 task analyze:
-    !git diff --name-only > /tmp/changed.txt
-    review the changed files listed in /tmp/changed.txt for security issues
-    !npm test
-    if any tests failed, explain the root cause
+    !git diff --name-only -> changed
+    review these changed files for security issues:
+    {{changed.stdout}}
+
+    !npm test 2>&1 || true -> tests
+    if tests failed, explain the root cause:
+    {{tests.stdout}}
+```
+
+## Capturing and Piping Output
+
+Use `-> name` on a shell step to expose that step's output to later prompts in
+the same task:
+
+```
+task review:
+    !git diff --name-only -> changed
+    review {{changed.stdout}}
+```
+
+Every shell step also updates `{{last.stdout}}`, `{{last.exit_code}}`, and
+`{{last.success}}`.
+
+Use `|>` to prepend command output to the next LLM prompt:
+
+```
+task review:
+    !git diff --name-only |>
+    review the changed files for security issues
 ```
 
 ## Variable Interpolation

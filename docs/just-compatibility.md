@@ -34,9 +34,12 @@ build:
     cargo build
 
 task review:
-    !git diff --name-only
+    !git diff --name-only |>
     review the changed files for security issues
 ```
+
+`-> name` shell-step capture and `|>` shell-to-prompt piping are makethlm
+extensions, not Just syntax.
 
 ## Missing or Partial
 
