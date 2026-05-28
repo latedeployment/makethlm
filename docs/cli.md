@@ -27,6 +27,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
+| `--json` | | Emit machine-readable JSON output |
 | `--parallel` | | Run independent dependency tasks in parallel |
 | `--jobs N` | | Limit parallel task workers; implies `--parallel` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
@@ -59,6 +60,12 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Emit machine-readable output
+makethlm --json deploy
+makethlm --plan --json deploy
+makethlm --graph --json deploy
+makethlm history --json
 
 # Run independent dependencies concurrently
 makethlm --parallel deploy

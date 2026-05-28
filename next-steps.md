@@ -34,6 +34,18 @@ makethlm --jobs 4 deploy
 If any task in a dependency level fails, later levels are skipped and the run
 fails.
 
+### Machine-Readable Output
+
+Use `--json` to emit structured output for runs, plans, dependency graphs, and
+history.
+
+```bash
+makethlm --json deploy
+makethlm --plan --json deploy
+makethlm --graph --json deploy
+makethlm history --json
+```
+
 ### Configurable Timeouts
 
 Use task metadata to control shell/SSH and LLM timeouts separately.
@@ -200,13 +212,6 @@ These are the highest-value items still missing or only partially implemented.
 - Automate changelog, version bump, tag, build, and publish steps.
 - Update the Git remote to `git@github.com:latedeployment/makethlm.git`.
 
-### Machine-Readable Output
-
-- Add `--json` for run results.
-- Support JSON plan output.
-- Support JSON history output.
-- Include task name, status, elapsed time, prompt, response, exit code, and steps.
-
 ### Lint and Type Pipeline
 
 - Enforce `uv run ruff check .`.
@@ -289,71 +294,64 @@ Split the largest modules into focused pieces:
 Work through these tasks one by one. Each task should end with tests, docs, and
 a focused commit before starting the next item.
 
-1. Add `--json` run output.
-   Emit machine-readable run results with target, task status, duration, step
-   kinds, prompts, responses, success flags, and exit codes.
-
-2. Add JSON support for `--plan`, `--history`, and `--graph`.
-   Reuse the same schemas where possible and keep text output as the default.
-
-3. Add `makethlm check`.
+1. Add `makethlm check`.
    Validate syntax, dependency references, rollback targets, provider names,
    host groups, agent files, backend tools, and unsafe feature use.
 
-4. Add CI.
+2. Add CI.
    Run `uv run pytest tests/ -q --no-docker`, `uv run ruff check .`, package
    build, and a wheel install smoke test.
 
-5. Enforce Ruff locally.
+3. Enforce Ruff locally.
    Make the existing Ruff config actionable, fix reported issues, and document
    the command in README and contributor docs.
 
-6. Clean release packaging.
+4. Clean release packaging.
    Remove stale generated artifacts from git, update `.gitignore`, refresh the
    remote URL, and add repeatable build/release commands.
 
-7. Add shell completions.
+5. Add shell completions.
    Implement `makethlm completions bash|zsh|fish`, including task names when a
    Promptfile is available.
 
-8. Harden secrets backends.
+6. Harden secrets backends.
     Add subprocess-mocked tests for `infisical`, `op`, and `sops`, add value-free
     audit messages, and add an option to forbid secret injection into LLM prompts.
 
-9. Add native OpenAI dispatcher.
+7. Add native OpenAI dispatcher.
     Implement direct subprocess/API behavior according to the package direction,
     provider validation, timeout handling, tests, and docs.
 
-10. Add native Ollama dispatcher.
+8. Add native Ollama dispatcher.
     Support local Ollama execution with model selection, timeout handling,
     provider validation, tests, and docs.
 
-11. Improve `--serve`.
+9. Improve `--serve`.
     Add task detail views, argument forms, run history detail pages, and safer
     execution controls.
 
-12. Add live output to `--serve`.
+10. Add live output to `--serve`.
     Stream task output to the UI/API without waiting for the run to finish.
 
-13. Split secrets and interpolation out of `models.py`.
+11. Split secrets and interpolation out of `models.py`.
     Move secret resolution and interpolation helpers into focused modules while
     preserving the public API and existing tests.
 
-14. Split runner subsystems.
+12. Split runner subsystems.
     Extract SSH execution, webhooks, history recording, and sandbox wrapping into
     focused modules with targeted tests.
 
-15. Harden sandbox behavior.
+13. Harden sandbox behavior.
     Add tests for Docker, systemd, and bwrap modes, read-only workspace support,
     network-deny defaults, explicit mounts, and threat-boundary docs.
 
-16. Add Docker Compose and systemd examples.
+14. Add Docker Compose and systemd examples.
     Provide realistic Promptfiles and docs for common self-hosted deployments.
 
-17. Add Kubernetes and Ansible examples.
+15. Add Kubernetes and Ansible examples.
     Cover `kubectl` workflows, inventory import, remote deploys, and rollback
     patterns.
 
-18. Add release workflow examples.
+16. Add release workflow examples.
     Include Python package release, GitHub Actions usage, and CMake
     `compile_commands.json` analysis examples.

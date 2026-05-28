@@ -7,6 +7,7 @@
 - Secrets injection with `{{#secret:NAME}}` and env, Infisical, 1Password, and SOPS backends.
 - Parallel CLI execution with `--parallel`.
 - Parallel worker limits with `--jobs N`.
+- Machine-readable JSON output with `--json` for runs, plans, graphs, and history.
 
 ## 0.1.0 - 2026-05-24
 

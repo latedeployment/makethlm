@@ -11,7 +11,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .parser import parse, ParseError
-from .runner import Runner, CycleError, topological_sort, _dispatcher_for_provider
+from .runner import (
+    Runner,
+    CycleError,
+    RunResult,
+    StepResult,
+    TaskResult,
+    topological_sort,
+    _dispatcher_for_provider,
+)
 from .dispatcher import ClaudeDispatcher, CodexDispatcher, Dispatcher, DryRunDispatcher, ShellDispatcher
 from .models import Promptfile, SecretError, _evaluate_expression, _builtin_functions
 from .history import list_runs, record_run
@@ -57,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Print prompts/commands that would be sent without executing",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit machine-readable JSON output",
     )
     ap.add_argument(
         "--parallel",
@@ -284,9 +298,86 @@ def _provider_label(pf: Promptfile, task_name: str) -> str:
     return " ".join(parts)
 
 
+def _task_plan_options(task) -> list[str]:
+    """Return user-facing task options included in plan output."""
+    options: list[str] = []
+    if task.options.timeout:
+        options.append(f"timeout={task.options.timeout}")
+    if task.options.llm_timeout:
+        options.append(f"llm-timeout={task.options.llm_timeout}")
+    if task.options.rollback:
+        options.append(f"rollback={task.options.rollback}")
+    if task.options.when:
+        options.append(f"when={'; '.join(task.options.when)}")
+    if task.options.ssh_identity:
+        options.append(f"ssh-key={task.options.ssh_identity}")
+    if task.options.ssh_strict_host_key_checking:
+        options.append(f"ssh-strict-host-key-checking={task.options.ssh_strict_host_key_checking}")
+    if task.options.secrets:
+        options.append(f"secrets={task.options.secrets}")
+    return options
+
+
+def _plan_payload(
+    pf: Promptfile,
+    target: str,
+    task_args: dict[str, str] | None,
+    promptfile_path: str,
+) -> dict[str, object]:
+    """Return an execution plan without running tasks."""
+    order = topological_sort(pf, target)
+    tasks: list[dict[str, object]] = []
+    for idx, task_name in enumerate(order, 1):
+        task = pf.tasks[task_name]
+        args = task_args if task_name == target else None
+        host_group = pf.get_hosts_for_task(task_name)
+        host_payload: dict[str, object] = {"mode": "local"}
+        if host_group:
+            host_payload = {
+                "mode": "ssh",
+                "group": host_group.name,
+                "count": len(host_group.hosts),
+                "parallel": task.options.ssh_parallel,
+            }
+
+        steps: list[dict[str, str]] = []
+        for step in pf.resolve_steps(
+            task_name,
+            args,
+            promptfile_path=promptfile_path,
+            mask_secrets=True,
+        ):
+            content = step.content
+            if step.kind == "prompt":
+                content = step.content.splitlines()[0] if step.content else ""
+            steps.append({"kind": step.kind, "content": content})
+
+        tasks.append({
+            "index": idx,
+            "name": task_name,
+            "provider": _provider_label(pf, task_name),
+            "hosts": host_payload,
+            "dependencies": list(task.dependencies),
+            "options": _task_plan_options(task),
+            "steps": steps,
+        })
+
+    return {
+        "target": target,
+        "variables": {key: pf.variables[key] for key in sorted(pf.variables)},
+        "execution_order": order,
+        "tasks": tasks,
+    }
+
+
+def _print_json(payload: object) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, promptfile_path: str) -> None:
     """Print an execution plan without running tasks."""
-    order = topological_sort(pf, target)
+    payload = _plan_payload(pf, target, task_args, promptfile_path)
+    order = payload["execution_order"]
     print(f"Plan for {target}")
     print()
     print("Variables:")
@@ -306,21 +397,7 @@ def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, p
             host_label = f"{host_group.name} ({len(host_group.hosts)} hosts)"
             if task.options.ssh_parallel:
                 host_label += ", parallel"
-        options: list[str] = []
-        if task.options.timeout:
-            options.append(f"timeout={task.options.timeout}")
-        if task.options.llm_timeout:
-            options.append(f"llm-timeout={task.options.llm_timeout}")
-        if task.options.rollback:
-            options.append(f"rollback={task.options.rollback}")
-        if task.options.when:
-            options.append(f"when={'; '.join(task.options.when)}")
-        if task.options.ssh_identity:
-            options.append(f"ssh-key={task.options.ssh_identity}")
-        if task.options.ssh_strict_host_key_checking:
-            options.append(f"ssh-strict-host-key-checking={task.options.ssh_strict_host_key_checking}")
-        if task.options.secrets:
-            options.append(f"secrets={task.options.secrets}")
+        options = _task_plan_options(task)
 
         print(f"  {idx}. {task_name}")
         print(f"     provider: {_provider_label(pf, task_name)}")
@@ -354,6 +431,23 @@ def _graph_tasks(pf: Promptfile, target: str | None) -> list[str]:
             raise KeyError(f"unknown task: {target!r}")
         return topological_sort(pf, target)
     return list(pf.task_order)
+
+
+def _graph_payload(pf: Promptfile, target: str | None) -> dict[str, object]:
+    """Return dependency graph data."""
+    tasks = _graph_tasks(pf, target)
+    task_set = set(tasks)
+    edges = [
+        {"from": dep, "to": task_name}
+        for task_name in tasks
+        for dep in pf.tasks[task_name].dependencies
+        if dep in task_set
+    ]
+    return {
+        "target": pf.resolve_alias(target) if target else None,
+        "nodes": tasks,
+        "edges": edges,
+    }
 
 
 def _print_graph(pf: Promptfile, target: str | None, fmt: str) -> None:
@@ -410,13 +504,28 @@ def _validate_safe_mode(
     return errors
 
 
-def _print_history(limit_raw: str | None = None) -> None:
-    """Print recent local run history."""
+def _history_payload(limit_raw: str | None = None) -> dict[str, object]:
+    """Return recent local run history."""
     try:
         limit = int(limit_raw or "20")
     except ValueError:
         limit = 20
     rows = list_runs(limit=max(1, limit))
+    runs = []
+    for row in rows:
+        item = dict(row)
+        item["success"] = bool(item["success"])
+        try:
+            item["tasks"] = json.loads(item.pop("tasks_json"))
+        except (TypeError, json.JSONDecodeError):
+            item["tasks"] = []
+        runs.append(item)
+    return {"runs": runs}
+
+
+def _print_history(limit_raw: str | None = None) -> None:
+    """Print recent local run history."""
+    rows = _history_payload(limit_raw)["runs"]
     if not rows:
         print("No runs recorded.")
         return
@@ -523,6 +632,57 @@ def _serve(pf: Promptfile, dispatcher: Dispatcher, promptfile_path: str, bind: s
     return 0
 
 
+def _step_result_payload(step: StepResult) -> dict[str, object]:
+    """Return a JSON-safe step result payload."""
+    return {
+        "kind": step.kind,
+        "content": step.content,
+        "response": step.response,
+        "success": step.success,
+        "exit_code": 0 if step.success else 1,
+        "host": step.host,
+    }
+
+
+def _task_result_payload(task: TaskResult) -> dict[str, object]:
+    """Return a JSON-safe task result payload."""
+    return {
+        "task": task.task_name,
+        "success": task.success,
+        "exit_code": 0 if task.success else 1,
+        "prompt": task.prompt_sent,
+        "response": task.response,
+        "steps": [_step_result_payload(step) for step in task.step_results],
+    }
+
+
+def _run_result_payload(
+    result: RunResult,
+    *,
+    duration_ms: int,
+    promptfile_path: str | None,
+    dry_run: bool,
+    parallel: bool,
+    jobs: int | None,
+    run_id: int | None = None,
+) -> dict[str, object]:
+    """Return a JSON-safe run result payload."""
+    payload: dict[str, object] = {
+        "target": result.target,
+        "success": result.success,
+        "exit_code": 0 if result.success else 1,
+        "duration_ms": duration_ms,
+        "promptfile": promptfile_path,
+        "dry_run": dry_run,
+        "parallel": parallel,
+        "jobs": jobs,
+        "tasks": [_task_result_payload(task) for task in result.task_results],
+    }
+    if run_id is not None:
+        payload["run_id"] = run_id
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -534,12 +694,18 @@ def main(argv: list[str] | None = None) -> int:
         args.parallel = True
 
     if args.history is not None:
-        _print_history(args.history)
+        if args.json_output:
+            _print_json(_history_payload(args.history))
+        else:
+            _print_history(args.history)
         return 0
 
     if args.task == "history":
         limit = args.task_args[0] if args.task_args else "20"
-        _print_history(limit)
+        if args.json_output:
+            _print_json(_history_payload(limit))
+        else:
+            _print_history(limit)
         return 0
 
     # Locate the Promptfile
@@ -785,7 +951,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.graph:
         try:
-            _print_graph(pf, target if args.task else None, args.graph_format)
+            graph_target = target if args.task else None
+            if args.json_output:
+                _print_json(_graph_payload(pf, graph_target))
+            else:
+                _print_graph(pf, graph_target, args.graph_format)
         except (KeyError, CycleError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -804,7 +974,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: unknown task: {target!r}", file=sys.stderr)
             return 1
         try:
-            _print_plan(pf, target, task_args, str(pf_path))
+            if args.json_output:
+                _print_json(_plan_payload(pf, target, task_args, str(pf_path)))
+            else:
+                _print_plan(pf, target, task_args, str(pf_path))
         except CycleError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -859,7 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
         pf,
         dispatcher,
         quiet=args.quiet,
-        verbose=not args.dry_run,
+        verbose=not args.dry_run and not args.json_output,
         promptfile_path=str(pf_path),
         dry_run=args.dry_run,
     )
@@ -883,8 +1056,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    run_id = None
     if not args.dry_run and not args.no_history:
-        record_run(result, duration_ms=duration_ms, promptfile_path=str(pf_path))
+        run_id = record_run(result, duration_ms=duration_ms, promptfile_path=str(pf_path))
+
+    if args.json_output:
+        _print_json(_run_result_payload(
+            result,
+            duration_ms=duration_ms,
+            promptfile_path=str(pf_path),
+            dry_run=args.dry_run,
+            parallel=args.parallel,
+            jobs=args.jobs,
+            run_id=run_id,
+        ))
+        return 0 if result.success else 1
 
     # Print results
     for tr in result.task_results:

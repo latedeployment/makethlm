@@ -827,14 +827,14 @@ class Runner:
         for step in resolved_steps:
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
-                sr = StepResult(kind="echo", content=step.content, response="", success=True)
+                sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
             elif step.kind == "shell":
                 if self.verbose:
                     redacted_cmd = self._redact(step.content)
                     cmd_preview = redacted_cmd if len(redacted_cmd) <= 60 else redacted_cmd[:57] + "..."
                     _log(f"         $ {cmd_preview}", dim=True)
                 if self.dry_run:
-                    sr = StepResult(kind="shell", content=step.content, response="", success=True)
+                    sr = StepResult(kind="shell", content=self._redact(step.content), response="", success=True)
                 else:
                     sr = self._run_shell_step(step, task=task, working_dir=working_dir)
             else:
@@ -879,7 +879,7 @@ class Runner:
         for step in resolved_steps:
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
-                sr = StepResult(kind="echo", content=step.content, response="", success=True)
+                sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
                 step_results.append(sr)
                 continue
             elif step.kind == "shell":
@@ -889,7 +889,7 @@ class Runner:
                     for host in effective_group.hosts:
                         step_results.append(StepResult(
                             kind="ssh",
-                            content=step.content,
+                            content=self._redact(step.content),
                             response="",
                             success=True,
                             host=host,
@@ -1045,7 +1045,7 @@ class Runner:
             ok = proc.returncode == 0 or step.ignore_error
             return StepResult(
                 kind="shell",
-                content=step.content,
+                content=self._redact(step.content),
                 response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
             )
@@ -1053,7 +1053,7 @@ class Runner:
             timeout = self._shell_timeout(task)
             return StepResult(
                 kind="shell",
-                content=step.content,
+                content=self._redact(step.content),
                 response=f"error: command timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
             )
@@ -1076,7 +1076,7 @@ class Runner:
             ok = proc.returncode == 0 or step.ignore_error
             return StepResult(
                 kind="ssh",
-                content=step.content,
+                content=self._redact(step.content),
                 response=self._redact(output.strip()) if not step.silent else "",
                 success=ok,
                 host=host,
@@ -1084,7 +1084,7 @@ class Runner:
         except subprocess.TimeoutExpired:
             return StepResult(
                 kind="ssh",
-                content=step.content,
+                content=self._redact(step.content),
                 response=f"error: SSH to {host} timed out after {_fmt_elapsed(timeout)}",
                 success=step.ignore_error,
                 host=host,
@@ -1095,7 +1095,7 @@ class Runner:
         dr = dispatcher.dispatch(step.content, task)
         return StepResult(
             kind="prompt",
-            content=step.content,
+            content=self._redact(step.content),
             response=self._redact(dr.response),
             success=dr.success,
         )
@@ -1120,7 +1120,7 @@ class Runner:
         if self.dry_run:
             step_results.append(StepResult(
                 kind="docker-generate",
-                content=generate_prompt,
+                content=self._redact(generate_prompt),
                 response="[dry-run] generate Dockerfile",
                 success=True,
             ))
@@ -1142,7 +1142,7 @@ class Runner:
         dr = dispatcher.dispatch(generate_prompt, task)
         step_results.append(StepResult(
             kind="docker-generate",
-            content=generate_prompt,
+            content=self._redact(generate_prompt),
             response=self._redact(dr.response),
             success=dr.success,
         ))
@@ -1179,7 +1179,7 @@ class Runner:
             ))
             return TaskResult(
                 task_name=task.name,
-                prompt_sent=prompt_sent,
+                prompt_sent=self._redact(prompt_sent),
                 response=f"error writing Dockerfile: {e}",
                 success=False,
                 step_results=step_results,

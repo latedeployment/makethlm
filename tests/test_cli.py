@@ -1,5 +1,6 @@
 """Tests for CLI-only output modes."""
 
+import json
 import sqlite3
 from unittest.mock import patch
 
@@ -56,6 +57,25 @@ task review:
     assert code == 0
     assert "supersecret" not in out
     assert "***" in out
+
+
+def test_plan_outputs_json(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+project := "demo"
+
+task build:
+    !echo {{project}}
+""")
+
+    code = main(["-f", str(promptfile), "--plan", "--json", "build"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["target"] == "build"
+    assert payload["variables"] == {"project": "demo"}
+    assert payload["execution_order"] == ["build"]
+    assert payload["tasks"][0]["steps"][0] == {"kind": "shell", "content": "echo demo"}
 
 
 def test_graph_outputs_mermaid_for_target(tmp_path, capsys):
@@ -115,6 +135,25 @@ task deploy(env): build:
     assert "task_build --> task_deploy" in out
 
 
+def test_graph_outputs_json(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+task build:
+    build
+
+task deploy: build:
+    deploy
+""")
+
+    code = main(["-f", str(promptfile), "--graph", "--json", "deploy"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["target"] == "deploy"
+    assert payload["nodes"] == ["build", "deploy"]
+    assert payload["edges"] == [{"from": "build", "to": "deploy"}]
+
+
 def test_history_command_outputs_recorded_runs(tmp_path, capsys, monkeypatch):
     db = tmp_path / "history.sqlite"
     monkeypatch.setenv("MAKETHLM_HISTORY_DB", str(db))
@@ -147,6 +186,44 @@ def test_history_command_outputs_recorded_runs(tmp_path, capsys, monkeypatch):
     assert code == 0
     assert "deploy" in out
     assert "ok" in out
+
+
+def test_history_outputs_json(tmp_path, capsys, monkeypatch):
+    db = tmp_path / "history.sqlite"
+    monkeypatch.setenv("MAKETHLM_HISTORY_DB", str(db))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                target TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                promptfile TEXT,
+                task_count INTEGER NOT NULL,
+                tasks_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO runs (
+                started_at, target, success, duration_ms, promptfile, task_count, tasks_json
+            ) VALUES (
+                '2026-01-01T00:00:00Z', 'deploy', 1, 12, 'Promptfile', 1,
+                '[{"task": "deploy", "success": true}]'
+            )
+            """
+        )
+
+    code = main(["--json", "history"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["runs"][0]["target"] == "deploy"
+    assert payload["runs"][0]["success"] is True
+    assert payload["runs"][0]["tasks"][0]["task"] == "deploy"
 
 
 def test_safe_mode_blocks_shell_without_permission(tmp_path, capsys):
@@ -193,6 +270,47 @@ task build:
     assert code == 0
     assert f"! touch {marker}" in out
     assert not marker.exists()
+
+
+def test_run_outputs_json(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("MAKETHLM_HISTORY_DB", str(tmp_path / "history.sqlite"))
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+task build:
+    !echo build
+""")
+
+    code = main(["-f", str(promptfile), "--json", "build"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["target"] == "build"
+    assert payload["success"] is True
+    assert payload["exit_code"] == 0
+    assert payload["run_id"] == 1
+    assert payload["tasks"][0]["task"] == "build"
+    assert payload["tasks"][0]["steps"][0]["kind"] == "shell"
+    assert payload["tasks"][0]["steps"][0]["exit_code"] == 0
+
+
+def test_json_output_redacts_secret_step_content(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("MAKETHLM_HISTORY_DB", str(tmp_path / "history.sqlite"))
+    monkeypatch.setenv("JSON_SECRET", "supersecret")
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+set secrets "env"
+
+task show:
+    !echo {{#secret:JSON_SECRET}}
+""")
+
+    code = main(["-f", str(promptfile), "--json", "show"])
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+
+    assert code == 0
+    assert "supersecret" not in out
+    assert "[redacted]" in payload["tasks"][0]["steps"][0]["content"]
 
 
 def test_parallel_flag_uses_parallel_runner(tmp_path, capsys):
