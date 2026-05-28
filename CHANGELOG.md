@@ -8,6 +8,9 @@
 - Parallel CLI execution with `--parallel`.
 - Parallel worker limits with `--jobs N`.
 - Machine-readable JSON output with `--json` for runs, plans, graphs, and history.
+- Bare Just-style shell recipes, e.g. `build:` with plain shell command lines.
+- Just compatibility tracking documentation.
+- Promptfile validation with `--check`.
 
 ## 0.1.0 - 2026-05-24
 

@@ -93,6 +93,68 @@ task alpha:
             parse(src)
 
 
+class TestJustStyleRecipes:
+    def test_bare_recipe_becomes_shell_task(self):
+        src = """\
+build:
+    echo build
+"""
+        pf = parse(src)
+        assert "build" in pf.tasks
+        steps = pf.resolve_steps("build")
+        assert len(steps) == 1
+        assert steps[0].kind == "shell"
+        assert steps[0].content == "echo build"
+
+    def test_bare_recipe_dependencies_without_trailing_colon(self):
+        src = """\
+build:
+    echo build
+
+test: build
+    echo test
+"""
+        pf = parse(src)
+        assert pf.tasks["test"].dependencies == ["build"]
+
+    def test_bare_recipe_arguments(self):
+        src = """\
+deploy target port="8080":
+    echo {{target}} {{port}}
+"""
+        pf = parse(src)
+        args = pf.tasks["deploy"].arguments
+        assert [arg.name for arg in args] == ["target", "port"]
+        assert args[1].default == "8080"
+        steps = pf.resolve_steps("deploy", args={"target": "prod"})
+        assert steps[0].content == "echo prod 8080"
+
+    def test_bare_recipe_quiet_and_ignore_prefixes(self):
+        src = """\
+clean:
+    @echo quiet
+    -rm missing
+    @-rm also-missing
+"""
+        pf = parse(src)
+        steps = pf.tasks["clean"].steps
+        assert steps[0].quiet is True
+        assert steps[0].content == "echo quiet"
+        assert steps[1].ignore_error is True
+        assert steps[1].content == "rm missing"
+        assert steps[2].quiet is True
+        assert steps[2].ignore_error is True
+        assert steps[2].content == "rm also-missing"
+
+    def test_bare_recipe_underscore_is_private(self):
+        src = """\
+_helper:
+    echo hidden
+"""
+        pf = parse(src)
+        assert pf.tasks["_helper"].options.private is True
+
+
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------

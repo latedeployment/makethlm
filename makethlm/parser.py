@@ -381,6 +381,134 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
     return steps
 
 
+def _parse_just_body_steps(raw_lines: list[str]) -> list[TaskStep]:
+    """Parse a Just-style recipe body where plain lines are shell commands."""
+    steps: list[TaskStep] = []
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+
+        quiet = False
+        ignore_error = False
+
+        while stripped.startswith(("@", "-")):
+            if stripped.startswith("@"):
+                quiet = True
+                stripped = stripped[1:].lstrip()
+            elif stripped.startswith("-"):
+                ignore_error = True
+                stripped = stripped[1:].lstrip()
+
+        if stripped:
+            steps.append(TaskStep(
+                kind="shell",
+                content=stripped,
+                ignore_error=ignore_error,
+                quiet=quiet,
+            ))
+    return steps
+
+
+def _parse_task_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument], list[str], TaskOptions]:
+    """Parse a makethlm task header body into name, args, deps, and options."""
+    rest, has_colon = _strip_trailing_colon(rest)
+    if not has_colon:
+        raise ParseError("task header must end with ':'", lineno)
+
+    # Extract arguments (...)
+    # Only match parens that appear BEFORE any bracket [
+    arguments: list[TaskArgument] = []
+    bracket_start = rest.find("[")
+    paren_start = rest.find("(")
+    if paren_start != -1 and (bracket_start == -1 or paren_start < bracket_start):
+        paren_end = rest.find(")", paren_start)
+        if paren_end == -1:
+            raise ParseError("unclosed parenthesis in task header", lineno)
+        arguments = _parse_arguments(rest[paren_start + 1 : paren_end])
+        rest = rest[:paren_start] + rest[paren_end + 1 :]
+
+    # Extract -> artifact_name (arrow syntax for register)
+    arrow_register: str | None = None
+    arrow_idx = rest.find("->")
+    if arrow_idx != -1:
+        # Everything after -> and before the next : or [ is the artifact name
+        after_arrow = rest[arrow_idx + 2:]
+        rest = rest[:arrow_idx]
+        # The artifact name may be followed by : (deps) or [ (options)
+        # Find the next meaningful delimiter
+        artifact_name = after_arrow.strip()
+        # Separate from deps/options if present
+        for delim_ch in (":", "["):
+            delim_pos = artifact_name.find(delim_ch)
+            if delim_pos != -1:
+                after_arrow_rest = artifact_name[delim_pos:]
+                artifact_name = artifact_name[:delim_pos].strip()
+                rest = rest.rstrip() + after_arrow_rest
+                break
+        arrow_register = artifact_name if artifact_name else None
+
+    # Extract [options]
+    rest, bracket = _extract_brackets(rest)
+    options = _parse_task_options(_parse_kv_pairs(bracket)) if bracket else TaskOptions()
+
+    # Apply arrow register to options
+    if arrow_register and not options.register:
+        options.register = arrow_register
+
+    # What remains: "name" or "name: dep1 dep2"
+    rest = rest.strip()
+    deps: list[str] = []
+    if ":" in rest:
+        colon_idx = rest.index(":")
+        task_name = rest[:colon_idx].strip()
+        dep_str = rest[colon_idx + 1 :].strip()
+        if dep_str:
+            deps = dep_str.split()
+    else:
+        task_name = rest.strip()
+
+    if not task_name:
+        raise ParseError("task declaration missing name", lineno)
+
+    return task_name, arguments, deps, options
+
+
+def _parse_just_recipe_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument], list[str], TaskOptions] | None:
+    """Parse a bare Just-style recipe header, if the line looks like one."""
+    if ":" not in rest:
+        return None
+    if rest.startswith((" ", "\t", "#")):
+        return None
+    if any(ch in rest for ch in "{}"):
+        return None
+
+    rest, bracket = _extract_brackets(rest)
+    options = _parse_task_options(_parse_kv_pairs(bracket)) if bracket else TaskOptions()
+
+    header, dep_str = rest.split(":", 1)
+    dep_str = dep_str.strip()
+    if dep_str.endswith(":"):
+        dep_str = dep_str[:-1].strip()
+
+    parts = header.split()
+    if not parts:
+        return None
+    task_name = parts[0]
+    if task_name in {
+        "agent", "alias", "docker", "export", "fn", "guidance", "hosts",
+        "include", "inventory", "llm", "set", "task",
+    }:
+        return None
+
+    arguments: list[TaskArgument] = []
+    if len(parts) > 1:
+        arguments = _parse_arguments(",".join(parts[1:]))
+
+    deps = dep_str.split() if dep_str else []
+    return task_name, arguments, deps, options
+
+
 def _strip_quotes(val: str) -> str:
     """Strip surrounding single or double quotes."""
     if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
@@ -857,64 +985,7 @@ def parse(
 
         # ----- task <name>[(args)] [: deps] [opts]: -----
         if stripped.startswith("task "):
-            rest, has_colon = _strip_trailing_colon(stripped[5:])
-            if not has_colon:
-                raise ParseError("task header must end with ':'", lineno)
-
-            # Extract arguments (...)
-            # Only match parens that appear BEFORE any bracket [
-            arguments: list[TaskArgument] = []
-            bracket_start = rest.find("[")
-            paren_start = rest.find("(")
-            if paren_start != -1 and (bracket_start == -1 or paren_start < bracket_start):
-                paren_end = rest.find(")", paren_start)
-                if paren_end == -1:
-                    raise ParseError("unclosed parenthesis in task header", lineno)
-                arguments = _parse_arguments(rest[paren_start + 1 : paren_end])
-                rest = rest[:paren_start] + rest[paren_end + 1 :]
-
-            # Extract -> artifact_name (arrow syntax for register)
-            arrow_register: str | None = None
-            arrow_idx = rest.find("->")
-            if arrow_idx != -1:
-                # Everything after -> and before the next : or [ is the artifact name
-                after_arrow = rest[arrow_idx + 2:]
-                rest = rest[:arrow_idx]
-                # The artifact name may be followed by : (deps) or [ (options)
-                # Find the next meaningful delimiter
-                artifact_name = after_arrow.strip()
-                # Separate from deps/options if present
-                for delim_ch in (":", "["):
-                    delim_pos = artifact_name.find(delim_ch)
-                    if delim_pos != -1:
-                        after_arrow_rest = artifact_name[delim_pos:]
-                        artifact_name = artifact_name[:delim_pos].strip()
-                        rest = rest.rstrip() + after_arrow_rest
-                        break
-                arrow_register = artifact_name if artifact_name else None
-
-            # Extract [options]
-            rest, bracket = _extract_brackets(rest)
-            options = _parse_task_options(_parse_kv_pairs(bracket)) if bracket else TaskOptions()
-
-            # Apply arrow register to options
-            if arrow_register and not options.register:
-                options.register = arrow_register
-
-            # What remains: "name" or "name: dep1 dep2"
-            rest = rest.strip()
-            deps: list[str] = []
-            if ":" in rest:
-                colon_idx = rest.index(":")
-                task_name = rest[:colon_idx].strip()
-                dep_str = rest[colon_idx + 1 :].strip()
-                if dep_str:
-                    deps = dep_str.split()
-            else:
-                task_name = rest.strip()
-
-            if not task_name:
-                raise ParseError("task declaration missing name", lineno)
+            task_name, arguments, deps, options = _parse_task_header(stripped[5:], lineno)
 
             # Tasks starting with _ are implicitly private (Justfile convention)
             if task_name.startswith("_"):
@@ -929,6 +1000,37 @@ def parse(
             steps = _parse_body_steps(body_lines)
             if not steps:
                 raise ParseError(f"task {task_name!r} has no prompt body", lineno)
+
+            task = Task(
+                name=task_name,
+                steps=steps,
+                dependencies=deps,
+                options=options,
+                arguments=arguments,
+                line_number=lineno,
+            )
+            pf.tasks[task_name] = task
+            if task_name not in pf.task_order:
+                pf.task_order.append(task_name)
+            continue
+
+        # ----- Just-style recipe: name [args]: [deps] -----
+        just_recipe = _parse_just_recipe_header(stripped, lineno)
+        if just_recipe is not None:
+            task_name, arguments, deps, options = just_recipe
+
+            if task_name.startswith("_"):
+                options.private = True
+
+            if task_name in pf.tasks:
+                if not pf.settings.allow_duplicate_tasks:
+                    raise ParseError(f"duplicate task: {task_name!r}", lineno)
+
+            i += 1
+            body_lines, i = _collect_body(lines, i)
+            steps = _parse_just_body_steps(body_lines)
+            if not steps:
+                raise ParseError(f"task {task_name!r} has no shell body", lineno)
 
             task = Task(
                 name=task_name,

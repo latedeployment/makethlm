@@ -2,7 +2,8 @@
 
 ## Defining Tasks
 
-A task is defined with the `task` keyword, a name, and a colon. The indented body is a mix of LLM prompts and shell commands.
+A makethlm-native task is defined with the `task` keyword, a name, and a colon.
+The indented body is a mix of LLM prompts and shell commands.
 
 ```
 task build:
@@ -11,6 +12,19 @@ task build:
     if so, rebuild the docker image from scratch.
     tag it as {{project}}:latest.
 ```
+
+Bare Just-style recipes are supported for shell-only workflows:
+
+```
+build:
+    cargo build
+
+test: build
+    cargo test
+```
+
+Bare recipe body lines are shell commands by default. Use `task` when you want
+LLM prompt lines.
 
 The **first task** defined in the file is the **default task**. Running `makethlm` with no arguments executes it.
 
@@ -21,7 +35,7 @@ Consecutive lines of natural language are merged into a single prompt and sent t
 A task can depend on other tasks:
 
 ```
-task deploy: build test
+task deploy: build test:
     deploy to production
 ```
 
@@ -31,13 +45,13 @@ This means: run `build` first, then `test`, then `deploy`. Dependencies are reso
 task a:
     do a
 
-task b: a
+task b: a:
     do b
 
-task c: a
+task c: a:
     do c
 
-task d: b c
+task d: b c:
     do d
 ```
 

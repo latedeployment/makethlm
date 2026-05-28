@@ -195,8 +195,9 @@ makethlm deploy -V env=production
 
 ### Tasks
 
-A task is defined with the `task` keyword, a name, and a colon. The indented
-body that follows is a mix of LLM prompts (natural language) and shell commands.
+A makethlm-native task is defined with the `task` keyword, a name, and a
+colon. The indented body that follows is a mix of LLM prompts (natural
+language) and shell commands.
 
 ```
 task build:
@@ -205,6 +206,19 @@ task build:
     if so, rebuild the docker image from scratch.
     tag it as {{project}}:latest.
 ```
+
+Bare Just-style recipes are also supported for shell-only workflows:
+
+```
+build:
+    cargo build
+
+test: build
+    cargo test
+```
+
+Bare recipe body lines are shell commands by default. Use `task` when you want
+LLM prompt lines.
 
 The **first task** defined in the file is the **default task**. Running
 `makethlm` with no arguments executes it.
@@ -219,7 +233,7 @@ calls.
 A task can depend on other tasks. Dependencies are listed after the colon:
 
 ```
-task deploy: build test
+task deploy: build test:
     deploy to production
 ```
 
@@ -231,13 +245,13 @@ dependencies work correctly. Cycles are detected and reported as errors.
 task a:
     do a
 
-task b: a
+task b: a:
     do b
 
-task c: a
+task c: a:
     do c
 
-task d: b c
+task d: b c:
     do d
 ```
 
@@ -871,6 +885,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--list` | `-l` | List all tasks, functions, LLM providers, and host groups |
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
+| `--check` | | Validate Promptfile references, required tools, and risky capabilities |
 | `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
 | `--graph` | | Print a task dependency graph and exit |
 | `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
@@ -912,6 +927,10 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Validate without executing
+makethlm --check
+makethlm --check --json
 
 # Emit machine-readable output
 makethlm --json deploy

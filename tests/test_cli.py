@@ -347,3 +347,63 @@ def test_jobs_must_be_positive(capsys):
 
     assert code == 1
     assert "--jobs must be at least 1" in err
+
+
+def test_check_succeeds_for_shell_only_promptfile(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+build:
+    echo build
+""")
+
+    code = main(["-f", str(promptfile), "--check"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "OK:" in out
+
+
+def test_check_outputs_json(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+build:
+    echo build
+""")
+
+    code = main(["-f", str(promptfile), "--check", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["summary"]["tasks"] == 1
+
+
+def test_check_reports_unknown_llm_provider(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+task review [llm=missing]:
+    review this
+""")
+
+    code = main(["-f", str(promptfile), "--check"])
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "unknown-provider" in out
+    assert "missing" in out
+
+
+def test_check_blocks_backticks_by_default(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+version := `echo 1`
+
+build:
+    echo {{version}}
+""")
+
+    code = main(["-f", str(promptfile), "--check"])
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "backtick command substitution is disabled" in err

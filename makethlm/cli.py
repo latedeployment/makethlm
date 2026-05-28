@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shutil
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,6 +29,18 @@ from .history import list_runs, record_run
 
 
 PROMPTFILE_NAMES = ["Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"]
+
+_KNOWN_NATIVE_PROVIDERS = {"claude", "codex"}
+_SECRETS_BACKEND_TOOLS = {
+    "infisical": "infisical",
+    "1password": "op",
+    "sops": "sops",
+}
+_SANDBOX_TOOLS = {
+    "docker": "docker",
+    "systemd": "systemd-run",
+    "bwrap": "bwrap",
+}
 
 
 def find_promptfile(directory: Path | None = None) -> Path | None:
@@ -98,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dump",
         action="store_true",
         help="Dump the parsed Promptfile (variables, tasks, etc.)",
+    )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate Promptfile references, tools, and risky capabilities",
     )
     ap.add_argument(
         "--plan",
@@ -504,6 +524,213 @@ def _validate_safe_mode(
     return errors
 
 
+def _check_issue(
+    severity: str,
+    code: str,
+    message: str,
+    *,
+    task: str | None = None,
+) -> dict[str, str]:
+    issue = {"severity": severity, "code": code, "message": message}
+    if task:
+        issue["task"] = task
+    return issue
+
+
+def _task_references_secret(pf: Promptfile, task_name: str) -> bool:
+    """Return True if a task/guidance/agent includes secret placeholders."""
+    task = pf.tasks[task_name]
+    if any("{{#secret:" in step.content for step in task.steps):
+        return True
+    agent = pf.get_agent_for_task(task_name)
+    if agent and "{{#secret:" in agent.instructions:
+        return True
+    return bool(pf.guidance and "{{#secret:" in pf.guidance)
+
+
+def _secret_refs_for_task(pf: Promptfile, task_name: str) -> list[str]:
+    """Return secret reference names used by a task."""
+    task = pf.tasks[task_name]
+    texts = [step.content for step in task.steps]
+    agent = pf.get_agent_for_task(task_name)
+    if agent:
+        texts.append(agent.instructions)
+    if pf.guidance:
+        texts.append(pf.guidance)
+    refs: list[str] = []
+    for text in texts:
+        refs.extend(match.strip() for match in re.findall(r"\{\{#secret:(.+?)\}\}", text))
+    return refs
+
+
+def _provider_for_check(pf: Promptfile, task_name: str) -> str | None:
+    """Return the provider name a prompt/docker task will use."""
+    agent = pf.get_agent_for_task(task_name)
+    if agent and agent.llm:
+        return agent.llm
+    task = pf.tasks[task_name]
+    return task.options.llm or pf.default_llm
+
+
+def _check_promptfile(
+    pf: Promptfile,
+    *,
+    promptfile_path: str,
+) -> dict[str, object]:
+    """Validate parsed Promptfile references, tools, and risky capabilities."""
+    errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+
+    def error(code: str, message: str, *, task: str | None = None) -> None:
+        errors.append(_check_issue("error", code, message, task=task))
+
+    def warn(code: str, message: str, *, task: str | None = None) -> None:
+        warnings.append(_check_issue("warning", code, message, task=task))
+
+    if not pf.tasks:
+        error("no-tasks", "no tasks defined in Promptfile")
+
+    used_providers: set[str] = set()
+    fallback_claude_needed = False
+    used_secret_backends: dict[str, set[str]] = {}
+    used_sandboxes: set[str] = set()
+    ssh_needed = False
+
+    for task_name in pf.task_order:
+        task = pf.tasks[task_name]
+        has_shell = any(step.kind == "shell" for step in task.steps)
+        has_prompt = any(step.kind == "prompt" for step in task.steps)
+        needs_llm = has_prompt or task.docker is not None
+
+        if task.options.llm and task.options.llm not in pf.llm_providers:
+            error(
+                "unknown-provider",
+                f"task {task_name!r} references unknown LLM provider {task.options.llm!r}",
+                task=task_name,
+            )
+
+        agent = pf.get_agent_for_task(task_name)
+        if agent and agent.llm and agent.llm not in pf.llm_providers:
+            error(
+                "unknown-agent-provider",
+                f"agent {agent.name!r} references unknown LLM provider {agent.llm!r}",
+                task=task_name,
+            )
+
+        if needs_llm:
+            provider_name = _provider_for_check(pf, task_name)
+            if provider_name and provider_name in pf.llm_providers:
+                used_providers.add(provider_name)
+            elif not provider_name:
+                fallback_claude_needed = True
+
+        if has_shell:
+            if task.options.on:
+                ssh_needed = True
+                warn(
+                    "ssh-execution",
+                    f"task {task_name!r} runs shell steps over SSH",
+                    task=task_name,
+                )
+            else:
+                warn(
+                    "shell-execution",
+                    f"task {task_name!r} runs local shell steps",
+                    task=task_name,
+                )
+
+        if task.docker:
+            warn("docker-generation", f"task {task_name!r} generates/builds Docker artifacts", task=task_name)
+
+        sandbox = task.options.sandbox or pf.settings.sandbox
+        if sandbox and sandbox != "none" and has_shell:
+            used_sandboxes.add(sandbox)
+        if task.options.sandbox_net == "host":
+            warn("sandbox-host-network", f"task {task_name!r} uses sandbox-net=host", task=task_name)
+
+        if _task_references_secret(pf, task_name):
+            backend = task.options.secrets or pf.settings.secrets or "env"
+            used_secret_backends.setdefault(backend, set()).update(_secret_refs_for_task(pf, task_name))
+
+    for provider_name in sorted(used_providers):
+        provider = pf.llm_providers[provider_name]
+        if provider.name.lower() not in _KNOWN_NATIVE_PROVIDERS and not provider.shell_template:
+            warn(
+                "provider-fallback",
+                (
+                    f"provider {provider_name!r} has no native dispatcher or template; "
+                    "it will use the Claude CLI fallback"
+                ),
+            )
+        tool_error = _dispatcher_for_provider(provider).validate_tool()
+        if tool_error:
+            error("missing-provider-tool", tool_error)
+
+    if fallback_claude_needed:
+        tool_error = ClaudeDispatcher().validate_tool()
+        if tool_error:
+            error("missing-provider-tool", f"{tool_error} (fallback dispatcher)")
+
+    if ssh_needed and shutil.which("ssh") is None:
+        error("missing-ssh-tool", "ssh CLI not found on PATH")
+
+    for sandbox in sorted(used_sandboxes):
+        tool = _SANDBOX_TOOLS.get(sandbox)
+        if tool and shutil.which(tool) is None:
+            error("missing-sandbox-tool", f"{tool!r} required for sandbox {sandbox!r} was not found on PATH")
+
+    base_dir = os.path.dirname(os.path.abspath(promptfile_path))
+    for backend, refs in sorted(used_secret_backends.items()):
+        if backend == "env":
+            for ref in sorted(refs):
+                if ref not in os.environ and ref.replace("/", "_") not in os.environ:
+                    error("missing-env-secret", f"environment secret {ref!r} is not set")
+            continue
+        tool = _SECRETS_BACKEND_TOOLS.get(backend)
+        if tool is None:
+            error("unknown-secrets-backend", f"unknown secrets backend {backend!r}")
+            continue
+        if shutil.which(tool) is None:
+            error("missing-secrets-tool", f"{tool!r} required for secrets backend {backend!r} was not found on PATH")
+        if backend == "sops":
+            if not pf.settings.secrets_file:
+                error("missing-sops-file", "sops secrets require set secrets-file")
+            else:
+                secrets_file = os.path.normpath(os.path.join(base_dir, pf.settings.secrets_file))
+                if not os.path.isfile(secrets_file):
+                    error("missing-sops-file", f"sops secrets file not found: {secrets_file}")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "summary": {
+            "tasks": len(pf.tasks),
+            "errors": len(errors),
+            "warnings": len(warnings),
+        },
+    }
+
+
+def _print_check_result(payload: dict[str, object]) -> None:
+    """Print check results in a concise human-readable format."""
+    for issue in payload["errors"]:
+        print(f"error[{issue['code']}]: {issue['message']}")
+    for issue in payload["warnings"]:
+        print(f"warning[{issue['code']}]: {issue['message']}")
+    summary = payload["summary"]
+    if payload["ok"]:
+        print(
+            f"OK: {summary['tasks']} task(s), "
+            f"{summary['warnings']} warning(s)"
+        )
+    else:
+        print(
+            f"FAILED: {summary['errors']} error(s), "
+            f"{summary['warnings']} warning(s)"
+        )
+
+
 def _history_payload(limit_raw: str | None = None) -> dict[str, object]:
     """Return recent local run history."""
     try:
@@ -719,7 +946,7 @@ def main(argv: list[str] | None = None) -> int:
     # Parse
     try:
         source = pf_path.read_text()
-        allow_backticks = (not args.safe) or args.allow_backticks
+        allow_backticks = (not args.safe and not args.check) or args.allow_backticks
         pf = parse(source, filename=str(pf_path), allow_backticks=allow_backticks)
     except ParseError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -740,6 +967,14 @@ def main(argv: list[str] | None = None) -> int:
         result = _evaluate_expression(args.evaluate, context)
         print(result)
         return 0
+
+    if args.check:
+        payload = _check_promptfile(pf, promptfile_path=str(pf_path))
+        if args.json_output:
+            _print_json(payload)
+        else:
+            _print_check_result(payload)
+        return 0 if payload["ok"] else 1
 
     # --summary: compact task list
     if args.summary:

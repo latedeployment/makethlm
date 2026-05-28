@@ -21,6 +21,8 @@ fn security_review:              # Functions
 task build: dep1 dep2            # Tasks
     !shell command
     natural language prompt
+just-build:                      # Bare Just-style shell recipe
+    cargo build
 docker api [tag=latest]:         # Docker blocks
     describe the image
 alias d := deploy                # Aliases
@@ -91,6 +93,12 @@ task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
     @echo "message"
     natural language prompt
     @use function_name
+
+# Bare Just-style shell recipes
+<name> [arg1 arg2="default"]: [dep1 dep2]
+    shell command
+    @quiet shell command
+    -ignored-failure command
 
 # Docker
 docker <name> [tag=..., context=..., file=...]:

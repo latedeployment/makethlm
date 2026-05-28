@@ -19,6 +19,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--list` | `-l` | List all tasks, functions, LLM providers, and host groups |
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
+| `--check` | | Validate Promptfile references, required tools, and risky capabilities |
 | `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
 | `--graph` | | Print a task dependency graph and exit |
 | `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
@@ -60,6 +61,10 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Validate without executing
+makethlm --check
+makethlm --check --json
 
 # Emit machine-readable output
 makethlm --json deploy
