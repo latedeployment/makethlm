@@ -1,8 +1,10 @@
 """Tests for CLI-only output modes."""
 
 import sqlite3
+from unittest.mock import patch
 
 from makethlm.cli import main
+from makethlm.runner import RunResult
 
 
 def test_plan_outputs_execution_details(tmp_path, capsys):
@@ -191,3 +193,39 @@ task build:
     assert code == 0
     assert f"! touch {marker}" in out
     assert not marker.exists()
+
+
+def test_parallel_flag_uses_parallel_runner(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+task build:
+    !echo build
+""")
+
+    with patch("makethlm.runner.Runner.run_parallel", return_value=RunResult(target="build")) as run_parallel:
+        code = main(["-f", str(promptfile), "--dry-run", "--parallel", "build"])
+
+    assert code == 0
+    run_parallel.assert_called_once()
+
+
+def test_jobs_implies_parallel_and_passes_limit(tmp_path, capsys):
+    promptfile = tmp_path / "Promptfile"
+    promptfile.write_text("""\
+task build:
+    !echo build
+""")
+
+    with patch("makethlm.runner.Runner.run_parallel", return_value=RunResult(target="build")) as run_parallel:
+        code = main(["-f", str(promptfile), "--dry-run", "--jobs", "3", "build"])
+
+    assert code == 0
+    assert run_parallel.call_args.kwargs["jobs"] == 3
+
+
+def test_jobs_must_be_positive(capsys):
+    code = main(["--jobs", "0"])
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "--jobs must be at least 1" in err

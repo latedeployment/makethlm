@@ -3,6 +3,8 @@
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -2359,6 +2361,54 @@ task skip [when=enabled]:
         result = runner.run_parallel("skip")
         assert result.success
         assert "skipped" in result.task_results[0].response
+
+    def test_parallel_run_respects_jobs_limit(self):
+        pf = parse("""\
+task a:
+    !echo a
+
+task b:
+    !echo b
+
+task c:
+    !echo c
+
+task done: a b c:
+    !echo done
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+        original = runner._run_single_task_in_pipeline
+
+        def wrapped(*args, **kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+                return original(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch.object(runner, "_run_single_task_in_pipeline", side_effect=wrapped):
+            result = runner.run_parallel("done", jobs=2)
+
+        assert result.success
+        assert max_active <= 2
+
+    def test_parallel_run_rejects_invalid_jobs(self):
+        pf = parse("""\
+task build:
+    !echo build
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        with pytest.raises(ValueError, match="jobs"):
+            runner.run_parallel("build", jobs=0)
 
 
 # ---------------------------------------------------------------------------

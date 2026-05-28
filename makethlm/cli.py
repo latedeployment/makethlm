@@ -59,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print prompts/commands that would be sent without executing",
     )
     ap.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Run independent dependency tasks in parallel",
+    )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Maximum number of parallel task workers",
+    )
+    ap.add_argument(
         "--list", "-l",
         action="store_true",
         dest="list_tasks",
@@ -516,6 +527,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
 
+    if args.jobs is not None and args.jobs < 1:
+        print("error: --jobs must be at least 1", file=sys.stderr)
+        return 1
+    if args.jobs is not None:
+        args.parallel = True
+
     if args.history is not None:
         _print_history(args.history)
         return 0
@@ -848,7 +865,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         started = time.monotonic()
-        result = runner.run(target, args=task_args)
+        if args.parallel:
+            result = runner.run_parallel(target, args=task_args, jobs=args.jobs)
+        else:
+            result = runner.run(target, args=task_args)
         duration_ms = int((time.monotonic() - started) * 1000)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)

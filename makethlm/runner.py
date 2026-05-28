@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -611,11 +610,21 @@ class Runner:
 
         return result
 
-    def run_parallel(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
+    def run_parallel(
+        self,
+        target: str | None = None,
+        args: dict[str, str] | None = None,
+        *,
+        jobs: int | None = None,
+    ) -> RunResult:
         """Run a target task with independent tasks at each level in parallel.
 
-        Uses asyncio.gather to run tasks that share no dependencies concurrently.
+        Tasks in the same dependency level are eligible to run concurrently.
+        ``jobs`` limits concurrent task workers; ``None`` means no explicit cap.
         """
+        if jobs is not None and jobs < 1:
+            raise ValueError("jobs must be at least 1")
+
         self._ensure_dotenv()
         self._apply_exports()
 
@@ -649,9 +658,7 @@ class Runner:
                     break
             else:
                 # Multiple tasks — run in parallel
-                level_results = asyncio.run(
-                    self._run_level_parallel(level, target, args, idx, total, result)
-                )
+                level_results = self._run_level_parallel(level, target, args, idx, total, result, jobs)
                 idx += len(level)
                 failed = any(not tr.success for tr in level_results if tr is not None)
                 if failed:
@@ -754,7 +761,7 @@ class Runner:
 
         return task_result
 
-    async def _run_level_parallel(
+    def _run_level_parallel(
         self,
         level: list[str],
         target: str,
@@ -762,20 +769,24 @@ class Runner:
         start_idx: int,
         total: int,
         result: RunResult,
+        jobs: int | None = None,
     ) -> list[TaskResult | None]:
-        """Run all tasks in a level concurrently using asyncio."""
-        loop = asyncio.get_event_loop()
-        tasks = []
-        for i, task_name in enumerate(level):
-            idx = start_idx + i + 1
-            tasks.append(
-                loop.run_in_executor(
-                    None,
+        """Run all tasks in a dependency level concurrently."""
+        max_workers = len(level) if jobs is None else min(jobs, len(level))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
                     self._run_single_task_in_pipeline,
-                    task_name, target, args, idx, total, result,
+                    task_name,
+                    target,
+                    args,
+                    start_idx + i + 1,
+                    total,
+                    result,
                 )
-            )
-        return await asyncio.gather(*tasks)
+                for i, task_name in enumerate(level)
+            ]
+            return [future.result() for future in futures]
 
     def _run_task(self, task: Task, args: dict[str, str] | None) -> TaskResult:
         """Execute a single task's steps."""

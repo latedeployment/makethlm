@@ -879,6 +879,8 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
+| `--parallel` | | Run independent dependency tasks in parallel |
+| `--jobs N` | | Limit parallel task workers; implies `--parallel` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
@@ -909,6 +911,10 @@ makethlm deploy -V env=production
 
 # Preview what would happen
 makethlm --dry-run deploy staging
+
+# Run independent dependencies concurrently
+makethlm --parallel deploy
+makethlm --jobs 4 deploy
 
 # Preview the execution plan without running anything
 makethlm --plan deploy staging
@@ -942,6 +948,9 @@ makethlm review --codex
 # List everything
 makethlm --list
 ```
+
+Parallel execution runs tasks at the same dependency depth concurrently. If any
+task in a level fails, later levels are skipped and the run fails.
 
 **`--list` output** includes tasks (with dependencies, arguments, options),
 functions, LLM providers (with the default marked), and host groups:
