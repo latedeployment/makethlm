@@ -349,6 +349,22 @@ def test_jobs_must_be_positive(capsys):
     assert "--jobs must be at least 1" in err
 
 
+def test_completions_outputs_shell_script(capsys):
+    code = main(["completions", "bash"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "complete -F _makethlm_complete makethlm" in out
+
+
+def test_completions_rejects_unknown_shell(capsys):
+    code = main(["completions", "powershell"])
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "unsupported shell" in err
+
+
 def test_check_succeeds_for_shell_only_promptfile(tmp_path, capsys):
     promptfile = tmp_path / "Promptfile"
     promptfile.write_text("""\

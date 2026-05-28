@@ -9,11 +9,10 @@ from unittest.mock import patch
 
 import pytest
 
-from makethlm.parser import parse
-from makethlm.runner import Runner, StepResult, topological_sort, CycleError
 from makethlm.dispatcher import DryRunDispatcher
 from makethlm.models import TaskStep
-
+from makethlm.parser import parse
+from makethlm.runner import CycleError, Runner, StepResult, topological_sort
 
 # ---------------------------------------------------------------------------
 # Topological sort
@@ -475,7 +474,7 @@ docker myapp:
         with tempfile.TemporaryDirectory() as tmpdir:
             assert pf.tasks["myapp"].docker is not None
             pf.tasks["myapp"].docker.context = tmpdir
-            result = runner.run("myapp")
+            runner.run("myapp")
 
         # The dispatcher should have received a "Generate a Dockerfile" prompt
         assert len(dispatcher.dispatched) == 1
@@ -615,8 +614,8 @@ task deploy [on=web]:
         assert sr[1].host == "host2"
 
     def test_ssh_builds_correct_command(self):
-        from makethlm.runner import _build_ssh_command
         from makethlm.models import HostGroup
+        from makethlm.runner import _build_ssh_command
 
         group = HostGroup(name="web", hosts=["h1"], user="deploy", port=2222)
         cmd = _build_ssh_command("h1", "uptime", group)
@@ -626,8 +625,8 @@ task deploy [on=web]:
         assert "uptime" in cmd
 
     def test_ssh_builds_command_with_identity_and_host_key_policy(self):
-        from makethlm.runner import _build_ssh_command
         from makethlm.models import HostGroup
+        from makethlm.runner import _build_ssh_command
 
         group = HostGroup(
             name="web",
@@ -640,8 +639,8 @@ task deploy [on=web]:
         assert "-o StrictHostKeyChecking=accept-new" in cmd
 
     def test_ssh_without_user(self):
-        from makethlm.runner import _build_ssh_command
         from makethlm.models import HostGroup
+        from makethlm.runner import _build_ssh_command
 
         group = HostGroup(name="web", hosts=["h1"])
         cmd = _build_ssh_command("h1", "ls", group)
@@ -921,6 +920,19 @@ task deploy [confirm=Really deploy?]:
 
         assert result.success
         assert "Really deploy?" in captured_prompts[0]
+
+
+class TestRunnerTaskEnv:
+    def test_task_env_attribute_is_available_to_shell_steps(self):
+        pf = parse("""\
+task show [env(MAKETHLM_TEST_ENV, expected)]:
+    !printf "$MAKETHLM_TEST_ENV"
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        result = runner.run("show")
+
+        assert result.success
+        assert result.task_results[0].step_results[0].response == "expected"
 
 
 # ---------------------------------------------------------------------------
@@ -1687,7 +1699,7 @@ task build:
 class TestClaudeDispatcherNaming:
     def test_system_prompt_includes_task_name(self):
         from makethlm.dispatcher import ClaudeDispatcher
-        from makethlm.models import Task, TaskStep, TaskOptions
+        from makethlm.models import Task, TaskOptions
 
         task = Task(
             name="audit",
@@ -1717,7 +1729,7 @@ class TestClaudeDispatcherNaming:
 
     def test_system_prompt_varies_per_task(self):
         from makethlm.dispatcher import ClaudeDispatcher
-        from makethlm.models import Task, TaskStep, TaskOptions
+        from makethlm.models import Task, TaskOptions
 
         dispatcher = ClaudeDispatcher()
         captured = []
@@ -1802,7 +1814,7 @@ task deploy: build:
 """)
         dispatcher = DryRunDispatcher()
         runner = Runner(pf, dispatcher)
-        result = runner.run("deploy")
+        runner.run("deploy")
 
         # After build completes, build.success should be in variables
         assert pf.variables.get("build.success") == "true"
@@ -1818,7 +1830,7 @@ task deploy: build:
 """)
         dispatcher = DryRunDispatcher()
         runner = Runner(pf, dispatcher)
-        result = runner.run("deploy")
+        runner.run("deploy")
 
         assert "build" in runner.artifacts
         assert runner.artifacts["build"]["success"] == "false"

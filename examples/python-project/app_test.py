@@ -17,7 +17,7 @@ def test_divide_by_zero():
     # This will fail — divide() doesn't handle zero
     try:
         divide(1, 0)
-        assert False, "Should have raised an error"
+        raise AssertionError("Should have raised an error")
     except ZeroDivisionError:
         pass
 

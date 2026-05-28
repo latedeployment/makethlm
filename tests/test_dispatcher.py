@@ -1,5 +1,6 @@
 """Tests for dispatchers."""
 
+import json
 import subprocess
 from unittest.mock import patch
 
@@ -7,11 +8,27 @@ from makethlm.dispatcher import (
     ClaudeDispatcher,
     CodexDispatcher,
     DryRunDispatcher,
+    OllamaDispatcher,
+    OpenAIDispatcher,
     ShellDispatcher,
     _extract_tool_name,
     _inject_noninteractive_flags,
 )
-from makethlm.models import Task, TaskStep, TaskOptions
+from makethlm.models import Task, TaskOptions, TaskStep
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class TestDryRunDispatcher:
@@ -192,3 +209,56 @@ class TestCodexDispatcher:
         d.dispatch("review it", task)
 
         assert mock_run.call_args.kwargs["timeout"] == 120
+
+
+class TestOpenAIDispatcher:
+    def test_validate_requires_api_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        err = OpenAIDispatcher().validate_tool()
+
+        assert err is not None
+        assert "OPENAI_API_KEY" in err
+
+    @patch("makethlm.dispatcher.urllib.request.urlopen")
+    def test_dispatch_posts_chat_completion_request(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse({
+            "choices": [{"message": {"content": "review complete"}}],
+        })
+        task = Task(name="review", steps=[TaskStep(kind="prompt", content="review it")])
+        dispatcher = OpenAIDispatcher(
+            model="gpt-test",
+            api_key="test-key",
+            base_url="https://example.test/v1",
+        )
+
+        result = dispatcher.dispatch("review it", task)
+
+        assert result.success
+        assert result.response == "review complete"
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        assert request.full_url == "https://example.test/v1/chat/completions"
+        assert payload["model"] == "gpt-test"
+        assert payload["messages"][0]["content"] == "review it"
+        assert request.headers["Authorization"] == "Bearer test-key"
+
+
+class TestOllamaDispatcher:
+    @patch("makethlm.dispatcher.urllib.request.urlopen")
+    def test_dispatch_posts_generate_request(self, mock_urlopen):
+        mock_urlopen.return_value = FakeHTTPResponse({"response": "done"})
+        task = Task(name="review", steps=[TaskStep(kind="prompt", content="review it")])
+        dispatcher = OllamaDispatcher(model="llama-test", base_url="http://ollama.test")
+
+        result = dispatcher.dispatch("review it", task)
+
+        assert result.success
+        assert result.response == "done"
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        assert request.full_url == "http://ollama.test/api/generate"
+        assert payload == {
+            "model": "llama-test",
+            "prompt": "review it",
+            "stream": False,
+        }

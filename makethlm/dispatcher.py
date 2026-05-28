@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -164,6 +168,91 @@ class CodexDispatcher(Dispatcher):
                 response=f"error: codex CLI timed out after {_llm_timeout(task):.0f}s",
                 success=False,
             )
+
+
+class OpenAIDispatcher(Dispatcher):
+    """Dispatches prompts to the OpenAI Chat Completions API."""
+
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ):
+        self.default_model = model
+        self.api_key = api_key
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+
+    def _api_key(self) -> str | None:
+        return self.api_key or os.environ.get("OPENAI_API_KEY")
+
+    def validate_tool(self) -> str | None:
+        if not self._api_key():
+            return "error: OPENAI_API_KEY is not set for native OpenAI provider"
+        return None
+
+    def dispatch(self, prompt: str, task: Task) -> DispatchResult:
+        api_key = self._api_key()
+        if not api_key:
+            return DispatchResult(response="error: OPENAI_API_KEY is not set", success=False)
+
+        model = task.options.model or self.default_model or "gpt-4o-mini"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if task.options.temperature is not None:
+            payload["temperature"] = task.options.temperature
+        if task.options.max_tokens is not None:
+            payload["max_tokens"] = task.options.max_tokens
+
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_llm_timeout(task)) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return DispatchResult(response=content, success=bool(content))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            return DispatchResult(response=f"error: OpenAI API returned {e.code}: {detail}", success=False)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            return DispatchResult(response=f"error: OpenAI API request failed: {e}", success=False)
+
+
+class OllamaDispatcher(Dispatcher):
+    """Dispatches prompts to a local Ollama HTTP server."""
+
+    def __init__(self, model: str | None = None, base_url: str | None = None):
+        self.default_model = model
+        self.base_url = (base_url or "http://127.0.0.1:11434").rstrip("/")
+
+    def dispatch(self, prompt: str, task: Task) -> DispatchResult:
+        model = task.options.model or self.default_model or "llama3"
+        payload = {"model": model, "prompt": prompt, "stream": False}
+        request = urllib.request.Request(
+            f"{self.base_url}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_llm_timeout(task)) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data.get("response", "")
+            return DispatchResult(response=content, success=not data.get("error") and bool(content))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            return DispatchResult(response=f"error: Ollama returned {e.code}: {detail}", success=False)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            return DispatchResult(response=f"error: Ollama request failed: {e}", success=False)
 
 
 _NONINTERACTIVE_FLAGS: dict[str, str] = {

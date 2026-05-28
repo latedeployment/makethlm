@@ -457,6 +457,13 @@ task review [llm=codex]:
 makethlm invokes `codex exec` non-interactively. Install and authenticate
 Codex first with `codex login`.
 
+**Native OpenAI and Ollama providers** do not require shell templates:
+
+```
+llm openai [model=gpt-4o-mini, key=$OPENAI_API_KEY]
+llm ollama [model=llama3, base_url=http://127.0.0.1:11434]
+```
+
 **Custom CLI providers** let you use any LLM tool that accepts a prompt on the
 command line. The `{prompt}` placeholder is replaced with the actual prompt
 text:
@@ -912,6 +919,8 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
+| `--openai` | | Use the native OpenAI API dispatcher as the default LLM dispatcher |
+| `--ollama` | | Use the native Ollama HTTP dispatcher as the default LLM dispatcher |
 | `--safe` | | Enable restrictive safety checks before execution |
 | `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
 | `--allow-shell` | | Allow local shell steps in safe mode |
@@ -1102,6 +1111,8 @@ docker <name> [tag=..., context=..., file=...]:
 
 # Includes
 include "path/to/file.pf"
+import "path/to/file.pf"
+import? "optional-file.pf"
 
 # Aliases
 alias <short> := <task>
@@ -1110,6 +1121,19 @@ alias <short> := <task>
 long_line := "this is a very long" + \
     " value that spans lines"
 ```
+
+---
+
+## Development
+
+```bash
+uv run ruff check .
+uv run pytest tests/ -q --no-docker
+./publish.sh --validate --skip-tests
+```
+
+Use these checks before committing changes that touch parser, runner, CLI, or
+packaging behavior.
 
 ---
 

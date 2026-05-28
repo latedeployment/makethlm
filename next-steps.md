@@ -261,20 +261,29 @@ makethlm --check
 makethlm --check --json
 ```
 
+## Local Validation and Provider Features Implemented
+
+- Local Ruff/dev dependency setup supports linting, tests, wheel builds, and
+  package validation.
+- `makethlm completions bash|zsh|fish` emits shell completion scripts.
+- Native OpenAI and Ollama dispatchers are available with `llm openai`,
+  `llm ollama`, `--openai`, and `--ollama`.
+- Just-style `import`, optional `import?`, `[default]`,
+  `[confirm("...")]`, and `[env(NAME, VALUE)]` are supported.
+
 ## Remaining Feature Gaps
 
 These are the highest-value items still missing or only partially implemented.
 
 ### Release and Packaging Cleanup
 
-- Add CI for tests, lint, build, and package install.
+- Add optional CI when the project owner wants hosted checks.
 - Remove or ignore stale generated artifacts.
 - Automate changelog, version bump, tag, build, and publish steps.
 - Update the Git remote to `git@github.com:latedeployment/makethlm.git`.
 
 ### Lint and Type Pipeline
 
-- Enforce `uv run ruff check .`.
 - Consider `ruff format`.
 - Add `mypy` or `pyright` after the larger modules are split.
 
@@ -296,28 +305,19 @@ These are the highest-value items still missing or only partially implemented.
 
 ### Provider Polish
 
-- Add native OpenAI and Ollama dispatchers instead of relying only on shell templates.
 - Improve provider-specific validation and error messages.
-- Document provider behavior consistently.
+- Add more provider API compatibility tests.
 
 ### Just Compatibility
 
-- Add `import` and optional `import?` aliases for `include`.
 - Add `mod` submodules and `module::recipe` invocation.
-- Add more Just attributes: `[default]`, `[script]`, `[extension]`, `[metadata]`, `[env]`, and `[confirm("...")]`.
+- Add more Just attributes: `[script]`, `[extension]`, `[metadata]`, and full `[env]` parity.
 - Add shebang/script recipes.
 - Add subsequent dependencies with `&&`.
 - Add multi-recipe invocation in one command.
 - Add fallback/global justfile search.
 - Add shell setting array syntax, e.g. `set shell := ["bash", "-cu"]`.
 - Add more Just built-in functions.
-
-### Shell Completions
-
-- Add `makethlm completions bash`.
-- Add `makethlm completions zsh`.
-- Add `makethlm completions fish`.
-- Include local task-name completion where possible.
 
 ### Module Cleanup
 
@@ -353,60 +353,40 @@ Split the largest modules into focused pieces:
 Work through these tasks one by one. Each task should end with tests, docs, and
 a focused commit before starting the next item.
 
-1. Add CI.
-   Run `uv run pytest tests/ -q --no-docker`, `uv run ruff check .`, package
-   build, and a wheel install smoke test.
-
-2. Enforce Ruff locally.
-   Make the existing Ruff config actionable, fix reported issues, and document
-   the command in README and contributor docs.
-
-3. Clean release packaging.
+1. Clean release packaging.
    Remove stale generated artifacts from git, update `.gitignore`, refresh the
    remote URL, and add repeatable build/release commands.
 
-4. Add shell completions.
-   Implement `makethlm completions bash|zsh|fish`, including task names when a
-   Promptfile is available.
-
-5. Harden secrets backends.
+2. Harden secrets backends.
     Add subprocess-mocked tests for `infisical`, `op`, and `sops`, add value-free
     audit messages, and add an option to forbid secret injection into LLM prompts.
 
-6. Add native OpenAI dispatcher.
-    Implement direct subprocess/API behavior according to the package direction,
-    provider validation, timeout handling, tests, and docs.
-
-7. Add native Ollama dispatcher.
-    Support local Ollama execution with model selection, timeout handling,
-    provider validation, tests, and docs.
-
-8. Improve `--serve`.
+3. Improve `--serve`.
     Add task detail views, argument forms, run history detail pages, and safer
     execution controls.
 
-9. Add live output to `--serve`.
+4. Add live output to `--serve`.
     Stream task output to the UI/API without waiting for the run to finish.
 
-10. Split secrets and interpolation out of `models.py`.
+5. Split secrets and interpolation out of `models.py`.
     Move secret resolution and interpolation helpers into focused modules while
     preserving the public API and existing tests.
 
-11. Split runner subsystems.
+6. Split runner subsystems.
     Extract SSH execution, webhooks, history recording, and sandbox wrapping into
     focused modules with targeted tests.
 
-12. Harden sandbox behavior.
+7. Harden sandbox behavior.
     Add tests for Docker, systemd, and bwrap modes, read-only workspace support,
     network-deny defaults, explicit mounts, and threat-boundary docs.
 
-13. Add Docker Compose and systemd examples.
+8. Add Docker Compose and systemd examples.
     Provide realistic Promptfiles and docs for common self-hosted deployments.
 
-14. Add Kubernetes and Ansible examples.
+9. Add Kubernetes and Ansible examples.
     Cover `kubectl` workflows, inventory import, remote deploys, and rollback
     patterns.
 
-15. Add release workflow examples.
+10. Add release workflow examples.
     Include Python package release, GitHub Actions usage, and CMake
     `compile_commands.json` analysis examples.

@@ -12,6 +12,10 @@
 - Just compatibility tracking documentation.
 - Promptfile validation with `--check`.
 - Step-level shell output capture with `!cmd -> name`, `{{last.stdout}}`, and `!cmd |>` prompt piping.
+- Local Ruff/dev dependency setup for linting and package smoke validation.
+- Just-style `import`, optional `import?`, `[default]`, `[confirm("...")]`, and `[env(NAME, VALUE)]`.
+- Shell completion generation with `makethlm completions bash|zsh|fish`.
+- Native OpenAI and Ollama dispatchers via `llm openai`, `llm ollama`, `--openai`, and `--ollama`.
 
 ## 0.1.0 - 2026-05-24
 

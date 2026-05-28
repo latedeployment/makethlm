@@ -125,7 +125,9 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
 | `group` | string | Group heading for `--list` (e.g., `group="deploy"`) |
 | `doc` | string | Description shown in `--list` output |
-| `confirm` | flag/string | Prompt for confirmation before running. Use `confirm` for a default message or `confirm="Are you sure?"` for a custom one |
+| `confirm` | flag/string | Prompt for confirmation before running. Use `confirm`, `confirm="Are you sure?"`, or Just-style `confirm("Are you sure?")` |
+| `default` | flag | Make this task the default target |
+| `env(NAME, VALUE)` | attribute | Set an environment variable for this task's shell steps |
 | `os` | string | Only run this task on the specified OS (e.g., `os=linux`) |
 | `linux` | flag | Shorthand for `os=linux` |
 | `macos` | flag | Shorthand for `os=macos` |

@@ -10,16 +10,14 @@ import os
 import shutil
 import socket
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
-from makethlm.parser import parse
 from makethlm.dispatcher import DryRunDispatcher
+from makethlm.parser import parse
 from makethlm.runner import Runner
-
 
 # ---------------------------------------------------------------------------
 # --no-docker flag: skip integration tests on machines without Docker

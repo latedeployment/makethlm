@@ -5,8 +5,7 @@ import tempfile
 
 import pytest
 
-from makethlm.parser import parse, ParseError
-
+from makethlm.parser import ParseError, parse
 
 # ---------------------------------------------------------------------------
 # Basic parsing
@@ -874,7 +873,7 @@ class TestIncludes:
             with open(common, "w") as f:
                 f.write('env := "production"\n\ntask setup:\n    setup env\n')
 
-            main_src = f'include "common.pf"\n\ntask deploy: setup:\n    deploy\n'
+            main_src = 'include "common.pf"\n\ntask deploy: setup:\n    deploy\n'
             pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
 
             assert pf.variables["env"] == "production"
@@ -887,7 +886,7 @@ class TestIncludes:
             with open(lib, "w") as f:
                 f.write("fn greet:\n    say hello\n")
 
-            main_src = f'include "lib.pf"\n\ntask hello:\n    @use greet\n'
+            main_src = 'include "lib.pf"\n\ntask hello:\n    @use greet\n'
             pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
 
             assert "greet" in pf.functions
@@ -898,6 +897,28 @@ class TestIncludes:
         src = 'include "nonexistent.pf"\n'
         with pytest.raises(ParseError, match="not found"):
             parse(src)
+
+    def test_import_alias_basic(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            common = os.path.join(tmpdir, "common.pf")
+            with open(common, "w") as f:
+                f.write('env := "production"\n\ntask setup:\n    setup env\n')
+
+            main_src = 'import "common.pf"\n\ntask deploy: setup:\n    deploy\n'
+            pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
+
+            assert pf.variables["env"] == "production"
+            assert "setup" in pf.tasks
+
+    def test_optional_import_missing_is_ignored(self):
+        src = """\
+import? "missing.pf"
+
+task build:
+    build it
+"""
+        pf = parse(src)
+        assert "build" in pf.tasks
 
     def test_circular_include_raises(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -918,7 +939,7 @@ class TestIncludes:
             with open(common, "w") as f:
                 f.write('env := "default"\n')
 
-            main_src = f'include "common.pf"\nenv := "override"\n\ntask show:\n    env is {{{{env}}}}\n'
+            main_src = 'include "common.pf"\nenv := "override"\n\ntask show:\n    env is {{env}}\n'
             pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
 
             # Local definition should override included
@@ -1593,6 +1614,36 @@ task deploy [confirm=Are you sure?]:
         pf = parse(src)
         assert pf.tasks["deploy"].options.confirm == "Are you sure?"
 
+    def test_confirm_function_attribute(self):
+        src = """\
+task deploy [confirm("Really deploy?")]:
+    deploy to production
+"""
+        pf = parse(src)
+        assert pf.tasks["deploy"].options.confirm == "Really deploy?"
+
+    def test_default_attribute_sets_default_task(self):
+        src = """\
+task first:
+    first task
+
+task second [default]:
+    second task
+"""
+        pf = parse(src)
+        assert pf.default_task == "second"
+
+    def test_env_function_attribute(self):
+        src = """\
+task build [env(NODE_ENV, production), env("DEBUG", "0")]:
+    !npm run build
+"""
+        pf = parse(src)
+        assert pf.tasks["build"].options.env == {
+            "NODE_ENV": "production",
+            "DEBUG": "0",
+        }
+
     def test_os_filter(self):
         src = """\
 task linuxonly [os=linux]:
@@ -1696,6 +1747,7 @@ class TestOsFilter:
 
     def test_matching_os_does_not_skip(self):
         import platform
+
         from makethlm.models import TaskOptions
         current = platform.system().lower()
         # Map back to our naming
@@ -1942,7 +1994,7 @@ task build:
 
     def test_set_directive_bare_value_still_works(self):
         """Bare unquoted values still work (e.g. set sandbox docker)."""
-        pf = parse("""\
+        parse("""\
 task build:
     build it
 """)
@@ -2681,8 +2733,9 @@ task build [unix]:
         assert pf.tasks["build"].options.os_filter == "unix"
 
     def test_unix_matches_linux(self):
-        from makethlm.models import TaskOptions
         import platform
+
+        from makethlm.models import TaskOptions
         opts = TaskOptions(os_filter="unix")
         if platform.system().lower() in ("linux", "darwin"):
             assert opts.should_skip_for_os() is False

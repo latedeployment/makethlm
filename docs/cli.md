@@ -35,6 +35,8 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
+| `--openai` | | Use the native OpenAI API dispatcher as the default LLM dispatcher |
+| `--ollama` | | Use the native Ollama HTTP dispatcher as the default LLM dispatcher |
 | `--safe` | | Enable restrictive safety checks before execution |
 | `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
 | `--allow-shell` | | Allow local shell steps in safe mode |
@@ -104,6 +106,13 @@ makethlm review --shell 'ollama run llama3 "{prompt}"'
 
 # Use Codex CLI
 makethlm review --codex
+
+# Use native OpenAI or Ollama
+makethlm review --openai -m gpt-4o-mini
+makethlm review --ollama -m llama3
+
+# Print shell completions
+makethlm completions bash
 
 # List everything
 makethlm --list

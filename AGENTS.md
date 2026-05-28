@@ -15,6 +15,7 @@ Tests live in `tests/`. Examples are under `examples/`, documentation under `doc
 ## Build, Test, and Development Commands
 
 - `uv run pytest tests/ -q --no-docker`: run the standard test suite without Docker-backed SSH integration tests.
+- `uv run ruff check .`: run the local lint gate.
 - `uv run pytest tests/test_parser.py -q`: run a focused parser test file.
 - `uv run makethlm --help`: exercise the CLI entry point locally.
 - `uv build --wheel`: build the package wheel.

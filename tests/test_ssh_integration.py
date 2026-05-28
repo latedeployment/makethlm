@@ -221,13 +221,9 @@ task slow [on=target]:
             "makethlm.runner._build_ssh_command",
             _patched_build_ssh_command(key_path),
         ):
-            # Monkey-patch the _run_ssh_step to use a short timeout
-            original_run_ssh = runner._run_ssh_step
-
             def _short_timeout_ssh(step, host, group):
                 import subprocess as sp
-                from makethlm.runner import _build_ssh_command as _orig_build
-                from makethlm.models import HostGroup
+
                 from makethlm.runner import StepResult
 
                 ssh_cmd = _patched_build_ssh_command(key_path)(host, step.content, group)

@@ -37,6 +37,25 @@ task review [llm=codex]:
 makethlm invokes `codex exec` non-interactively and sends the prompt on stdin.
 Install and authenticate Codex first with `codex login`.
 
+## Native OpenAI
+
+`llm openai` calls the OpenAI Chat Completions API directly. Set
+`OPENAI_API_KEY` or pass `key=$OPENAI_API_KEY` in the provider declaration.
+
+```
+llm openai [model=gpt-4o-mini, key=$OPENAI_API_KEY]
+```
+
+Use `base_url` for compatible gateways.
+
+## Native Ollama
+
+`llm ollama` calls a local Ollama HTTP server directly:
+
+```
+llm ollama [model=llama3, base_url=http://127.0.0.1:11434]
+```
+
 ## Custom CLI Providers
 
 Use any LLM tool that accepts a prompt on the command line. The `{prompt}` placeholder is replaced with the actual prompt text:
@@ -80,4 +99,11 @@ To use Codex as the default dispatcher for a run:
 
 ```bash
 makethlm review --codex
+```
+
+Native OpenAI and Ollama can also be selected for one run:
+
+```bash
+makethlm review --openai -m gpt-4o-mini
+makethlm review --ollama -m llama3
 ```

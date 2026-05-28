@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import re
 import platform
+import re
 import shlex
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from collections.abc import Callable
 from typing import Literal
 
 
@@ -89,8 +89,10 @@ class TaskOptions:
     sandbox_image: str | None = None  # docker image (default: ubuntu:latest)
     sandbox_mount: str | None = None  # extra mount (src:dst)
     sandbox_net: str | None = None    # network mode (e.g., "host", "none")
+    default: bool = False             # Just-style [default] task attribute
+    env: dict[str, str] = field(default_factory=dict)  # env vars for shell steps
 
-    def merge(self, overrides: "TaskOptions") -> "TaskOptions":
+    def merge(self, overrides: TaskOptions) -> TaskOptions:
         """Return a new TaskOptions with non-None overrides applied."""
         return TaskOptions(
             model=overrides.model if overrides.model is not None else self.model,
@@ -129,6 +131,8 @@ class TaskOptions:
             sandbox_image=overrides.sandbox_image if overrides.sandbox_image is not None else self.sandbox_image,
             sandbox_mount=overrides.sandbox_mount if overrides.sandbox_mount is not None else self.sandbox_mount,
             sandbox_net=overrides.sandbox_net if overrides.sandbox_net is not None else self.sandbox_net,
+            default=overrides.default or self.default,
+            env={**self.env, **overrides.env},
         )
 
     def should_skip_for_os(self) -> bool:

@@ -13,24 +13,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .parser import parse, ParseError
+from .dispatcher import (
+    ClaudeDispatcher,
+    CodexDispatcher,
+    Dispatcher,
+    DryRunDispatcher,
+    OllamaDispatcher,
+    OpenAIDispatcher,
+    ShellDispatcher,
+)
+from .history import list_runs, record_run
+from .models import Promptfile, SecretError, _builtin_functions, _evaluate_expression
+from .parser import ParseError, parse
 from .runner import (
-    Runner,
     CycleError,
+    Runner,
     RunResult,
     StepResult,
     TaskResult,
-    topological_sort,
     _dispatcher_for_provider,
+    topological_sort,
 )
-from .dispatcher import ClaudeDispatcher, CodexDispatcher, Dispatcher, DryRunDispatcher, ShellDispatcher
-from .models import Promptfile, SecretError, _evaluate_expression, _builtin_functions
-from .history import list_runs, record_run
-
 
 PROMPTFILE_NAMES = ["Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"]
 
-_KNOWN_NATIVE_PROVIDERS = {"claude", "codex"}
+_KNOWN_NATIVE_PROVIDERS = {"claude", "codex", "openai", "ollama"}
 _SECRETS_BACKEND_TOOLS = {
     "infisical": "infisical",
     "1password": "op",
@@ -174,6 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--codex",
         action="store_true",
         help="Use the Codex CLI as the default LLM dispatcher",
+    )
+    ap.add_argument(
+        "--openai",
+        action="store_true",
+        help="Use the native OpenAI API dispatcher as the default LLM dispatcher",
+    )
+    ap.add_argument(
+        "--ollama",
+        action="store_true",
+        help="Use the native Ollama HTTP dispatcher as the default LLM dispatcher",
     )
     ap.add_argument(
         "--safe",
@@ -764,6 +781,59 @@ def _print_history(limit_raw: str | None = None) -> None:
         )
 
 
+def _completion_script(shell: str) -> str:
+    """Return a shell completion script for makethlm."""
+    common_opts = (
+        "--file -f --dry-run --json --parallel --jobs --list -l --summary "
+        "--dump --check --plan --graph --graph-format --history --no-history "
+        "--serve --evaluate --model -m --shell --codex --openai --ollama --safe "
+        "--allow-backticks --allow-shell --allow-ssh --allow-docker --allow-llm "
+        "--var -V --quiet -q --verbose"
+    )
+    if shell == "bash":
+        return f"""# bash completion for makethlm
+_makethlm_complete() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "{common_opts} completions history" -- "$cur") )
+        return 0
+    fi
+    local tasks
+    tasks="$(makethlm --summary 2>/dev/null || true)"
+    COMPREPLY=( $(compgen -W "completions history $tasks" -- "$cur") )
+}}
+complete -F _makethlm_complete makethlm
+"""
+    if shell == "zsh":
+        return f"""#compdef makethlm
+# zsh completion for makethlm
+_makethlm() {{
+  local -a opts tasks
+  opts=(${{=:-"{common_opts} completions history"}})
+  tasks=(${{(f)"$(makethlm --summary 2>/dev/null)"}})
+  _describe 'option' opts
+  _describe 'task' tasks
+}}
+_makethlm "$@"
+"""
+    if shell == "fish":
+        lines = [
+            "# fish completion for makethlm",
+            "function __makethlm_tasks",
+            "    makethlm --summary 2>/dev/null",
+            "end",
+        ]
+        for opt in common_opts.split():
+            if opt.startswith("--"):
+                lines.append(f"complete -c makethlm -l {opt[2:]}")
+            elif opt.startswith("-") and len(opt) == 2:
+                lines.append(f"complete -c makethlm -s {opt[1:]}")
+        lines.append("complete -c makethlm -a '(__makethlm_tasks)'")
+        lines.append("complete -c makethlm -a 'completions history'")
+        return "\n".join(lines) + "\n"
+    raise ValueError(f"unsupported shell: {shell!r} (expected bash, zsh, or fish)")
+
+
 def _serve(pf: Promptfile, dispatcher: Dispatcher, promptfile_path: str, bind: str) -> int:
     """Run a small local HTTP UI/API for self-hosted use."""
     host, _, port_raw = bind.partition(":")
@@ -933,6 +1003,18 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(_history_payload(limit))
         else:
             _print_history(limit)
+        return 0
+
+    if args.task in ("completions", "completion"):
+        if not args.task_args:
+            print("error: completions requires a shell: bash, zsh, or fish", file=sys.stderr)
+            return 1
+        shell = args.task_args[0]
+        try:
+            print(_completion_script(shell), end="")
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         return 0
 
     # Locate the Promptfile
@@ -1225,6 +1307,10 @@ def main(argv: list[str] | None = None) -> int:
         dispatcher = ShellDispatcher(args.shell)
     elif args.codex:
         dispatcher = CodexDispatcher(model=args.model)
+    elif args.openai:
+        dispatcher = OpenAIDispatcher(model=args.model)
+    elif args.ollama:
+        dispatcher = OllamaDispatcher(model=args.model)
     else:
         dispatcher = ClaudeDispatcher(model=args.model)
 

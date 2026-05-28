@@ -13,6 +13,7 @@ export secret := "key"           # Exported variables
 set dotenv-load                  # Set directives
 set dotenv-load ".env.local"     # Set directives (with value)
 include "other.pf"               # Includes
+import? "local.pf"               # Optional imports
 llm claude [model=opus]          # LLM providers
 hosts web [user=deploy]:         # Host groups
     web1.example.com
@@ -87,6 +88,7 @@ fn <name>:
 
 # Tasks
 task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
+task deploy [default, confirm("Really deploy?"), env(ENV, prod)]:
     !shell command
     !shell command -> captured
     !shell command |>
@@ -108,6 +110,8 @@ docker <name> [tag=..., context=..., file=...]:
 
 # Includes
 include "path/to/file.pf"
+import "path/to/file.pf"
+import? "optional-file.pf"
 
 # Aliases
 alias <short> := <task>

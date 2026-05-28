@@ -11,15 +11,30 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import HostGroup, LLMProvider, Promptfile, SecretError, Task, TaskStep, evaluate_condition, parse_duration_seconds
-from .dispatcher import Dispatcher, DispatchResult, ClaudeDispatcher, CodexDispatcher, ShellDispatcher
+from .dispatcher import (
+    ClaudeDispatcher,
+    CodexDispatcher,
+    Dispatcher,
+    OllamaDispatcher,
+    OpenAIDispatcher,
+    ShellDispatcher,
+)
+from .models import (
+    HostGroup,
+    LLMProvider,
+    Promptfile,
+    Task,
+    TaskStep,
+    evaluate_condition,
+    parse_duration_seconds,
+)
 from .subprocess_util import run_subprocess as _run_subprocess
 
 
@@ -186,8 +201,17 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
     """Create a Dispatcher from an LLMProvider configuration."""
     if provider.shell_template:
         return ShellDispatcher(provider.shell_template)
-    if provider.name.lower() == "codex":
+    provider_name = provider.name.lower()
+    if provider_name == "codex":
         return CodexDispatcher(model=provider.model)
+    if provider_name == "openai":
+        return OpenAIDispatcher(
+            model=provider.model,
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+        )
+    if provider_name == "ollama":
+        return OllamaDispatcher(model=provider.model, base_url=provider.base_url)
     # Default: use Claude CLI dispatcher
     return ClaudeDispatcher(model=provider.model)
 
@@ -677,7 +701,6 @@ class Runner:
 
         total = sum(len(level) for level in levels)
         if self.verbose and total > 1:
-            flat = [n for level in levels for n in level if n != target]
             _log(f"Running {target} ({total} tasks, {len(levels)} levels)", bold=True)
 
         idx = 0
@@ -721,7 +744,7 @@ class Runner:
             if self.verbose:
                 _log(f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})", dim=True)
             tr = TaskResult(task_name=task_name, prompt_sent="",
-                            response=f"[skipped] not applicable on this OS", success=True)
+                            response="[skipped] not applicable on this OS", success=True)
             result.task_results.append(tr)
             return tr
 
@@ -883,7 +906,7 @@ class Runner:
                     prompt_preview = step.content.split("\n")[0]
                     if len(prompt_preview) > 60:
                         prompt_preview = prompt_preview[:57] + "..."
-                    _log(f"         > sending prompt to LLM ...", dim=True)
+                    _log("         > sending prompt to LLM ...", dim=True)
                 pipe_context = "\n\n".join(pending_pipe_outputs)
                 pending_pipe_outputs.clear()
                 sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
@@ -947,7 +970,9 @@ class Runner:
                     with ThreadPoolExecutor(max_workers=len(effective_group.hosts)) as executor:
                         host_results = list(
                             executor.map(
-                                lambda h: self._run_ssh_step(step, h, effective_group),
+                                lambda h, current_step=step: self._run_ssh_step(
+                                    current_step, h, effective_group
+                                ),
                                 effective_group.hosts,
                             )
                         )
@@ -992,7 +1017,7 @@ class Runner:
             else:
                 # Prompt steps still run locally via LLM
                 if self.verbose:
-                    _log(f"         > sending prompt to LLM ...", dim=True)
+                    _log("         > sending prompt to LLM ...", dim=True)
                 pipe_context = "\n\n".join(pending_pipe_outputs)
                 pending_pipe_outputs.clear()
                 sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
@@ -1090,6 +1115,8 @@ class Runner:
         exported = self.pf.get_exported_env()
         if exported:
             env.update(exported)
+        if task and task.options.env:
+            env.update(task.options.env)
 
         # Inject MAKETHLM_* env vars
         if task:
@@ -1204,7 +1231,7 @@ class Runner:
         generate_prompt = _DOCKER_GENERATE_PREFIX + description
 
         if self.verbose:
-            _log(f"         > generating Dockerfile via LLM ...", dim=True)
+            _log("         > generating Dockerfile via LLM ...", dim=True)
         if self.dry_run:
             step_results.append(StepResult(
                 kind="docker-generate",
@@ -1293,9 +1320,8 @@ class Runner:
         """Store task output as an artifact for downstream access."""
         artifact_name = task.options.register or task.name
 
-        # Collect stdout and stderr from shell steps
+        # Collect stdout from shell steps. stderr is mixed into stdout today.
         stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
         last_exit_code = "0"
         response_parts: list[str] = []
 
@@ -1350,7 +1376,7 @@ class Runner:
                     url = maybe_url
 
             if preset == "ntfy":
-                body = f"{task.name}: {status}\n{payload['stdout']}".encode("utf-8")
+                body = f"{task.name}: {status}\n{payload['stdout']}".encode()
                 req = urllib.request.Request(
                     url,
                     data=body,

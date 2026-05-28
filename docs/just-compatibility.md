@@ -20,8 +20,12 @@ keeping makethlm's LLM-oriented task model.
 | Working directory controls | Supported: `set working-dir`, `[working-dir=...]`, `[no-cd]` |
 | Dotenv loading | Supported with `set dotenv-load`, `set dotenv-path`, and `set dotenv-required` |
 | Duplicate override settings | Supported with `set allow-duplicate-tasks` and `set allow-duplicate-variables` |
-| Includes | Supported with `include "path"` |
+| Includes/imports | Supported with `include "path"`, `import "path"`, and optional `import? "path"` |
+| Default attribute | Supported with `[default]` |
+| Confirmation attributes | Supported with `[confirm]`, `[confirm="message"]`, and `[confirm("message")]` |
+| Env attributes | Supported with `[env(NAME, VALUE)]` for task shell steps |
 | Listing and summaries | Supported with `--list` and `--summary` |
+| Shell completions | Supported with `makethlm completions bash|zsh|fish` |
 
 ## Deliberate Differences
 
@@ -45,22 +49,18 @@ extensions, not Just syntax.
 
 These are the largest gaps to close for stronger Just compatibility:
 
-- `import` and optional `import?` aliases for `include`.
 - `mod` submodules and `module::recipe` invocation.
-- Just's full attribute syntax, including `[confirm("prompt")]`,
-  `[default]`, `[script]`, `[extension]`, `[metadata]`, and `[env]`.
+- Just's full attribute syntax, including `[script]`, `[extension]`,
+  `[metadata]`, and `[env]`.
 - Shebang/script recipes.
 - Subsequent dependencies with `&&`.
 - Multiple recipe invocation in one command.
 - Fallback/global justfile search.
 - Shell setting array syntax, such as `set shell := ["bash", "-cu"]`.
 - More built-in functions, especially path and environment helpers.
-- Command-line shell completions.
 
 ## Implementation Priority
 
-1. Add `import` and `import?` as aliases for `include` and optional include.
-2. Add `[default]`, `[confirm("...")]`, and `[env(NAME, VALUE)]`.
-3. Add shebang/script recipe support.
-4. Add `mod` parsing and `module::recipe` execution.
-5. Add shell completions and richer `--list` output.
+1. Add shebang/script recipe support.
+2. Add `mod` parsing and `module::recipe` execution.
+3. Add richer `--list` output.
