@@ -20,6 +20,7 @@ Tests live in `tests/`. Examples are under `examples/`, documentation under `doc
 - `uv run makethlm --help`: exercise the CLI entry point locally.
 - `uv build --wheel`: build the package wheel.
 - `./publish.sh --validate`: build and install the wheel in a temporary venv for a smoke test.
+- `scripts/release.py patch --no-build`: preview version/changelog release automation without publishing.
 - `uv run mkdocs serve`: preview docs locally when editing `docs/`.
 
 ## Coding Style & Naming Conventions

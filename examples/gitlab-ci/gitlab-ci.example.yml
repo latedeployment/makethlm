@@ -1,0 +1,19 @@
+stages:
+  - test
+  - review
+
+makethlm-test:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm
+  stage: test
+  script:
+    - uv sync
+    - uv run makethlm -f examples/gitlab-ci/Promptfile test
+
+makethlm-review:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm
+  stage: review
+  script:
+    - uv sync
+    - uv run makethlm -f examples/gitlab-ci/Promptfile review-changes
+  rules:
+    - if: $CI_MERGE_REQUEST_ID

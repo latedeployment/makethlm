@@ -1,0 +1,23 @@
+# systemd service deployment workflow
+
+service := "myapp.service"
+artifact := "dist/myapp"
+target := "/opt/myapp/myapp"
+
+task status:
+    !systemctl status {{quote(service)}} --no-pager || true |>
+    summarize service health and recent failure clues
+
+task deploy [confirm("Restart production service?"), rollback=rollback]:
+    !install -m 0755 {{quote(artifact)}} {{quote(target)}}
+    !systemctl daemon-reload
+    !systemctl restart {{quote(service)}}
+    !systemctl is-active {{quote(service)}}
+
+task logs:
+    !journalctl -u {{quote(service)}} -n 100 --no-pager |>
+    identify crashes, dependency failures, or configuration errors
+
+task rollback:
+    !systemctl restart {{quote(service)}}
+    !journalctl -u {{quote(service)}} -n 50 --no-pager

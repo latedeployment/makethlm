@@ -12,9 +12,9 @@ by LLMs. Define your build, deploy, review, and maintenance workflows as
 prose, interleave them with shell commands, and let your LLM of choice do the
 heavy lifting.
 
-Recent additions include Codex support, execution previews, local history, a
-small self-hosted UI/API server, stricter safety controls, and ready-made
-workflow examples for C, CMake, and Python projects.
+Recent additions include Codex support, execution previews, local history,
+stricter safety controls, and ready-made workflow examples for C, CMake, and
+Python projects.
 
 ```
 # Promptfile
@@ -67,6 +67,7 @@ $ makethlm deploy staging
   - [Includes](#includes)
   - [Environment Variables](#environment-variables)
   - [Task Metadata Options](#task-metadata-options)
+  - [Reliable Workflows](#reliable-workflows)
   - [Set Directives](#set-directives)
   - [Aliases](#aliases)
 - [CLI Reference](#cli-reference)
@@ -278,6 +279,9 @@ Arguments are interpolated into both prompt text and shell commands via the
 same `{{name}}` syntax as variables. If a required argument (one without a
 default) is not provided, makethlm exits with an error.
 
+Interpolation does not shell-escape values. In shell steps, quote variable and
+argument values explicitly with `{{quote(name)}}`.
+
 Arguments are **scoped to the target task** -- they are not passed to
 dependency tasks.
 
@@ -337,7 +341,7 @@ Variable interpolation (`{{name}}`) works inside shell commands:
 project := "myapp"
 
 task build:
-    !docker build -t {{project}}:latest .
+    !docker build -t {{quote(project)}}:latest .
 ```
 
 ### Functions
@@ -632,7 +636,7 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 |--------|------|-------------|
 | `model` | string | LLM model to use for this task |
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
-| `max_tokens` | int | Maximum tokens in the LLM response |
+| `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
 | `llm` | string | Name of the LLM provider to use (must be declared globally) |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
@@ -652,9 +656,17 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
+| `postmortem` | string | Diagnostic task to run after failure and before rollback |
+| `fallback-llm` | string | Up to four `|`-separated providers to try after the primary provider |
+| `retries` | integer | LLM retries per provider, from 0 through 10 |
+| `requires` | string | `|`-separated `artifact.field[:type]` input contracts |
+| `produces` | string | Output contract: `text`, `nonempty`, `json`, `object`, `array`, `integer`, `number`, or `boolean` |
 | `ssh-key` | string | SSH identity file for this task's remote shell steps |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
+| `script` | flag/string | Run the task body as one temporary script; use `script("python3")` to choose an interpreter |
+| `extension("ext")` | string | File extension for script recipes, e.g. `extension("py")` |
+| `env(NAME, VALUE)` | string | Set an environment variable for task shell steps |
 
 Options can be combined with dependencies:
 
@@ -662,6 +674,48 @@ Options can be combined with dependencies:
 task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
     deploy {{project}} to {{target}}
 ```
+
+### Reliable Workflows
+
+Postmortems run after a failed task and before rollback. They can inspect the
+failed task's redacted artifact:
+
+```
+task diagnose:
+    explain deploy exit {{deploy.exit_code}}:
+    {{deploy.stdout}}
+
+task restore:
+    !./scripts/restore
+
+task deploy [postmortem=diagnose, rollback=restore]:
+    !./scripts/deploy
+```
+
+Artifact contracts validate task boundaries:
+
+```
+task inspect [produces=object]:
+    !./scripts/inspect --json
+
+task publish [requires="inspect.stdout:object"]: inspect:
+    !./scripts/publish
+```
+
+Provider retry and fallback strategies are declared per task:
+
+```
+llm cloud [template=cloud-llm {prompt}]
+llm local [model=llama3]
+
+task review [llm=cloud, retries=1, fallback-llm=local]:
+    review the release diff
+```
+
+Cache keys include resolved execution inputs such as arguments, variables,
+upstream artifacts, provider and agent configuration, task options, and
+referenced environment variables. Failed or secret-resolving tasks are not
+cached.
 
 ### Set Directives
 
@@ -796,6 +850,8 @@ String manipulation functions can be used inside `{{ }}` templates on variables:
 | `replace_regex(s, pat, to)` | `{{replace_regex(ver, "\\d+$", "0")}}` | `1.2.0` |
 | `quote(s)` | `{{quote(cmd)}}` | `'hello world'` |
 | `join(sep, a, b, ...)` | `{{join(", ", "a", "b")}}` | `a, b` |
+| `env_var(name[, default])` | `{{env_var("HOME")}}` | `/home/user` |
+| `path_exists(p)` | `{{path_exists("README.md")}}` | `true` |
 | `len(s)` | `{{len(name)}}` | `5` |
 | `substr(s, start[, len])` | `{{substr(name, 0, 3)}}` | `hel` |
 | `match(s, regex)` | `{{match(ver, "^\\d+")}}` | `true` |
@@ -806,7 +862,7 @@ String manipulation functions can be used inside `{{ }}` templates on variables:
 |----------|---------|--------|
 | `file_name(p)` | `{{file_name("/tmp/a.txt")}}` | `a.txt` |
 | `file_stem(p)` | `{{file_stem("/tmp/a.txt")}}` | `a` |
-| `extension(p)` | `{{extension("a.tar.gz")}}` | `.gz` |
+| `extension(p)` | `{{extension("a.tar.gz")}}` | `gz` |
 | `without_extension(p)` | `{{without_extension("a.tar.gz")}}` | `a.tar` |
 | `parent_directory(p)` | `{{parent_directory("/tmp/a.txt")}}` | `/tmp` |
 
@@ -904,12 +960,12 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
 | `--check` | | Validate Promptfile references, required tools, and risky capabilities |
+| `--capabilities` | | Explain transitive execution capabilities and their safe-mode flags |
 | `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
 | `--graph` | | Print a task dependency graph and exit |
 | `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
 | `--history [N]` | | Show recent local run history and exit |
 | `--no-history` | | Do not record this run in local history |
-| `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--json` | | Emit machine-readable JSON output |
@@ -917,16 +973,18 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--jobs N` | | Limit parallel task workers; implies `--parallel` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
-| `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
+| `--shell TEMPLATE` | | Use an LLM CLI argv template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
 | `--openai` | | Use the native OpenAI API dispatcher as the default LLM dispatcher |
 | `--ollama` | | Use the native Ollama HTTP dispatcher as the default LLM dispatcher |
 | `--safe` | | Enable restrictive safety checks before execution |
-| `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
+| `--allow-backticks` | | Allow parse-time backtick commands in safe or inspection modes |
 | `--allow-shell` | | Allow local shell steps in safe mode |
 | `--allow-ssh` | | Allow SSH shell steps in safe mode |
 | `--allow-docker` | | Allow docker blocks in safe mode |
 | `--allow-llm` | | Allow LLM prompt execution in safe mode |
+| `--allow-secrets` | | Allow secret reads and sensitive interpolation in safe mode |
+| `--allow-webhook` | | Allow webhook delivery in safe mode |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -951,6 +1009,8 @@ makethlm --dry-run deploy staging
 # Validate without executing
 makethlm --check
 makethlm --check --json
+makethlm --capabilities deploy
+makethlm --capabilities --json deploy
 
 # Emit machine-readable output
 makethlm --json deploy
@@ -972,12 +1032,11 @@ makethlm --graph --graph-format dot deploy
 # Show local run history
 makethlm history
 makethlm --history 50
+makethlm replay 42
+makethlm --json replay 42
 
 # Run with explicit safety permissions
-makethlm --safe --allow-shell --allow-llm test
-
-# Start the local self-hosted UI/API
-makethlm --serve 127.0.0.1:8765
+makethlm --safe --allow-shell --allow-llm --allow-secrets test
 
 # Use a different model
 makethlm review -m sonnet
@@ -1128,12 +1187,20 @@ long_line := "this is a very long" + \
 
 ```bash
 uv run ruff check .
+uv run ruff format --check .
 uv run pytest tests/ -q --no-docker
 ./publish.sh --validate --skip-tests
 ```
 
 Use these checks before committing changes that touch parser, runner, CLI, or
 packaging behavior.
+
+Release preparation is scripted:
+
+```bash
+scripts/release.py patch        # bump, test, validate, commit, tag
+scripts/release.py minor --publish
+```
 
 ---
 

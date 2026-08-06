@@ -1,0 +1,19 @@
+# CMake compile_commands.json analysis workflow
+
+build_dir := "build"
+
+task configure:
+    !cmake -S . -B {{quote(build_dir)}} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+task build: configure:
+    !cmake --build {{quote(build_dir)}} -j
+
+task analyze: configure:
+    !test -f {{quote(build_dir)}}/compile_commands.json
+    !python -m json.tool {{quote(build_dir)}}/compile_commands.json >/tmp/compile_commands.pretty.json
+    Review /tmp/compile_commands.pretty.json for missing warnings, unsafe flags,
+    non-hermetic include paths, and inconsistent C/C++ standards.
+
+task diagnostics: build:
+    !cmake --build {{quote(build_dir)}} -j 2>&1 || true |>
+    explain compiler diagnostics and suggest fixes

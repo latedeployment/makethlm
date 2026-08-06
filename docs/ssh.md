@@ -52,6 +52,23 @@ task deploy [on=web]:
 
 SSH connections use `BatchMode=yes` for non-interactive operation.
 
+## Ansible Inventory Files
+
+Imported INI inventories preserve `ansible_user` and `ansible_port` separately
+for every host:
+
+```ini
+[web]
+web1.example.test ansible_user=alice ansible_port=2201
+web2.example.test ansible_user=bob ansible_port=2202
+```
+
+```make
+inventory "./hosts.ini"
+```
+
+One host's values are never reused as defaults for another host.
+
 ## Task-Level SSH Options
 
 Task options can override host group SSH settings:

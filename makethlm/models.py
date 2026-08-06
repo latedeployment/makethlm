@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import os
 import platform
 import re
@@ -12,6 +11,31 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Literal
+
+from .interpolation import (
+    apply_parameter_expansion,
+    interpolate_text,
+    resolve_env_vars,
+    split_unquoted,
+    try_parameter_expansion,
+)
+from .secrets import SecretError, is_secret_name, resolve_secret, resolve_secrets
+
+ARTIFACT_CONTRACT_TYPES = frozenset(
+    {
+        "text",
+        "nonempty",
+        "json",
+        "object",
+        "array",
+        "integer",
+        "number",
+        "boolean",
+    }
+)
+MAX_LLM_RETRIES = 10
+MAX_FALLBACK_LLMS = 4
+MAX_LLM_TOKENS = 1_000_000
 
 
 @dataclass
@@ -33,24 +57,27 @@ class Settings:
     """Global configuration from ``set`` directives (Justfile-compatible)."""
 
     dotenv_load: bool = False
-    dotenv_path: str | None = None      # custom .env path
-    dotenv_required: bool = False        # error if .env missing
-    secrets: str | None = None          # secrets backend name
+    dotenv_path: str | None = None  # custom .env path
+    dotenv_required: bool = False  # error if .env missing
+    secrets: str | None = None  # secrets backend name
     secrets_project: str | None = None  # backend-specific project/name
     secrets_environment: str | None = None
     secrets_vault: str | None = None
     secrets_file: str | None = None
-    shell: str | None = None             # shell executable (default: sh)
-    working_dir: str | None = None       # global working directory
-    export: bool = False                 # export all variables to env
-    positional_arguments: bool = False   # pass task args as $1, $2...
-    ignore_comments: bool = False        # strip # comments from shell cmds
-    tempdir: str | None = None           # temp directory for recipes
-    quiet: bool = False                  # suppress command echoing globally
+    shell: str | None = None  # shell executable (default: sh)
+    shell_argv: list[str] | None = None  # Just-style set shell := ["bash", "-cu"]
+    working_dir: str | None = None  # global working directory
+    export: bool = False  # export all variables to env
+    positional_arguments: bool = False  # pass task args as $1, $2...
+    ignore_comments: bool = False  # strip # comments from shell cmds
+    tempdir: str | None = None  # temp directory for recipes
+    quiet: bool = False  # suppress command echoing globally
     allow_duplicate_tasks: bool = False  # allow redefining tasks
     allow_duplicate_variables: bool = False
-    default: str | None = None           # explicit default task name
-    sandbox: str | None = None           # global sandbox: docker, systemd, bwrap
+    default: str | None = None  # explicit default task name
+    sandbox: str | None = None  # global sandbox: docker, systemd, bwrap
+    secrets_audit: bool = False  # log secret resolution metadata
+    allow_secrets_in_prompts: bool = True  # allow {{#secret:}} in LLM prompts
 
 
 @dataclass
@@ -60,37 +87,48 @@ class TaskOptions:
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    llm: str | None = None         # per-task LLM provider override
-    agent: str | None = None       # agent to use for this task
-    on: str | None = None          # host group to run on (Ansible-like)
-    private: bool = False          # hide from --list
-    group: str | None = None       # group name for --list display
-    doc: str | None = None         # one-line description for --list
-    confirm: str | bool = False    # True or custom message
-    os_filter: str | None = None   # "linux", "macos", "windows", "unix"
-    working_dir: str | None = None # per-task working directory
-    no_cd: bool = False            # don't change to working dir
+    llm: str | None = None  # per-task LLM provider override
+    agent: str | None = None  # agent to use for this task
+    on: str | None = None  # host group to run on (Ansible-like)
+    private: bool = False  # hide from --list
+    group: str | None = None  # group name for --list display
+    doc: str | None = None  # one-line description for --list
+    confirm: str | bool = False  # True or custom message
+    os_filter: str | None = None  # "linux", "macos", "windows", "unix"
+    working_dir: str | None = None  # per-task working directory
+    no_cd: bool = False  # don't change to working dir
     no_exit_message: bool = False  # suppress error message on failure
-    no_quiet: bool = False         # override global quiet for this task
+    no_quiet: bool = False  # override global quiet for this task
     positional_arguments: bool | None = None  # per-task override
-    register: str | None = None    # register task output as named artifact
-    webhook: str | None = None     # webhook URL to call on task completion
-    webhook_on: str = "always"     # "always", "success", or "failure"
-    secrets: str | None = None      # per-task secrets backend override
+    register: str | None = None  # register task output as named artifact
+    webhook: str | None = None  # webhook URL to call on task completion
+    webhook_on: str = "always"  # "always", "success", or "failure"
+    secrets: str | None = None  # per-task secrets backend override
     when: list[str] = field(default_factory=list)  # conditional execution expressions
-    cache: str | None = None          # cache duration e.g. "1h", "30m", "1d"
-    timeout: str | None = None        # shell/SSH timeout e.g. "30s", "5m"
-    llm_timeout: str | None = None    # prompt/LLM timeout e.g. "5m"
-    rollback: str | None = None       # task to run if this task fails
-    ssh_identity: str | None = None   # SSH identity file for remote shell steps
+    cache: str | None = None  # cache duration e.g. "1h", "30m", "1d"
+    timeout: str | None = None  # shell/SSH timeout e.g. "30s", "5m"
+    llm_timeout: str | None = None  # prompt/LLM timeout e.g. "5m"
+    rollback: str | None = None  # task to run if this task fails
+    postmortem: str | None = None  # diagnostic task to run after failure
+    fallback_llms: list[str] = field(default_factory=list)
+    retries: int = 0  # retry count per LLM provider
+    requires: list[str] = field(default_factory=list)  # artifact contracts
+    produces: str | None = None  # output type contract
+    ssh_identity: str | None = None  # SSH identity file for remote shell steps
     ssh_strict_host_key_checking: str | None = None  # yes, no, or accept-new
-    ssh_parallel: bool = False        # run each shell step across hosts concurrently
-    sandbox: str | None = None       # "docker", "systemd", "bwrap", or "none"
+    ssh_parallel: bool = False  # run each shell step across hosts concurrently
+    sandbox: str | None = None  # "docker", "systemd", "bwrap", or "none"
     sandbox_image: str | None = None  # docker image (default: ubuntu:latest)
     sandbox_mount: str | None = None  # extra mount (src:dst)
-    sandbox_net: str | None = None    # network mode (e.g., "host", "none")
-    default: bool = False             # Just-style [default] task attribute
+    sandbox_net: str | None = None  # network mode (e.g., "host", "none")
+    sandbox_read_only: bool = False  # mount workspace read-only where supported
+    default: bool = False  # Just-style [default] task attribute
     env: dict[str, str] = field(default_factory=dict)  # env vars for shell steps
+    script: bool = False  # Just-style [script] attribute
+    script_command: str | None = None  # Just-style [script(COMMAND)] interpreter
+    extension: str | None = None  # Just-style [extension] metadata
+    metadata: bool = False  # Just-style [metadata] marker
+    env_enabled: bool = False  # Just-style [env] marker
 
     def merge(self, overrides: TaskOptions) -> TaskOptions:
         """Return a new TaskOptions with non-None overrides applied."""
@@ -110,29 +148,64 @@ class TaskOptions:
             doc=overrides.doc if overrides.doc is not None else self.doc,
             confirm=overrides.confirm if overrides.confirm else self.confirm,
             os_filter=overrides.os_filter if overrides.os_filter is not None else self.os_filter,
-            working_dir=overrides.working_dir if overrides.working_dir is not None else self.working_dir,
+            working_dir=overrides.working_dir
+            if overrides.working_dir is not None
+            else self.working_dir,
             no_cd=overrides.no_cd or self.no_cd,
             no_exit_message=overrides.no_exit_message or self.no_exit_message,
             no_quiet=overrides.no_quiet or self.no_quiet,
-            positional_arguments=overrides.positional_arguments if overrides.positional_arguments is not None else self.positional_arguments,
+            positional_arguments=overrides.positional_arguments
+            if overrides.positional_arguments is not None
+            else self.positional_arguments,
             register=overrides.register if overrides.register is not None else self.register,
             webhook=overrides.webhook if overrides.webhook is not None else self.webhook,
-            webhook_on=overrides.webhook_on if overrides.webhook_on != "always" else self.webhook_on,
+            webhook_on=overrides.webhook_on
+            if overrides.webhook_on != "always"
+            else self.webhook_on,
             secrets=overrides.secrets if overrides.secrets is not None else self.secrets,
             when=overrides.when if overrides.when else self.when,
             cache=overrides.cache if overrides.cache is not None else self.cache,
             timeout=overrides.timeout if overrides.timeout is not None else self.timeout,
-            llm_timeout=overrides.llm_timeout if overrides.llm_timeout is not None else self.llm_timeout,
+            llm_timeout=overrides.llm_timeout
+            if overrides.llm_timeout is not None
+            else self.llm_timeout,
             rollback=overrides.rollback if overrides.rollback is not None else self.rollback,
-            ssh_identity=overrides.ssh_identity if overrides.ssh_identity is not None else self.ssh_identity,
-            ssh_strict_host_key_checking=overrides.ssh_strict_host_key_checking if overrides.ssh_strict_host_key_checking is not None else self.ssh_strict_host_key_checking,
+            postmortem=overrides.postmortem
+            if overrides.postmortem is not None
+            else self.postmortem,
+            fallback_llms=overrides.fallback_llms
+            if overrides.fallback_llms
+            else self.fallback_llms,
+            retries=overrides.retries if overrides.retries else self.retries,
+            requires=overrides.requires if overrides.requires else self.requires,
+            produces=overrides.produces if overrides.produces is not None else self.produces,
+            ssh_identity=overrides.ssh_identity
+            if overrides.ssh_identity is not None
+            else self.ssh_identity,
+            ssh_strict_host_key_checking=overrides.ssh_strict_host_key_checking
+            if overrides.ssh_strict_host_key_checking is not None
+            else self.ssh_strict_host_key_checking,
             ssh_parallel=overrides.ssh_parallel or self.ssh_parallel,
             sandbox=overrides.sandbox if overrides.sandbox is not None else self.sandbox,
-            sandbox_image=overrides.sandbox_image if overrides.sandbox_image is not None else self.sandbox_image,
-            sandbox_mount=overrides.sandbox_mount if overrides.sandbox_mount is not None else self.sandbox_mount,
-            sandbox_net=overrides.sandbox_net if overrides.sandbox_net is not None else self.sandbox_net,
+            sandbox_image=overrides.sandbox_image
+            if overrides.sandbox_image is not None
+            else self.sandbox_image,
+            sandbox_mount=overrides.sandbox_mount
+            if overrides.sandbox_mount is not None
+            else self.sandbox_mount,
+            sandbox_net=overrides.sandbox_net
+            if overrides.sandbox_net is not None
+            else self.sandbox_net,
+            sandbox_read_only=overrides.sandbox_read_only or self.sandbox_read_only,
             default=overrides.default or self.default,
             env={**self.env, **overrides.env},
+            script=overrides.script or self.script,
+            script_command=overrides.script_command
+            if overrides.script_command is not None
+            else self.script_command,
+            extension=overrides.extension if overrides.extension is not None else self.extension,
+            metadata=overrides.metadata or self.metadata,
+            env_enabled=overrides.env_enabled or self.env_enabled,
         )
 
     def should_skip_for_os(self) -> bool:
@@ -163,11 +236,12 @@ class TaskStep:
 
     kind: Literal["shell", "prompt", "echo"]
     content: str
-    silent: bool = False        # @silent -- suppress stdout
+    silent: bool = False  # @silent -- suppress stdout
     ignore_error: bool = False  # @ignore -- continue on non-zero exit
-    quiet: bool = False         # @ prefix -- suppress command echoing
+    quiet: bool = False  # @ prefix -- suppress command echoing
     capture: str | None = None  # -> name -- expose output as {{name.stdout}}
-    pipe_output: bool = False   # |> -- prepend output to the next prompt step
+    pipe_output: bool = False  # |> -- prepend output to the next prompt step
+    script: bool = False  # execute content as a temporary script file
 
 
 @dataclass
@@ -195,7 +269,7 @@ class Agent:
 
     name: str
     instructions_path: str  # path to .md file
-    instructions: str       # loaded content of the .md file
+    instructions: str  # loaded content of the .md file
     llm: str | None = None  # optional LLM provider override
     model: str | None = None
     line_number: int = 0
@@ -220,6 +294,16 @@ class DockerConfig:
 
 
 @dataclass
+class HostConnection:
+    """Per-host SSH settings imported from an inventory."""
+
+    user: str | None = None
+    port: int | None = None
+    identity_file: str | None = None
+    strict_host_key_checking: str | None = None
+
+
+@dataclass
 class HostGroup:
     """A named group of hosts for Ansible-like remote execution.
 
@@ -228,12 +312,13 @@ class HostGroup:
 
     name: str
     hosts: list[str] = field(default_factory=list)
-    user: str | None = None     # SSH user override
-    port: int | None = None     # SSH port override
+    user: str | None = None  # SSH user override
+    port: int | None = None  # SSH port override
     identity_file: str | None = None  # SSH identity file
     strict_host_key_checking: str | None = None  # yes, no, or accept-new
     timeout: str | None = None  # effective SSH command timeout
     line_number: int = 0
+    connections: dict[str, HostConnection] = field(default_factory=dict)
 
 
 @dataclass
@@ -243,10 +328,14 @@ class Task:
     name: str
     steps: list[TaskStep] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
+    subsequent_dependencies: list[str] = field(default_factory=list)
     options: TaskOptions = field(default_factory=TaskOptions)
     arguments: list[TaskArgument] = field(default_factory=list)
     docker: DockerConfig | None = None
     line_number: int = 0
+    local_variables: dict[str, str] = field(default_factory=dict)
+    function_namespace: str | None = None
+    guidance: str | None = None
 
     @property
     def prompt(self) -> str:
@@ -258,15 +347,10 @@ class Task:
         return any(s.kind == "shell" for s in self.steps)
 
 
-class SecretError(Exception):
-    """Raised when a configured secrets backend cannot resolve a value."""
-
-    pass
-
-
 # ---------------------------------------------------------------------------
 # Built-in functions (Justfile-compatible)
 # ---------------------------------------------------------------------------
+
 
 def _builtin_functions() -> dict[str, str]:
     """Evaluate all built-in functions and return name -> value mapping."""
@@ -278,6 +362,8 @@ def _builtin_functions() -> dict[str, str]:
     result["arch()"] = platform.machine()
     result["num_cpus()"] = str(os.cpu_count() or 1)
     result["home_directory()"] = str(os.path.expanduser("~"))
+    result["invocation_directory()"] = os.getcwd()
+    result["cwd()"] = os.getcwd()
     return result
 
 
@@ -295,6 +381,7 @@ def parse_duration_seconds(duration: str) -> float:
 # ---------------------------------------------------------------------------
 # String functions (Justfile-compatible + extensions)
 # ---------------------------------------------------------------------------
+
 
 def _fn_uppercase(*args: str) -> str:
     if len(args) != 1:
@@ -349,6 +436,18 @@ def _fn_join(*args: str) -> str:
         raise ValueError("join() takes at least 2 arguments (separator, values...)")
     sep = args[0]
     return sep.join(args[1:])
+
+
+def _fn_env_var(*args: str) -> str:
+    if len(args) not in (1, 2):
+        raise ValueError("env_var() takes 1 or 2 arguments")
+    return os.environ.get(args[0], args[1] if len(args) == 2 else "")
+
+
+def _fn_path_exists(*args: str) -> str:
+    if len(args) != 1:
+        raise ValueError("path_exists() takes exactly 1 argument")
+    return "true" if os.path.exists(args[0]) else "false"
 
 
 # Path functions
@@ -490,6 +589,8 @@ _STRING_FUNCTIONS: dict[str, Callable[..., str]] = {
     "replace_regex": _fn_replace_regex,
     "quote": _fn_quote,
     "join": _fn_join,
+    "env_var": _fn_env_var,
+    "path_exists": _fn_path_exists,
     # Path functions
     "file_name": _fn_file_name,
     "file_stem": _fn_file_stem,
@@ -568,15 +669,14 @@ def _resolve_function_arg(arg: str, context: dict[str, str]) -> str:
     arg = arg.strip()
 
     # Quoted string
-    if (arg.startswith('"') and arg.endswith('"')) or \
-       (arg.startswith("'") and arg.endswith("'")):
+    if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
         return arg[1:-1]
 
     # Nested function call: name(args...)
     paren = arg.find("(")
     if paren != -1 and arg.endswith(")"):
         fn_name = arg[:paren].strip()
-        inner_args_raw = arg[paren + 1:-1]
+        inner_args_raw = arg[paren + 1 : -1]
         inner_args = _parse_function_args(inner_args_raw)
         result = _call_function(fn_name, inner_args, context)
         if result is not None:
@@ -594,44 +694,7 @@ def _apply_parameter_expansion(var_value: str, operator: str, pattern: str) -> s
 
     Supported operators: #, ##, %, %%, /, //
     """
-    if operator == "##":
-        # Remove longest prefix match (using fnmatch glob)
-        # Try progressively longer prefixes
-        best = 0
-        for i in range(len(var_value) + 1):
-            if fnmatch.fnmatch(var_value[:i], pattern):
-                best = i
-        return var_value[best:]
-    elif operator == "#":
-        # Remove shortest prefix match
-        for i in range(len(var_value) + 1):
-            if fnmatch.fnmatch(var_value[:i], pattern):
-                return var_value[i:]
-        return var_value
-    elif operator == "%%":
-        # Remove longest suffix match
-        best = len(var_value)
-        for i in range(len(var_value), -1, -1):
-            if fnmatch.fnmatch(var_value[i:], pattern):
-                best = i
-        return var_value[:best]
-    elif operator == "%":
-        # Remove shortest suffix match
-        for i in range(len(var_value), -1, -1):
-            if fnmatch.fnmatch(var_value[i:], pattern):
-                return var_value[:i]
-        return var_value
-    elif operator == "//":
-        # Replace all occurrences
-        return var_value.replace(pattern.split("/")[0], pattern.split("/")[1] if "/" in pattern else "")
-    elif operator == "/":
-        # Replace first occurrence
-        parts = pattern.split("/", 1)
-        old = parts[0]
-        new = parts[1] if len(parts) > 1 else ""
-        return var_value.replace(old, new, 1)
-
-    return var_value
+    return apply_parameter_expansion(var_value, operator, pattern)
 
 
 def evaluate_condition(expr: str, context: dict[str, str]) -> bool:
@@ -663,7 +726,11 @@ def evaluate_condition(expr: str, context: dict[str, str]) -> bool:
         cmd = expr[1:-1]
         try:
             proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30,
+                ["/bin/sh", "-c", cmd],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             return proc.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
@@ -674,7 +741,7 @@ def evaluate_condition(expr: str, context: dict[str, str]) -> bool:
         idx = expr.find(op)
         if idx > 0:
             lhs = expr[:idx].strip()
-            rhs = expr[idx + len(op):].strip()
+            rhs = expr[idx + len(op) :].strip()
             lhs_val = _resolve_value(lhs, context)
             rhs_val = _resolve_value(rhs, context)
             if op == "==":
@@ -687,6 +754,14 @@ def evaluate_condition(expr: str, context: dict[str, str]) -> bool:
     # Bare variable: truthy check
     val = _resolve_value(expr, context)
     return val not in ("", "false", "0")
+
+
+def condition_uses_shell(expr: str) -> bool:
+    """Return whether evaluating a condition can invoke a shell command."""
+    normalized = expr.strip()
+    while normalized.startswith("!"):
+        normalized = normalized[1:].strip()
+    return normalized.startswith("`") and normalized.endswith("`")
 
 
 def _evaluate_expression(expr: str, variables: dict[str, str]) -> str:
@@ -715,8 +790,9 @@ def _resolve_value(token: str, variables: dict[str, str]) -> str:
     """Resolve a single value: quoted string, variable, or built-in function call."""
     token = token.strip()
     # Quoted string
-    if (token.startswith('"') and token.endswith('"')) or \
-       (token.startswith("'") and token.endswith("'")):
+    if (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
         return token[1:-1]
     # Variable lookup (including built-in function calls like os())
     if token in variables:
@@ -726,7 +802,7 @@ def _resolve_value(token: str, variables: dict[str, str]) -> str:
 
 def _eval_concat(expr: str, variables: dict[str, str]) -> str:
     """Evaluate string concatenation: "a" + b + "c"."""
-    parts = expr.split("+")
+    parts = split_unquoted(expr, "+")
     return "".join(_resolve_value(p, variables) for p in parts)
 
 
@@ -795,7 +871,7 @@ def _eval_if_else(expr: str, variables: dict[str, str]) -> str:
         return ""
 
     lhs = rest[:op_pos].strip()
-    after_op = rest[op_pos + len(op):].strip()
+    after_op = rest[op_pos + len(op) :].strip()
 
     # Parse: "val" { "then_branch" } else { "else_branch" }
     # Find the first { ... }
@@ -819,17 +895,17 @@ def _eval_if_else(expr: str, variables: dict[str, str]) -> str:
     if first_close == -1:
         return ""
 
-    then_body = after_op[first_brace + 1:first_close].strip()
+    then_body = after_op[first_brace + 1 : first_close].strip()
 
     # Find else { ... }
-    else_part = after_op[first_close + 1:].strip()
+    else_part = after_op[first_close + 1 :].strip()
     else_body = ""
     if else_part.startswith("else"):
         else_rest = else_part[4:].strip()
         eb_start = else_rest.find("{")
         eb_end = else_rest.rfind("}")
         if eb_start != -1 and eb_end > eb_start:
-            else_body = else_rest[eb_start + 1:eb_end].strip()
+            else_body = else_rest[eb_start + 1 : eb_end].strip()
 
     lhs_val = _resolve_value(lhs, variables)
     rhs_val = _resolve_value(rhs, variables)
@@ -852,6 +928,7 @@ class Promptfile:
     """The parsed representation of an entire Promptfile."""
 
     variables: dict[str, str] = field(default_factory=dict)
+    included_variables: set[str] = field(default_factory=set, repr=False)
     exported_vars: set[str] = field(default_factory=set)  # vars with 'export' prefix
     tasks: dict[str, Task] = field(default_factory=dict)
     functions: dict[str, Function] = field(default_factory=dict)
@@ -913,13 +990,19 @@ class Promptfile:
     # Resolution helpers
     # ------------------------------------------------------------------
 
-    def _expand_uses(self, text: str) -> str:
+    def _expand_uses(self, text: str, task_name: str | None = None) -> str:
         """Replace ``@use fn_name`` lines with the function body."""
         lines: list[str] = []
         for line in text.split("\n"):
             stripped = line.strip()
             if stripped.startswith("@use "):
                 fn_name = stripped[5:].strip()
+                if (
+                    fn_name not in self.functions
+                    and task_name
+                    and self.tasks[task_name].function_namespace
+                ):
+                    fn_name = f"{self.tasks[task_name].function_namespace}::{fn_name}"
                 if fn_name not in self.functions:
                     raise KeyError(f"unknown function: {fn_name!r}")
                 lines.append(self.functions[fn_name].body)
@@ -930,20 +1013,13 @@ class Promptfile:
     @staticmethod
     def _resolve_env_vars(text: str) -> str:
         """Resolve ``${VAR:-default}`` and ``${VAR}`` from the environment."""
-        def _with_default(m: re.Match) -> str:
-            return os.environ.get(m.group(1), m.group(2))
-
-        text = re.sub(r"\$\{(\w+):-([^}]*)\}", _with_default, text)
-
-        def _braced(m: re.Match) -> str:
-            return os.environ.get(m.group(1), "")
-
-        text = re.sub(r"\$\{(\w+)\}", _braced, text)
-        return text
+        return resolve_env_vars(text)
 
     def _secret_backend_for_task(self, task: Task) -> str:
         """Return the secrets backend for a task."""
-        return task.options.secrets or self.settings.secrets or "env"
+        from .secrets import secret_backend_for_task
+
+        return secret_backend_for_task(self.settings, task)
 
     def _resolve_secret(
         self,
@@ -953,68 +1029,18 @@ class Promptfile:
         promptfile_path: str | None = None,
     ) -> str:
         """Resolve a single ``{{#secret:...}}`` reference."""
-        backend = self._secret_backend_for_task(task)
-        ref = secret_ref.strip()
+        return resolve_secret(
+            self.settings,
+            secret_ref,
+            task,
+            promptfile_path=promptfile_path,
+        )
 
-        if backend == "env":
-            value = os.environ.get(ref)
-            if value is None and "/" in ref:
-                value = os.environ.get(ref.replace("/", "_"))
-            if value is None:
-                raise SecretError(f"secret not found in environment: {ref!r}")
-            return value
+    def _audit_secret_resolution(self, secret_ref: str, task: Task) -> None:
+        """Log secret resolution metadata without exposing the resolved value."""
+        from .secrets import audit_secret_resolution
 
-        if backend == "infisical":
-            cmd = ["infisical", "secrets", "get", ref, "--plain"]
-            if self.settings.secrets_project:
-                cmd.append(f"--projectId={self.settings.secrets_project}")
-            if self.settings.secrets_environment:
-                cmd.append(f"--env={self.settings.secrets_environment}")
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            except FileNotFoundError:
-                raise SecretError("secret backend tool not found: infisical")
-            except subprocess.CalledProcessError as e:
-                msg = (e.stderr or e.stdout or "").strip()
-                raise SecretError(f"infisical failed to resolve {ref!r}: {msg or e}") from e
-            return proc.stdout.strip()
-
-        if backend == "1password":
-            vault = self.settings.secrets_vault
-            if "/" in ref:
-                op_path = ref
-            elif vault:
-                op_path = f"{vault}/{ref}"
-            else:
-                raise SecretError("1password secrets require set secrets-vault or a full op:// path")
-            cmd = ["op", "read", f"op://{op_path}"]
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            except FileNotFoundError:
-                raise SecretError("secret backend tool not found: op")
-            except subprocess.CalledProcessError as e:
-                msg = (e.stderr or e.stdout or "").strip()
-                raise SecretError(f"1password failed to resolve {ref!r}: {msg or e}") from e
-            return proc.stdout.strip()
-
-        if backend == "sops":
-            secrets_file = self.settings.secrets_file
-            if not secrets_file:
-                raise SecretError("sops secrets require set secrets-file")
-            base_dir = os.path.dirname(os.path.abspath(promptfile_path)) if promptfile_path else os.getcwd()
-            resolved_file = os.path.normpath(os.path.join(base_dir, secrets_file))
-            extract = "".join(f'["{part}"]' for part in ref.split("/"))
-            cmd = ["sops", "decrypt", "--extract", extract, resolved_file]
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            except FileNotFoundError:
-                raise SecretError("secret backend tool not found: sops")
-            except subprocess.CalledProcessError as e:
-                msg = (e.stderr or e.stdout or "").strip()
-                raise SecretError(f"sops failed to resolve {ref!r}: {msg or e}") from e
-            return proc.stdout.strip()
-
-        raise SecretError(f"unknown secrets backend: {backend!r}")
+        audit_secret_resolution(self.settings, secret_ref, task)
 
     def _resolve_secrets(
         self,
@@ -1026,16 +1052,112 @@ class Promptfile:
         secret_callback: Callable[[str], None] | None = None,
     ) -> str:
         """Resolve ``{{#secret:NAME}}`` placeholders in text."""
-        def _replace(m: re.Match) -> str:
-            secret_ref = m.group(1).strip()
-            if mask_only:
-                return "***"
-            value = self._resolve_secret(secret_ref, task, promptfile_path=promptfile_path)
-            if secret_callback:
-                secret_callback(value)
-            return value
+        return resolve_secrets(
+            text,
+            self.settings,
+            task,
+            promptfile_path=promptfile_path,
+            mask_only=mask_only,
+            secret_callback=secret_callback,
+        )
 
-        return re.sub(r"\{\{#secret:(.+?)\}\}", _replace, text)
+    def task_secret_sources(
+        self,
+        task_name: str,
+        args: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Return task text after non-secret expansion, without resolving secrets."""
+        task = self.tasks[task_name]
+        context = self._build_context(task_name, args)
+        sources: list[str] = []
+        for step in task.steps:
+            content = step.content
+            sources.append(content)
+            if step.kind == "prompt":
+                content = self._expand_uses(content, task_name)
+                sources.append(content)
+                content = self._interpolate(content, context)
+                sources.append(content)
+                content = self._resolve_env_vars(content)
+            else:
+                content = self._interpolate(content, context)
+            sources.append(content)
+        for raw_value in task.options.env.values():
+            sources.append(raw_value)
+            value = self._interpolate(raw_value, context)
+            sources.append(self._resolve_env_vars(value))
+        agent = self.get_agent_for_task(task_name)
+        if agent:
+            sources.append(agent.instructions)
+        if task.guidance:
+            sources.append(task.guidance)
+        if self.guidance:
+            sources.append(self.guidance)
+        return sources
+
+    def task_secret_references(
+        self,
+        task_name: str,
+        args: dict[str, str] | None = None,
+    ) -> set[str]:
+        """Return explicit or secret-like environment references reachable by a task."""
+        refs: set[str] = set()
+        sources = self.task_secret_sources(task_name, args)
+        for source in sources:
+            refs.update(
+                match.strip()
+                for match in re.findall(r"\{\{#secret:(.+?)\}\}", source)
+                if match.strip()
+            )
+            for expression in re.findall(r"\{\{(?!#secret:)(.+?)\}\}", source):
+                refs.update(
+                    identifier
+                    for identifier in re.findall(
+                        r"[A-Za-z_][A-Za-z0-9_]*",
+                        expression,
+                    )
+                    if is_secret_name(identifier)
+                )
+            env_names = re.findall(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}"
+                r"|(?<!\$)\$([A-Za-z_][A-Za-z0-9_]*)"
+                r"|env_var\(\s*[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']",
+                source,
+            )
+            refs.update(name for groups in env_names for name in groups if name)
+
+        task = self.tasks[task_name]
+        refs.update(name for name in task.options.env if is_secret_name(name))
+        effective_args = dict(args or {})
+        for argument in task.arguments:
+            if argument.name not in effective_args and argument.default is not None:
+                effective_args[argument.name] = argument.default
+        refs.update(name for name in effective_args if is_secret_name(name))
+
+        known_values = {
+            value
+            for name, value in {
+                **dict(os.environ),
+                **self.variables,
+                **task.local_variables,
+                **effective_args,
+            }.items()
+            if is_secret_name(name) and value
+        }
+        if known_values:
+            for source in sources:
+                if any(value in source for value in known_values):
+                    refs.add("interpolated-secret-value")
+                    break
+        return refs
+
+    def task_references_secret(
+        self,
+        task_name: str,
+        args: dict[str, str] | None = None,
+    ) -> bool:
+        """Return whether resolving a task can reach a secret placeholder."""
+        return bool(self.task_secret_references(task_name, args))
 
     def _build_context(
         self,
@@ -1049,11 +1171,13 @@ class Promptfile:
         context = _builtin_functions()
         # Layer on user variables
         context.update(self.variables)
+        task = self.tasks[task_name]
+        # Module-scoped variables override the importing Promptfile's globals.
+        context.update(task.local_variables)
         # Layer on task args
         if args:
             context.update(args)
         # Fill in defaults for missing args
-        task = self.tasks[task_name]
         if task.arguments:
             for arg in task.arguments:
                 if arg.name not in context and arg.default is not None:
@@ -1079,42 +1203,14 @@ class Promptfile:
         - String concatenation: {{"a" + "b"}}
         - Bash-style parameter expansion: {{name##pattern}}, {{name/old/new}}
         """
-        def _replace_match(m: re.Match) -> str:
-            inner = m.group(1).strip()
-
-            # Simple variable lookup first
-            if inner in context:
-                return context[inner]
-
-            # Function call: name(arg1, arg2, ...)
-            paren_pos = inner.find("(")
-            if paren_pos != -1 and inner.endswith(")"):
-                fn_name = inner[:paren_pos].strip()
-                # Only treat as function call if fn_name is a known function
-                # (built-in zero-arg functions like os() are in context as "os()")
-                if fn_name in _STRING_FUNCTIONS:
-                    args_raw = inner[paren_pos + 1:-1]
-                    args = _parse_function_args(args_raw)
-                    try:
-                        result = _call_function(fn_name, args, context)
-                        if result is not None:
-                            return result
-                    except (ValueError, TypeError):
-                        return m.group(0)
-
-            # Bash-style parameter expansion: var##pattern, var#pattern,
-            # var%%pattern, var%pattern, var//old/new, var/old/new
-            expansion_result = self._try_parameter_expansion(inner, context)
-            if expansion_result is not None:
-                return expansion_result
-
-            # Try expression evaluation (if/else, concat, zero-arg builtins)
-            if inner.startswith("if ") or "+" in inner or inner.endswith("()"):
-                return _evaluate_expression(inner, context)
-
-            return m.group(0)  # leave unchanged
-
-        return re.sub(r"\{\{(.+?)\}\}", _replace_match, text)
+        return interpolate_text(
+            text,
+            context,
+            string_functions=_STRING_FUNCTIONS,
+            parse_function_args=_parse_function_args,
+            call_function=_call_function,
+            evaluate_expression=_evaluate_expression,
+        )
 
     @staticmethod
     def _try_parameter_expansion(expr: str, context: dict[str, str]) -> str | None:
@@ -1123,34 +1219,7 @@ class Promptfile:
         Returns None if no expansion pattern is matched.
         Supports: ##, #, %%, %, //, /
         """
-        # Try ## and # (prefix removal) - check ## first (longer operator)
-        for op in ("##", "#"):
-            idx = expr.find(op)
-            if idx > 0:
-                var_name = expr[:idx].strip()
-                pattern = expr[idx + len(op):]
-                if var_name in context:
-                    return _apply_parameter_expansion(context[var_name], op, pattern)
-
-        # Try %% and % (suffix removal) - check %% first
-        for op in ("%%", "%"):
-            idx = expr.find(op)
-            if idx > 0:
-                var_name = expr[:idx].strip()
-                pattern = expr[idx + len(op):]
-                if var_name in context:
-                    return _apply_parameter_expansion(context[var_name], op, pattern)
-
-        # Try // and / (replacement) - check // first
-        for op in ("//", "/"):
-            idx = expr.find(op)
-            if idx > 0:
-                var_name = expr[:idx].strip()
-                pattern = expr[idx + len(op):]
-                if var_name in context:
-                    return _apply_parameter_expansion(context[var_name], op, pattern)
-
-        return None
+        return try_parameter_expansion(expr, context)
 
     def resolve_prompt(
         self,
@@ -1165,7 +1234,15 @@ class Promptfile:
         task = self.tasks[task_name]
         prompt = task.prompt
 
-        prompt = self._expand_uses(prompt)
+        if not self.settings.allow_secrets_in_prompts and self.task_references_secret(
+            task_name, args
+        ):
+            raise SecretError(
+                f"task {task_name!r} references a secret in an LLM prompt "
+                "or other sensitive input; "
+                "enable it with set allow-secrets-in-prompts true"
+            )
+        prompt = self._expand_uses(prompt, task_name)
         context = self._build_context(task_name, args, promptfile_path=promptfile_path)
         prompt = self._interpolate(prompt, context)
         prompt = self._resolve_env_vars(prompt)
@@ -1193,18 +1270,30 @@ class Promptfile:
         context = self._build_context(task_name, args, promptfile_path=promptfile_path)
         agent = self.get_agent_for_task(task_name)
 
+        if (
+            not self.settings.allow_secrets_in_prompts
+            and any(step.kind == "prompt" for step in task.steps)
+            and self.task_references_secret(task_name, args)
+        ):
+            raise SecretError(
+                f"task {task_name!r} references a secret in an LLM prompt "
+                "or other sensitive input; "
+                "enable it with set allow-secrets-in-prompts true"
+            )
         resolved: list[TaskStep] = []
         for step in task.steps:
             content = step.content
 
             if step.kind == "prompt":
-                content = self._expand_uses(content)
+                content = self._expand_uses(content, task_name)
                 content = self._interpolate(content, context)
                 content = self._resolve_env_vars(content)
                 # Prepend agent instructions and guidance to every prompt step
-                # Order: guidance -> agent instructions -> task content
+                # Order: global guidance -> module guidance -> agent -> task.
                 if agent:
                     content = agent.instructions + "\n\n" + content
+                if task.guidance:
+                    content = task.guidance + "\n\n" + content
                 if self.guidance:
                     content = self.guidance + "\n\n" + content
             else:
@@ -1217,14 +1306,17 @@ class Promptfile:
                 secret_callback=secret_callback,
             )
 
-            resolved.append(TaskStep(
-                kind=step.kind,
-                content=content,
-                silent=step.silent,
-                ignore_error=step.ignore_error,
-                quiet=step.quiet,
-                capture=step.capture,
-                pipe_output=step.pipe_output,
-            ))
+            resolved.append(
+                TaskStep(
+                    kind=step.kind,
+                    content=content,
+                    silent=step.silent,
+                    ignore_error=step.ignore_error,
+                    quiet=step.quiet,
+                    capture=step.capture,
+                    pipe_output=step.pipe_output,
+                    script=step.script,
+                )
+            )
 
         return resolved

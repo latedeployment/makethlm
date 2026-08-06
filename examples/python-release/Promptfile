@@ -1,0 +1,19 @@
+# Python package release workflow
+
+version := `python -c "import makethlm; print(makethlm.__version__)"`
+
+task check:
+    !uv run ruff check .
+    !uv run pytest tests/ -q --no-docker
+
+task build: check:
+    !uv build --wheel
+
+task validate: build:
+    !./publish.sh --validate --skip-tests
+
+task changelog:
+    review CHANGELOG.md for missing release notes for version {{version}}
+
+task release: validate changelog [confirm("Tag and publish release?")]:
+    !scripts/release.py patch --publish

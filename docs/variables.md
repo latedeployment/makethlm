@@ -131,6 +131,8 @@ String manipulation functions can be used inside `{{ }}` templates on variables.
 | `replace_regex(s, pat, to)` | `{{replace_regex(ver, "\\d+$", "0")}}` | `1.2.0` |
 | `quote(s)` | `{{quote(cmd)}}` | `'hello world'` |
 | `join(sep, a, b, ...)` | `{{join(", ", "a", "b")}}` | `a, b` |
+| `env_var(name[, default])` | `{{env_var("HOME")}}` | `/home/user` |
+| `path_exists(p)` | `{{path_exists("README.md")}}` | `true` |
 | `len(s)` | `{{len(name)}}` | `5` |
 | `substr(s, start[, len])` | `{{substr(name, 0, 3)}}` | `hel` |
 | `match(s, regex)` | `{{match(ver, "^\\d+")}}` | `true` |
@@ -141,7 +143,7 @@ String manipulation functions can be used inside `{{ }}` templates on variables.
 |----------|---------|--------|
 | `file_name(p)` | `{{file_name("/tmp/a.txt")}}` | `a.txt` |
 | `file_stem(p)` | `{{file_stem("/tmp/a.txt")}}` | `a` |
-| `extension(p)` | `{{extension("a.tar.gz")}}` | `.gz` |
+| `extension(p)` | `{{extension("a.tar.gz")}}` | `gz` |
 | `without_extension(p)` | `{{without_extension("a.tar.gz")}}` | `a.tar` |
 | `parent_directory(p)` | `{{parent_directory("/tmp/a.txt")}}` | `/tmp` |
 

@@ -1,0 +1,19 @@
+# GitLab CI workflow helpers
+
+pipeline_ref := "main"
+
+task lint:
+    !python -m compileall .
+    !uv run ruff check .
+
+task test: lint:
+    !uv run pytest -q |>
+    if tests failed, explain the root cause and name the failing test files
+
+task review-changes:
+    !git diff --name-only |>
+    review these changed files for risky deployment, secret, and test gaps
+
+task release-notes:
+    !git log --oneline -20 |>
+    draft concise release notes for {{pipeline_ref}}

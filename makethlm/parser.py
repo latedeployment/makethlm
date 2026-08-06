@@ -53,9 +53,15 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from copy import deepcopy
 
+from .interpolation import split_unquoted
 from .inventory import parse_ansible_inventory
 from .models import (
+    ARTIFACT_CONTRACT_TYPES,
+    MAX_FALLBACK_LLMS,
+    MAX_LLM_RETRIES,
+    MAX_LLM_TOKENS,
     Agent,
     DockerConfig,
     Function,
@@ -84,6 +90,7 @@ class ParseError(Exception):
 # Low-level helpers (no regex)
 # ---------------------------------------------------------------------------
 
+
 def _strip_trailing_colon(s: str) -> tuple[str, bool]:
     """If s ends with ':', return (s[:-1].rstrip(), True), else (s, False)."""
     stripped = s.rstrip()
@@ -106,14 +113,29 @@ def _extract_brackets(s: str) -> tuple[str, str | None]:
 
 
 _BOOLEAN_OPTIONS = {
-    "private", "confirm", "no-cd", "no_cd",
-    "no-exit-message", "no_exit_message",
-    "no-quiet", "no_quiet",
-    "positional-arguments", "positional_arguments",
-    "ssh-parallel", "ssh_parallel",
+    "private",
+    "confirm",
+    "no-cd",
+    "no_cd",
+    "no-exit-message",
+    "no_exit_message",
+    "no-quiet",
+    "no_quiet",
+    "positional-arguments",
+    "positional_arguments",
+    "ssh-parallel",
+    "ssh_parallel",
+    "sandbox-read-only",
+    "sandbox_read_only",
     "default",
+    "script",
+    "metadata",
+    "env",
     # OS-specific attributes (Justfile-compatible)
-    "linux", "macos", "windows", "unix",
+    "linux",
+    "macos",
+    "windows",
+    "unix",
 }
 
 
@@ -189,6 +211,17 @@ def _parse_kv_pairs(raw: str) -> dict[str, str]:
                 if len(args) != 2:
                     raise ParseError("env(...) expects a name and value")
                 result[f"env:{args[0]}"] = args[1]
+            elif attr_name == "extension" and attr_args is not None:
+                args = _split_function_args(attr_args)
+                if len(args) != 1:
+                    raise ParseError("extension(...) expects one value")
+                result["extension"] = args[0]
+            elif attr_name == "script" and attr_args is not None:
+                args = _split_function_args(attr_args)
+                if len(args) != 1:
+                    raise ParseError("script(...) expects one command")
+                result["script"] = "true"
+                result["script_command"] = args[0]
             elif pair in _BOOLEAN_OPTIONS:
                 result[pair] = "true"
             else:
@@ -215,6 +248,8 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
                 opts.max_tokens = int(value)
             except ValueError:
                 raise ParseError(f"max_tokens must be an integer, got {value!r}")
+            if not 1 <= opts.max_tokens <= MAX_LLM_TOKENS:
+                raise ParseError(f"max_tokens must be between 1 and {MAX_LLM_TOKENS}")
         elif key == "llm":
             opts.llm = value
         elif key == "agent":
@@ -252,7 +287,9 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.webhook = value
         elif key in ("webhook-on", "webhook_on"):
             if value not in ("always", "success", "failure"):
-                raise ParseError(f"webhook_on must be 'always', 'success', or 'failure', got {value!r}")
+                raise ParseError(
+                    f"webhook_on must be 'always', 'success', or 'failure', got {value!r}"
+                )
             opts.webhook_on = value
         elif key == "cache":
             opts.cache = value
@@ -270,6 +307,48 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.llm_timeout = value
         elif key == "rollback":
             opts.rollback = value
+        elif key in ("postmortem", "on-failure", "on_failure"):
+            opts.postmortem = value
+        elif key in ("fallback-llm", "fallback_llm"):
+            opts.fallback_llms = list(
+                dict.fromkeys(
+                    name.strip()
+                    for name in re.split(r"[| ]+", _strip_quotes(value))
+                    if name.strip()
+                )
+            )
+            if len(opts.fallback_llms) > MAX_FALLBACK_LLMS:
+                raise ParseError(f"fallback-llm accepts at most {MAX_FALLBACK_LLMS} providers")
+        elif key == "retries":
+            try:
+                opts.retries = int(value)
+            except ValueError:
+                raise ParseError(f"retries must be an integer, got {value!r}")
+            if not 0 <= opts.retries <= MAX_LLM_RETRIES:
+                raise ParseError(f"retries must be between 0 and {MAX_LLM_RETRIES}")
+        elif key == "requires":
+            opts.requires = [
+                contract.strip()
+                for contract in re.split(r"[| ]+", _strip_quotes(value))
+                if contract.strip()
+            ]
+            for contract in opts.requires:
+                reference, separator, suffix = contract.rpartition(":")
+                if separator and "." not in suffix:
+                    if suffix.lower() not in ARTIFACT_CONTRACT_TYPES:
+                        raise ParseError(f"unknown artifact contract type: {suffix!r}")
+                else:
+                    reference = contract
+                artifact, dot, field_name = reference.rpartition(".")
+                if not dot or not artifact or not field_name:
+                    raise ParseError(
+                        f"invalid artifact contract {contract!r}; expected artifact.field[:type]"
+                    )
+        elif key == "produces":
+            output_type = _strip_quotes(value).lower()
+            if output_type not in ARTIFACT_CONTRACT_TYPES:
+                raise ParseError(f"unknown produces type: {output_type!r}")
+            opts.produces = output_type
         elif key == "secrets":
             opts.secrets = value
         elif key in ("ssh-key", "ssh_key", "identity-file", "identity_file"):
@@ -284,16 +363,33 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.ssh_parallel = value.lower() in ("true", "yes", "1")
         elif key == "sandbox":
             if value not in ("docker", "systemd", "bwrap", "none"):
-                raise ParseError(f"sandbox must be 'docker', 'systemd', 'bwrap', or 'none', got {value!r}")
+                raise ParseError(
+                    f"sandbox must be 'docker', 'systemd', 'bwrap', or 'none', got {value!r}"
+                )
             opts.sandbox = value
         elif key in ("sandbox-image", "sandbox_image"):
             opts.sandbox_image = value
         elif key in ("sandbox-mount", "sandbox_mount"):
             opts.sandbox_mount = value
         elif key in ("sandbox-net", "sandbox_net"):
+            if value not in ("none", "host"):
+                raise ParseError(f"sandbox_net must be 'none' or 'host', got {value!r}")
             opts.sandbox_net = value
+        elif key in ("sandbox-read-only", "sandbox_read_only"):
+            opts.sandbox_read_only = value.lower() in ("true", "yes", "1")
         elif key == "default":
             opts.default = value.lower() in ("true", "yes", "1")
+        elif key == "script":
+            opts.script = value.lower() in ("true", "yes", "1")
+        elif key == "script_command":
+            opts.script = True
+            opts.script_command = _strip_quotes(value)
+        elif key == "metadata":
+            opts.metadata = value.lower() in ("true", "yes", "1")
+        elif key == "env":
+            opts.env_enabled = value.lower() in ("true", "yes", "1")
+        elif key == "extension":
+            opts.extension = _strip_quotes(value)
         elif key.startswith("env:"):
             env_name = key[4:].strip()
             if not env_name:
@@ -322,10 +418,20 @@ def _parse_docker_config(kvs: dict[str, str]) -> DockerConfig:
     return cfg
 
 
+def _split_dependencies(raw: str) -> tuple[list[str], list[str]]:
+    """Split normal and subsequent dependencies from ``a b && c d``."""
+    before, sep, after = raw.partition("&&")
+    dependencies = before.split() if before.strip() else []
+    subsequent = after.split() if sep and after.strip() else []
+    return dependencies, subsequent
+
+
 def _merge_promptfile(target: Promptfile, included: Promptfile) -> None:
     """Merge included Promptfile definitions into target without overriding local state."""
     for k, v in included.variables.items():
-        target.variables.setdefault(k, v)
+        if k not in target.variables:
+            target.variables[k] = v
+            target.included_variables.add(k)
     for k, v in included.functions.items():
         target.functions.setdefault(k, v)
     for name in included.task_order:
@@ -349,9 +455,88 @@ def _merge_promptfile(target: Promptfile, included: Promptfile) -> None:
         target.settings.default = included.settings.default
 
 
+def _merge_module(target: Promptfile, module_name: str, included: Promptfile) -> None:
+    """Merge an included Promptfile as an isolated task namespace."""
+    name_map = {name: f"{module_name}::{name}" for name in included.task_order}
+    function_map = {name: f"{module_name}::{name}" for name in included.functions}
+    provider_map = {name: f"{module_name}::{name}" for name in included.llm_providers}
+    host_map = {name: f"{module_name}::{name}" for name in included.host_groups}
+    agent_map = {name: f"{module_name}::{name}" for name in included.agents}
+
+    for old_name in included.task_order:
+        task = deepcopy(included.tasks[old_name])
+        new_name = name_map[old_name]
+        task.name = new_name
+        task.dependencies = [name_map.get(dep, dep) for dep in task.dependencies]
+        task.subsequent_dependencies = [
+            name_map.get(dep, dep) for dep in task.subsequent_dependencies
+        ]
+        if task.options.rollback:
+            task.options.rollback = name_map.get(
+                task.options.rollback,
+                task.options.rollback,
+            )
+        if task.options.postmortem:
+            task.options.postmortem = name_map.get(
+                task.options.postmortem,
+                task.options.postmortem,
+            )
+        if task.options.llm:
+            task.options.llm = provider_map.get(task.options.llm, task.options.llm)
+        elif included.default_llm:
+            task.options.llm = provider_map[included.default_llm]
+        task.options.fallback_llms = [
+            provider_map.get(provider, provider) for provider in task.options.fallback_llms
+        ]
+        if task.options.on:
+            task.options.on = host_map.get(task.options.on, task.options.on)
+        if task.options.agent:
+            task.options.agent = agent_map.get(
+                task.options.agent,
+                task.options.agent,
+            )
+        task.local_variables = {
+            **included.variables,
+            **task.local_variables,
+        }
+        task.function_namespace = (
+            f"{module_name}::{task.function_namespace}" if task.function_namespace else module_name
+        )
+        if included.guidance:
+            task.guidance = "\n\n".join(
+                value for value in (included.guidance, task.guidance) if value
+            )
+        target.tasks[new_name] = task
+        target.task_order.append(new_name)
+
+    for k, v in included.functions.items():
+        function = deepcopy(v)
+        function.name = function_map[k]
+        target.functions.setdefault(function_map[k], function)
+    for k, v in included.llm_providers.items():
+        target.llm_providers.setdefault(provider_map[k], deepcopy(v))
+    for k, v in included.host_groups.items():
+        group = deepcopy(v)
+        group.name = host_map[k]
+        target.host_groups.setdefault(host_map[k], group)
+    for k, v in included.agents.items():
+        agent = deepcopy(v)
+        agent.name = agent_map[k]
+        if agent.llm:
+            agent.llm = provider_map.get(agent.llm, agent.llm)
+        target.agents.setdefault(agent_map[k], agent)
+    for alias_name, alias_target in included.aliases.items():
+        target.aliases.setdefault(
+            f"{module_name}::{alias_name}",
+            name_map.get(alias_target, alias_target),
+        )
+
+
 def _parse_include_path(rest: str, lineno: int, directive: str) -> str:
-    if not ((rest.startswith('"') and rest.endswith('"')) or
-            (rest.startswith("'") and rest.endswith("'"))):
+    if not (
+        (rest.startswith('"') and rest.endswith('"'))
+        or (rest.startswith("'") and rest.endswith("'"))
+    ):
         raise ParseError(f"{directive} path must be quoted: {rest!r}", lineno)
     return rest[1:-1]
 
@@ -362,7 +547,7 @@ def _parse_arguments(raw: str) -> list[TaskArgument]:
     if not raw:
         return []
     args: list[TaskArgument] = []
-    for part in raw.split(","):
+    for part in _split_option_items(raw):
         part = part.strip()
         if not part:
             continue
@@ -374,16 +559,26 @@ def _parse_arguments(raw: str) -> list[TaskArgument]:
         if "=" in part:
             name, default = part.split("=", 1)
             name = name.strip()
-            default = default.strip().strip('"').strip("'")
+            default = _strip_quotes(default.strip())
             args.append(TaskArgument(name=name, default=default, variadic=variadic))
         else:
             args.append(TaskArgument(name=part.strip(), variadic=variadic))
+    seen: set[str] = set()
+    for index, arg in enumerate(args):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", arg.name):
+            raise ParseError(f"invalid task argument name: {arg.name!r}")
+        if arg.name in seen:
+            raise ParseError(f"duplicate task argument: {arg.name!r}")
+        if arg.variadic and index != len(args) - 1:
+            raise ParseError("variadic task argument must be last")
+        seen.add(arg.name)
     return args
 
 
 # ---------------------------------------------------------------------------
 # Body collection
 # ---------------------------------------------------------------------------
+
 
 def _is_blank(line: str) -> bool:
     return not line or line.isspace()
@@ -476,7 +671,11 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
             ignore_error = False
             quiet = False
             # Check for bare @ prefix (quiet — suppress echoing)
-            if rest.startswith("@") and not rest.startswith("@silent") and not rest.startswith("@ignore"):
+            if (
+                rest.startswith("@")
+                and not rest.startswith("@silent")
+                and not rest.startswith("@ignore")
+            ):
                 quiet = True
                 rest = rest[1:]
             while rest.startswith("@"):
@@ -492,15 +691,17 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
                     quiet = True
                 rest = rest[space_idx + 1 :].lstrip()
             rest, capture, pipe_output, pipe_prompt = _extract_step_routing(rest)
-            steps.append(TaskStep(
-                kind="shell",
-                content=rest,
-                silent=silent,
-                ignore_error=ignore_error,
-                quiet=quiet,
-                capture=capture,
-                pipe_output=pipe_output,
-            ))
+            steps.append(
+                TaskStep(
+                    kind="shell",
+                    content=rest,
+                    silent=silent,
+                    ignore_error=ignore_error,
+                    quiet=quiet,
+                    capture=capture,
+                    pipe_output=pipe_output,
+                )
+            )
             if pipe_prompt:
                 steps.append(TaskStep(kind="prompt", content=pipe_prompt))
         else:
@@ -512,6 +713,10 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
 
 def _parse_just_body_steps(raw_lines: list[str]) -> list[TaskStep]:
     """Parse a Just-style recipe body where plain lines are shell commands."""
+    nonblank = [raw.strip() for raw in raw_lines if raw.strip()]
+    if nonblank and nonblank[0].startswith("#!"):
+        return [TaskStep(kind="shell", content="\n".join(nonblank), script=True)]
+
     steps: list[TaskStep] = []
     for raw in raw_lines:
         stripped = raw.strip()
@@ -531,17 +736,22 @@ def _parse_just_body_steps(raw_lines: list[str]) -> list[TaskStep]:
 
         if stripped:
             stripped, capture, _pipe_output, _pipe_prompt = _extract_step_routing(stripped)
-            steps.append(TaskStep(
-                kind="shell",
-                content=stripped,
-                ignore_error=ignore_error,
-                quiet=quiet,
-                capture=capture,
-            ))
+            steps.append(
+                TaskStep(
+                    kind="shell",
+                    content=stripped,
+                    ignore_error=ignore_error,
+                    quiet=quiet,
+                    capture=capture,
+                )
+            )
     return steps
 
 
-def _parse_task_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument], list[str], TaskOptions]:
+def _parse_task_header(
+    rest: str,
+    lineno: int,
+) -> tuple[str, list[TaskArgument], list[str], list[str], TaskOptions]:
     """Parse a makethlm task header body into name, args, deps, and options."""
     rest, has_colon = _strip_trailing_colon(rest)
     if not has_colon:
@@ -564,7 +774,7 @@ def _parse_task_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument],
     arrow_idx = rest.find("->")
     if arrow_idx != -1:
         # Everything after -> and before the next : or [ is the artifact name
-        after_arrow = rest[arrow_idx + 2:]
+        after_arrow = rest[arrow_idx + 2 :]
         rest = rest[:arrow_idx]
         # The artifact name may be followed by : (deps) or [ (options)
         # Find the next meaningful delimiter
@@ -590,22 +800,26 @@ def _parse_task_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument],
     # What remains: "name" or "name: dep1 dep2"
     rest = rest.strip()
     deps: list[str] = []
+    subsequent_deps: list[str] = []
     if ":" in rest:
         colon_idx = rest.index(":")
         task_name = rest[:colon_idx].strip()
         dep_str = rest[colon_idx + 1 :].strip()
         if dep_str:
-            deps = dep_str.split()
+            deps, subsequent_deps = _split_dependencies(dep_str)
     else:
         task_name = rest.strip()
 
     if not task_name:
         raise ParseError("task declaration missing name", lineno)
 
-    return task_name, arguments, deps, options
+    return task_name, arguments, deps, subsequent_deps, options
 
 
-def _parse_just_recipe_header(rest: str, lineno: int) -> tuple[str, list[TaskArgument], list[str], TaskOptions] | None:
+def _parse_just_recipe_header(
+    rest: str,
+    lineno: int,
+) -> tuple[str, list[TaskArgument], list[str], list[str], TaskOptions] | None:
     """Parse a bare Just-style recipe header, if the line looks like one."""
     if ":" not in rest:
         return None
@@ -627,8 +841,21 @@ def _parse_just_recipe_header(rest: str, lineno: int) -> tuple[str, list[TaskArg
         return None
     task_name = parts[0]
     if task_name in {
-        "agent", "alias", "docker", "export", "fn", "guidance", "hosts",
-        "include", "inventory", "llm", "set", "task",
+        "agent",
+        "alias",
+        "docker",
+        "export",
+        "fn",
+        "guidance",
+        "hosts",
+        "include",
+        "import",
+        "import?",
+        "inventory",
+        "llm",
+        "mod",
+        "set",
+        "task",
     }:
         return None
 
@@ -636,8 +863,8 @@ def _parse_just_recipe_header(rest: str, lineno: int) -> tuple[str, list[TaskArg
     if len(parts) > 1:
         arguments = _parse_arguments(",".join(parts[1:]))
 
-    deps = dep_str.split() if dep_str else []
-    return task_name, arguments, deps, options
+    deps, subsequent_deps = _split_dependencies(dep_str)
+    return task_name, arguments, deps, subsequent_deps, options
 
 
 def _strip_quotes(val: str) -> str:
@@ -647,7 +874,9 @@ def _strip_quotes(val: str) -> str:
     return val
 
 
-def _resolve_set_value(raw: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True) -> str:
+def _resolve_set_value(
+    raw: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True
+) -> str:
     """Resolve a set-directive string value.
 
     Supports the same expressions as variable declarations (quoted strings,
@@ -657,11 +886,31 @@ def _resolve_set_value(raw: str, pf: Promptfile, lineno: int, *, allow_backticks
     try:
         return _parse_var_value(raw, pf, lineno, allow_backticks=allow_backticks)
     except ParseError:
-        # Bare unquoted value (e.g. ``set sandbox docker``) — use as-is
-        return raw.strip()
+        # Only plain tokens may fall back to literal values. Failed command
+        # substitutions and malformed expressions remain parse errors.
+        value = raw.strip()
+        if re.fullmatch(r"[A-Za-z0-9_./:~+-]+", value):
+            return value
+        raise
 
 
-def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True) -> None:
+def _parse_string_array(raw: str, lineno: int) -> list[str]:
+    """Parse a simple Just-style string array like ["bash", "-cu"]."""
+    value = raw.strip()
+    if value.startswith(":="):
+        value = value[2:].strip()
+    if not (value.startswith("[") and value.endswith("]")):
+        raise ParseError(f"expected string array, got {raw!r}", lineno)
+    items = _split_option_items(value[1:-1])
+    result = [_strip_quotes(item.strip()) for item in items if item.strip()]
+    if not result:
+        raise ParseError("shell array must not be empty", lineno)
+    return result
+
+
+def _parse_set_directive(
+    rest: str, pf: Promptfile, lineno: int, *, allow_backticks: bool = True
+) -> None:
     """Parse a 'set <directive> [value]' line."""
     # Map directive names to settings fields
     directives = {
@@ -687,6 +936,9 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
         "allow-duplicate-variables": "allow_duplicate_variables",
         "default": "default",
         "sandbox": "sandbox",
+        "secrets-audit": "secrets_audit",
+        "allow-secrets-in-prompts": "allow_secrets_in_prompts",
+        "secrets-allow-llm": "allow_secrets_in_prompts",
     }
 
     # Find which directive matches
@@ -695,7 +947,7 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
     for key, field_name in directives.items():
         if rest.startswith(key):
             # Make sure it's a complete word match
-            after = rest[len(key):]
+            after = rest[len(key) :]
             if not after or after[0] in (" ", "\t"):
                 matched_key = key
                 matched_field = field_name
@@ -704,16 +956,27 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
     if matched_key is None:
         raise ParseError(f"unknown set directive: {rest!r}", lineno)
 
-    raw_val = rest[len(matched_key):].strip()
+    raw_val = rest[len(matched_key) :].strip()
+    if matched_field == "shell" and raw_val.lstrip().startswith(":="):
+        pf.settings.shell_argv = _parse_string_array(raw_val, lineno)
+        pf.settings.shell = pf.settings.shell_argv[0]
+        return
+
     stripped_val = _strip_quotes(raw_val)
 
     _BOOL_VALUES = {"true", "false", "yes", "no", "0", "1"}
 
     # Pure boolean directives: bare ``set X`` means True, ``set X false`` means False
     bool_fields = {
-        "dotenv_required", "export",
-        "positional_arguments", "ignore_comments",
-        "quiet", "allow_duplicate_tasks", "allow_duplicate_variables",
+        "dotenv_required",
+        "export",
+        "positional_arguments",
+        "ignore_comments",
+        "quiet",
+        "allow_duplicate_tasks",
+        "allow_duplicate_variables",
+        "secrets_audit",
+        "allow_secrets_in_prompts",
     }
 
     # Optional-bool directives: boolean when bare or given true/false,
@@ -738,6 +1001,16 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
         # String directives: resolve variables, concatenation, backticks, etc.
         if raw_val:
             resolved = _resolve_set_value(raw_val, pf, lineno, allow_backticks=allow_backticks)
+            if matched_field == "sandbox" and resolved not in (
+                "docker",
+                "systemd",
+                "bwrap",
+                "none",
+            ):
+                raise ParseError(
+                    "sandbox must be 'docker', 'systemd', 'bwrap', or 'none'",
+                    lineno,
+                )
             setattr(pf.settings, matched_field, resolved)
         else:
             setattr(pf.settings, matched_field, None)
@@ -746,9 +1019,30 @@ def _parse_set_directive(rest: str, pf: Promptfile, lineno: int, *, allow_backti
             pf.settings.dotenv_load = True
 
 
+def _assign_variable(
+    pf: Promptfile,
+    name: str,
+    value: str,
+    lineno: int,
+    *,
+    exported: bool = False,
+) -> None:
+    """Validate and assign a Promptfile variable."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name):
+        raise ParseError(f"invalid variable name: {name!r}", lineno)
+    imported_value = name in pf.included_variables
+    if name in pf.variables and not imported_value and not pf.settings.allow_duplicate_variables:
+        raise ParseError(f"duplicate variable: {name!r}", lineno)
+    pf.variables[name] = value
+    pf.included_variables.discard(name)
+    if exported:
+        pf.exported_vars.add(name)
+
+
 # ---------------------------------------------------------------------------
 # Main parser — line scanner, no regex on hot path
 # ---------------------------------------------------------------------------
+
 
 def parse(
     source: str,
@@ -813,11 +1107,43 @@ def parse(
                     continue
                 raise ParseError(f"{include_directive} file not found: {include_path!r}", lineno)
             included_pf = parse(
-                include_source, resolved,
-                _included=_included, _base_dir=os.path.dirname(resolved),
+                include_source,
+                resolved,
+                _included=_included,
+                _base_dir=os.path.dirname(resolved),
                 allow_backticks=allow_backticks,
             )
             _merge_promptfile(pf, included_pf)
+            i += 1
+            continue
+
+        # ----- mod <name> ["path"] -----
+        if stripped.startswith("mod "):
+            rest = stripped[4:].strip()
+            parts = rest.split(None, 1)
+            module_name = parts[0] if parts else ""
+            if not module_name:
+                raise ParseError("mod declaration missing name", lineno)
+            if len(parts) > 1:
+                module_path = _parse_include_path(parts[1].strip(), lineno, "mod")
+            else:
+                module_path = f"{module_name}.pf"
+            resolved = os.path.normpath(os.path.join(_base_dir, module_path))
+            if resolved in _included:
+                raise ParseError(f"circular mod: {module_path!r}", lineno)
+            try:
+                with open(resolved) as f:
+                    module_source = f.read()
+            except FileNotFoundError:
+                raise ParseError(f"mod file not found: {module_path!r}", lineno)
+            module_pf = parse(
+                module_source,
+                resolved,
+                _included=_included,
+                _base_dir=os.path.dirname(resolved),
+                allow_backticks=allow_backticks,
+            )
+            _merge_module(pf, module_name, module_pf)
             i += 1
             continue
 
@@ -851,8 +1177,7 @@ def parse(
                 var_name = rest[:eq_idx].strip()
                 var_val_raw = rest[eq_idx + 2 :].strip()
                 var_val = _parse_var_value(var_val_raw, pf, lineno, allow_backticks=allow_backticks)
-                pf.variables[var_name] = var_val
-                pf.exported_vars.add(var_name)
+                _assign_variable(pf, var_name, var_val, lineno, exported=True)
                 i += 1
                 continue
             # Bare "export VAR" — mark existing var as exported
@@ -869,7 +1194,7 @@ def parse(
             var_name = stripped[:eq_idx].strip()
             var_val_raw = stripped[eq_idx + 2 :].strip()
             var_val = _parse_var_value(var_val_raw, pf, lineno, allow_backticks=allow_backticks)
-            pf.variables[var_name] = var_val
+            _assign_variable(pf, var_name, var_val, lineno)
             i += 1
             continue
 
@@ -883,7 +1208,7 @@ def parse(
             llm_opts = _parse_kv_pairs(bracket) if bracket else {}
             api_key = llm_opts.get("key")
             if api_key and api_key.startswith("$"):
-                api_key = os.environ.get(api_key[1:], api_key)
+                api_key = os.environ.get(api_key[1:])
             provider = LLMProvider(
                 name=llm_name,
                 model=llm_opts.get("model"),
@@ -909,8 +1234,10 @@ def parse(
                 raise ParseError("agent requires a name and a quoted path", lineno)
             agent_name = parts[0]
             agent_path_raw = parts[1].strip()
-            if not ((agent_path_raw.startswith('"') and agent_path_raw.endswith('"')) or
-                    (agent_path_raw.startswith("'") and agent_path_raw.endswith("'"))):
+            if not (
+                (agent_path_raw.startswith('"') and agent_path_raw.endswith('"'))
+                or (agent_path_raw.startswith("'") and agent_path_raw.endswith("'"))
+            ):
                 raise ParseError(f"agent path must be quoted: {agent_path_raw!r}", lineno)
             agent_path = agent_path_raw[1:-1]
             if agent_name in pf.agents:
@@ -942,8 +1269,10 @@ def parse(
             rest_g = stripped[8:].strip()
             # File reference: guidance "./rules.md"
             if rest_g and rest_g[0] in ('"', "'"):
-                if not ((rest_g.startswith('"') and rest_g.endswith('"')) or
-                        (rest_g.startswith("'") and rest_g.endswith("'"))):
+                if not (
+                    (rest_g.startswith('"') and rest_g.endswith('"'))
+                    or (rest_g.startswith("'") and rest_g.endswith("'"))
+                ):
                     raise ParseError(f"guidance path must be quoted: {rest_g!r}", lineno)
                 guidance_path = rest_g[1:-1]
                 resolved_g = os.path.normpath(os.path.join(_base_dir, guidance_path))
@@ -971,8 +1300,10 @@ def parse(
         # ----- inventory "<path>" -----
         if stripped.startswith("inventory "):
             rest = stripped[10:].strip()
-            if not ((rest.startswith('"') and rest.endswith('"')) or
-                    (rest.startswith("'") and rest.endswith("'"))):
+            if not (
+                (rest.startswith('"') and rest.endswith('"'))
+                or (rest.startswith("'") and rest.endswith("'"))
+            ):
                 raise ParseError(f"inventory path must be quoted: {rest!r}", lineno)
             inv_path = rest[1:-1]
             resolved_inv = os.path.normpath(os.path.join(_base_dir, inv_path))
@@ -1003,11 +1334,16 @@ def parse(
             host_kvs = _parse_kv_pairs(bracket) if bracket else {}
             for k in host_kvs:
                 if k not in (
-                    "user", "port",
-                    "identity-file", "identity_file",
-                    "ssh-key", "ssh_key",
-                    "strict-host-key-checking", "strict_host_key_checking",
-                    "ssh-strict-host-key-checking", "ssh_strict_host_key_checking",
+                    "user",
+                    "port",
+                    "identity-file",
+                    "identity_file",
+                    "ssh-key",
+                    "ssh_key",
+                    "strict-host-key-checking",
+                    "strict_host_key_checking",
+                    "ssh-strict-host-key-checking",
+                    "ssh_strict_host_key_checking",
                 ):
                     raise ParseError(f"unknown host option: {k!r}", lineno)
             if group_name in pf.host_groups:
@@ -1032,7 +1368,11 @@ def parse(
                 or host_kvs.get("ssh-strict-host-key-checking")
                 or host_kvs.get("ssh_strict_host_key_checking")
             )
-            if strict_host_key_checking and strict_host_key_checking not in ("yes", "no", "accept-new"):
+            if strict_host_key_checking and strict_host_key_checking not in (
+                "yes",
+                "no",
+                "accept-new",
+            ):
                 raise ParseError(
                     "strict_host_key_checking must be 'yes', 'no', or 'accept-new'",
                     lineno,
@@ -1084,7 +1424,9 @@ def parse(
             docker_name = rest.strip()
             if not docker_name:
                 raise ParseError("docker declaration missing name", lineno)
-            docker_cfg = _parse_docker_config(_parse_kv_pairs(bracket)) if bracket else DockerConfig()
+            docker_cfg = (
+                _parse_docker_config(_parse_kv_pairs(bracket)) if bracket else DockerConfig()
+            )
 
             if docker_name in pf.tasks:
                 raise ParseError(f"duplicate task/docker: {docker_name!r}", lineno)
@@ -1107,7 +1449,9 @@ def parse(
 
         # ----- task <name>[(args)] [: deps] [opts]: -----
         if stripped.startswith("task "):
-            task_name, arguments, deps, options = _parse_task_header(stripped[5:], lineno)
+            task_name, arguments, deps, subsequent_deps, options = _parse_task_header(
+                stripped[5:], lineno
+            )
 
             # Tasks starting with _ are implicitly private (Justfile convention)
             if task_name.startswith("_"):
@@ -1120,6 +1464,9 @@ def parse(
             i += 1
             body_lines, i = _collect_body(lines, i)
             steps = _parse_body_steps(body_lines)
+            if options.script:
+                script_text = "\n".join(line.strip() for line in body_lines if line.strip())
+                steps = [TaskStep(kind="shell", content=script_text, script=True)]
             if not steps:
                 raise ParseError(f"task {task_name!r} has no prompt body", lineno)
 
@@ -1127,6 +1474,7 @@ def parse(
                 name=task_name,
                 steps=steps,
                 dependencies=deps,
+                subsequent_dependencies=subsequent_deps,
                 options=options,
                 arguments=arguments,
                 line_number=lineno,
@@ -1136,14 +1484,16 @@ def parse(
                 pf.task_order.append(task_name)
             if options.default:
                 if pf.settings.default and pf.settings.default != task_name:
-                    raise ParseError(f"multiple default tasks: {pf.settings.default!r} and {task_name!r}", lineno)
+                    raise ParseError(
+                        f"multiple default tasks: {pf.settings.default!r} and {task_name!r}", lineno
+                    )
                 pf.settings.default = task_name
             continue
 
         # ----- Just-style recipe: name [args]: [deps] -----
         just_recipe = _parse_just_recipe_header(stripped, lineno)
         if just_recipe is not None:
-            task_name, arguments, deps, options = just_recipe
+            task_name, arguments, deps, subsequent_deps, options = just_recipe
 
             if task_name.startswith("_"):
                 options.private = True
@@ -1155,6 +1505,9 @@ def parse(
             i += 1
             body_lines, i = _collect_body(lines, i)
             steps = _parse_just_body_steps(body_lines)
+            if options.script:
+                script_text = "\n".join(line.strip() for line in body_lines if line.strip())
+                steps = [TaskStep(kind="shell", content=script_text, script=True)]
             if not steps:
                 raise ParseError(f"task {task_name!r} has no shell body", lineno)
 
@@ -1162,6 +1515,7 @@ def parse(
                 name=task_name,
                 steps=steps,
                 dependencies=deps,
+                subsequent_dependencies=subsequent_deps,
                 options=options,
                 arguments=arguments,
                 line_number=lineno,
@@ -1171,7 +1525,9 @@ def parse(
                 pf.task_order.append(task_name)
             if options.default:
                 if pf.settings.default and pf.settings.default != task_name:
-                    raise ParseError(f"multiple default tasks: {pf.settings.default!r} and {task_name!r}", lineno)
+                    raise ParseError(
+                        f"multiple default tasks: {pf.settings.default!r} and {task_name!r}", lineno
+                    )
                 pf.settings.default = task_name
             continue
 
@@ -1179,7 +1535,7 @@ def parse(
 
     # --- Validation ---
     for task in pf.tasks.values():
-        for dep in task.dependencies:
+        for dep in task.dependencies + task.subsequent_dependencies:
             if dep not in pf.tasks:
                 raise ParseError(
                     f"task {task.name!r} depends on unknown task {dep!r}",
@@ -1192,7 +1548,12 @@ def parse(
                     text_line = text_line.strip()
                     if text_line.startswith("@use "):
                         fn_name = text_line[5:].strip()
-                        if fn_name not in pf.functions:
+                        namespaced_fn = (
+                            f"{task.function_namespace}::{fn_name}"
+                            if task.function_namespace
+                            else None
+                        )
+                        if fn_name not in pf.functions and namespaced_fn not in pf.functions:
                             raise ParseError(
                                 f"task {task.name!r} references unknown function {fn_name!r}",
                                 task.line_number,
@@ -1215,6 +1576,17 @@ def parse(
                 f"task {task.name!r} rollback targets unknown task {task.options.rollback!r}",
                 task.line_number,
             )
+        if task.options.postmortem and task.options.postmortem not in pf.tasks:
+            raise ParseError(
+                f"task {task.name!r} postmortem targets unknown task {task.options.postmortem!r}",
+                task.line_number,
+            )
+        for provider in task.options.fallback_llms:
+            if provider not in pf.llm_providers:
+                raise ParseError(
+                    f"task {task.name!r} references unknown fallback LLM provider {provider!r}",
+                    task.line_number,
+                )
 
     # Validate alias targets
     for alias_name, alias_target in pf.aliases.items():
@@ -1225,12 +1597,14 @@ def parse(
     if pf.settings.default and pf.settings.default not in pf.tasks:
         raise ParseError(f"set default references unknown task {pf.settings.default!r}")
 
+    _included.discard(abs_filename)
     return pf
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _join_continuations(source: str) -> str:
     """Join lines ending with \\ (line continuation, like Makefile/Justfile)."""
@@ -1261,40 +1635,27 @@ def _parse_var_value(raw: str, pf: Promptfile, lineno: int, *, allow_backticks: 
     if raw.startswith("v`") and raw.endswith("`"):
         if not allow_backticks:
             raise ParseError("backtick command substitution is disabled in safe mode", lineno)
-        cmd = raw[2:-1]
-        try:
-            proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30,
-            )
-            return proc.stdout.strip()
-        except (subprocess.TimeoutExpired, OSError) as e:
-            raise ParseError(f"backtick command failed: {e}", lineno)
+        return _run_backtick(raw[2:-1], lineno)
 
     # Backtick command substitution
     if raw.startswith("`") and raw.endswith("`"):
         if not allow_backticks:
             raise ParseError("backtick command substitution is disabled in safe mode", lineno)
-        cmd = raw[1:-1]
-        try:
-            proc = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30,
-            )
-            return proc.stdout.strip()
-        except (subprocess.TimeoutExpired, OSError) as e:
-            raise ParseError(f"backtick command failed: {e}", lineno)
+        return _run_backtick(raw[1:-1], lineno)
 
     # if/else expression (check before concat to avoid splitting on + inside quotes)
     if raw.startswith("if "):
         return _evaluate_expression(raw, pf.variables)
 
     # String concatenation with +
-    if "+" in raw:
-        parts = raw.split("+")
+    parts = split_unquoted(raw, "+")
+    if len(parts) > 1:
         result_parts: list[str] = []
         for part in parts:
             part = part.strip()
-            if (part.startswith('"') and part.endswith('"')) or \
-               (part.startswith("'") and part.endswith("'")):
+            if (part.startswith('"') and part.endswith('"')) or (
+                part.startswith("'") and part.endswith("'")
+            ):
                 result_parts.append(part[1:-1])
             elif part in pf.variables:
                 result_parts.append(pf.variables[part])
@@ -1302,13 +1663,31 @@ def _parse_var_value(raw: str, pf: Promptfile, lineno: int, *, allow_backticks: 
                 result_parts.append(part)
         return "".join(result_parts)
 
-    # Quoted string
+    # Quoted literals may contain a plus sign without becoming concatenations.
     if raw.startswith('"') and raw.endswith('"'):
         val = raw[1:-1]
         return val.replace('\\"', '"').replace("\\\\", "\\")
-
-    # Single-quoted string
     if raw.startswith("'") and raw.endswith("'"):
         return raw[1:-1]
 
     raise ParseError(f"variable value must be quoted, backtick, or expression: {raw!r}", lineno)
+
+
+def _run_backtick(command: str, lineno: int) -> str:
+    """Execute an explicit Promptfile command substitution."""
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-c", command],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ParseError(f"backtick command failed: {e}", lineno)
+    if proc.returncode != 0:
+        raise ParseError(
+            f"backtick command exited with status {proc.returncode}",
+            lineno,
+        )
+    return proc.stdout.strip()

@@ -5,18 +5,20 @@ import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from makethlm.dispatcher import DryRunDispatcher
+from makethlm.dispatcher import Dispatcher, DispatchResult, DryRunDispatcher
 from makethlm.models import TaskStep
 from makethlm.parser import parse
-from makethlm.runner import CycleError, Runner, StepResult, topological_sort
+from makethlm.runner import CycleError, Runner, StepResult, TaskResult, topological_sort
 
 # ---------------------------------------------------------------------------
 # Topological sort
 # ---------------------------------------------------------------------------
+
 
 class TestTopologicalSort:
     def test_no_deps(self):
@@ -100,10 +102,55 @@ task c: a:
         assert "b" not in order
         assert order == ["a", "c"]
 
+    def test_subsequent_dependencies_run_after_task(self):
+        pf = parse("""\
+main: setup && cleanup
+    echo main
+
+setup:
+    echo setup
+
+cleanup:
+    echo cleanup
+""")
+        assert topological_sort(pf, "main") == ["setup", "main", "cleanup"]
+
+
+# ---------------------------------------------------------------------------
+# Runner — Just script recipes
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerScriptRecipes:
+    def test_bare_script_attribute_runs_with_shell(self):
+        pf = parse("""\
+task script [script]:
+    echo script-ran
+""")
+        runner = Runner(pf, DryRunDispatcher())
+
+        result = runner.run("script")
+
+        assert result.success
+        assert "script-ran" in result.task_results[0].step_results[0].response
+
+    def test_script_command_attribute_runs_interpreter(self):
+        pf = parse("""\
+task script [script("python3"), extension("py")]:
+    print("script-ran")
+""")
+        runner = Runner(pf, DryRunDispatcher())
+
+        result = runner.run("script")
+
+        assert result.success
+        assert "script-ran" in result.task_results[0].step_results[0].response
+
 
 # ---------------------------------------------------------------------------
 # Runner — basic
 # ---------------------------------------------------------------------------
+
 
 class TestRunner:
     def test_run_single_task(self):
@@ -250,6 +297,7 @@ task b: a:
 # Runner — shell steps
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerShellSteps:
     def test_shell_step_executes(self):
         pf = parse("""\
@@ -366,6 +414,7 @@ task build:
 # Runner — task arguments
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerArgs:
     def test_args_passed_to_prompt(self):
         pf = parse("""\
@@ -437,6 +486,7 @@ task deploy(target): setup:
 # Runner — functions (@use)
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerFunctions:
     def test_use_expands_in_prompt(self):
         pf = parse("""\
@@ -460,6 +510,7 @@ task review:
 # ---------------------------------------------------------------------------
 # Runner — docker tasks
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerDocker:
     def test_docker_sends_generate_prompt(self):
@@ -512,7 +563,9 @@ task deploy: myapp:
         dispatcher = DryRunDispatcher()
         runner = Runner(pf, dispatcher)
 
-        mock_result = subprocess.CompletedProcess(args="docker build", returncode=0, stdout="built\n", stderr="")
+        mock_result = subprocess.CompletedProcess(
+            args="docker build", returncode=0, stdout="built\n", stderr=""
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             assert pf.tasks["myapp"].docker is not None
             pf.tasks["myapp"].docker.context = tmpdir
@@ -523,10 +576,47 @@ task deploy: myapp:
         assert names[0] == "myapp"
         assert names[1] == "deploy"
 
+    def test_docker_build_uses_argv_not_shell(self):
+        pf = parse("""\
+docker myapp:
+    Python 3.11 slim image.
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="built\n", stderr=""
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert pf.tasks["myapp"].docker is not None
+            pf.tasks["myapp"].docker.context = tmpdir
+            with patch("makethlm.runner._run_subprocess", return_value=mock_result) as mock_run:
+                result = runner.run("myapp")
+
+        assert result.success
+        assert mock_run.call_args.args[0][:4] == ["docker", "build", "-t", "myapp:latest"]
+        assert mock_run.call_args.kwargs["shell"] is False
+
+    def test_dockerfile_path_must_stay_inside_context(self):
+        pf = parse("""\
+docker myapp [file=../Dockerfile]:
+    Python 3.11 slim image.
+""")
+        runner = Runner(pf, DryRunDispatcher())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert pf.tasks["myapp"].docker is not None
+            pf.tasks["myapp"].docker.context = tmpdir
+            result = runner.run("myapp")
+
+        assert not result.success
+        assert "inside docker context" in result.task_results[0].response
+
 
 # ---------------------------------------------------------------------------
 # Runner — @echo steps
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerEcho:
     def test_echo_step_succeeds(self):
@@ -584,6 +674,7 @@ task greet:
 # ---------------------------------------------------------------------------
 # Runner — SSH / hosts execution
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerSSH:
     def test_ssh_step_runs_on_each_host(self):
@@ -647,6 +738,42 @@ task deploy [on=web]:
         assert "h1" in cmd
         assert "@" not in cmd  # no user@ prefix
 
+    def test_ssh_rejects_unsafe_host(self):
+        from makethlm.models import HostGroup
+        from makethlm.runner import _build_ssh_command
+
+        group = HostGroup(name="web", hosts=["h1"])
+        with pytest.raises(ValueError, match="invalid SSH host"):
+            _build_ssh_command("h1;touch /tmp/pwn", "ls", group)
+
+    def test_ssh_step_runs_with_argv_not_shell(self):
+        from makethlm.models import HostGroup
+
+        pf = parse("""\
+task noop:
+    noop
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        group = HostGroup(name="web", hosts=["h1"], user="deploy")
+        mock_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with patch("makethlm.runner._run_subprocess", return_value=mock_result) as mock_run:
+            result = runner._run_ssh_step(TaskStep(kind="shell", content="echo ok"), "h1", group)
+
+        assert result.success
+        assert mock_run.call_args.args[0] == [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "deploy@h1",
+            "echo ok",
+        ]
+        assert mock_run.call_args.kwargs["shell"] is False
+
     def test_prompt_steps_run_locally_even_with_hosts(self):
         pf = parse("""\
 hosts web:
@@ -667,8 +794,8 @@ task check [on=web]:
 
         assert result.success
         sr = result.task_results[0].step_results
-        assert sr[0].kind == "ssh"      # shell runs via SSH
-        assert sr[1].kind == "prompt"   # prompt runs locally
+        assert sr[0].kind == "ssh"  # shell runs via SSH
+        assert sr[1].kind == "prompt"  # prompt runs locally
 
     def test_ssh_failure_stops_execution(self):
         pf = parse("""\
@@ -706,7 +833,9 @@ task deploy [on=web, ssh-parallel]:
         runner = Runner(pf, DryRunDispatcher(), verbose=False)
 
         def _fake_ssh(step, host, group):
-            return StepResult(kind="ssh", content=step.content, response=host, success=True, host=host)
+            return StepResult(
+                kind="ssh", content=step.content, response=host, success=True, host=host
+            )
 
         with patch.object(runner, "_run_ssh_step", side_effect=_fake_ssh) as mock_ssh:
             result = runner.run("deploy")
@@ -720,6 +849,7 @@ task deploy [on=web, ssh-parallel]:
 # ---------------------------------------------------------------------------
 # Runner — LLM provider routing
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerLLMRouting:
     def test_per_task_llm_routes_to_different_dispatcher(self):
@@ -802,6 +932,7 @@ task review:
 # Runner — alias resolution
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerAliases:
     def test_alias_resolves_to_task(self):
         pf = parse("""\
@@ -837,6 +968,7 @@ alias d := deploy
 # Runner — OS filter
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerOsFilter:
     def test_os_filter_skips_non_matching(self):
         pf = parse("""\
@@ -871,6 +1003,7 @@ task main: platform_specific:
 # ---------------------------------------------------------------------------
 # Runner — confirm
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerConfirm:
     def test_confirm_declined_skips(self):
@@ -911,6 +1044,7 @@ task deploy [confirm=Really deploy?]:
         runner = Runner(pf, dispatcher)
 
         captured_prompts = []
+
         def mock_input(prompt):
             captured_prompts.append(prompt)
             return "y"
@@ -939,9 +1073,11 @@ task show [env(MAKETHLM_TEST_ENV, expected)]:
 # Runner — working directory
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerWorkingDir:
     def test_task_working_dir(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             pf = parse(f"""\
 task build [working-dir={tmpdir}]:
@@ -956,6 +1092,7 @@ task build [working-dir={tmpdir}]:
 
     def test_global_working_dir(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             pf = parse(f"""\
 set working-dir "{tmpdir}"
@@ -975,14 +1112,16 @@ task build:
 # Runner — dotenv loading
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerDotenv:
     def test_dotenv_loads_env_vars(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create .env file
             env_path = os.path.join(tmpdir, ".env")
             with open(env_path, "w") as f:
-                f.write('PF_DOTENV_TEST=loaded_value\n')
+                f.write("PF_DOTENV_TEST=loaded_value\n")
 
             pf = parse("""\
 set dotenv-load
@@ -1011,10 +1150,11 @@ task show:
     def test_dotenv_load_with_path(self):
         """dotenv-load with a file path loads that specific file."""
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = os.path.join(tmpdir, ".env.custom")
             with open(env_path, "w") as f:
-                f.write('PF_DOTENV_CUSTOM=custom_value\n')
+                f.write("PF_DOTENV_CUSTOM=custom_value\n")
 
             pf = parse(f"""\
 set dotenv-load "{env_path}"
@@ -1038,10 +1178,11 @@ task show:
     def test_dotenv_path_expands_env_vars(self):
         """dotenv path supports $VAR and ${VAR} expansion."""
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = os.path.join(tmpdir, ".env.expanded")
             with open(env_path, "w") as f:
-                f.write('PF_DOTENV_EXPANDED=it_works\n')
+                f.write("PF_DOTENV_EXPANDED=it_works\n")
 
             pf = parse("""\
 set dotenv-load "$PF_TEST_DOTENV_DIR/.env.expanded"
@@ -1068,10 +1209,11 @@ task show:
         """dotenv path supports ~ (home directory) expansion."""
         import tempfile
         from unittest import mock
+
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = os.path.join(tmpdir, ".env.tilde")
             with open(env_path, "w") as f:
-                f.write('PF_DOTENV_TILDE=tilde_works\n')
+                f.write("PF_DOTENV_TILDE=tilde_works\n")
 
             # Use ~ in the path and mock expanduser to point at our tmpdir
             tilde_path = "~/.env.tilde"
@@ -1101,6 +1243,7 @@ task show:
 # Runner — set shell
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerShell:
     def test_set_shell_used_for_commands(self):
         pf = parse("""\
@@ -1120,6 +1263,7 @@ task build:
 # ---------------------------------------------------------------------------
 # Runner — export variables
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerExport:
     def test_export_var_in_env(self):
@@ -1159,6 +1303,26 @@ task show:
 
 
 class TestSecretRedaction:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "AWS_ACCESS_KEY_ID",
+            "SSH_KEY",
+            "AUTHORIZATION",
+            "SESSION",
+            "DATABASE_URL",
+        ],
+    )
+    def test_secret_name_detection_covers_common_credentials(self, name):
+        from makethlm.secrets import is_secret_name
+
+        assert is_secret_name(name)
+
+    def test_secret_name_detection_avoids_embedded_word_false_positive(self):
+        from makethlm.secrets import is_secret_name
+
+        assert not is_secret_name("MONKEY")
+
     def test_shell_output_redacts_exported_secret(self):
         pf = parse("""\
 export API_KEY := "secret123"
@@ -1172,6 +1336,18 @@ task show:
 
         assert "[redacted]" in result.task_results[0].response
         assert "secret123" not in result.task_results[0].response
+
+    def test_shell_output_redacts_short_global_secret(self):
+        pf = parse("""\
+PASSWORD := "xQz"
+
+task show:
+    !printf '%s' {{PASSWORD}}
+""")
+
+        result = Runner(pf, DryRunDispatcher(), verbose=False).run("show")
+
+        assert result.task_results[0].response == "[redacted]"
 
     def test_secret_injection_env_backend_is_redacted(self, monkeypatch):
         monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
@@ -1193,6 +1369,48 @@ task show:
         assert "[redacted]" in result.task_results[0].response
         assert result.task_results[0].step_results[0].response == "[redacted]"
 
+    def test_short_explicit_secret_is_redacted(self, monkeypatch):
+        monkeypatch.setenv("PF_TEST_PIN", "123")
+        pf = parse("""\
+set secrets "env"
+
+task show:
+    !printf '%s' {{#secret:PF_TEST_PIN}}
+""")
+
+        result = Runner(pf, DryRunDispatcher(), verbose=False).run("show")
+
+        assert result.success
+        assert result.task_results[0].response == "[redacted]"
+
+    def test_short_secret_task_argument_is_redacted(self):
+        pf = parse("""\
+task show(PASSWORD):
+    !printf '%s' {{PASSWORD}}
+""")
+
+        result = Runner(pf, DryRunDispatcher(), verbose=False).run(
+            "show",
+            {"PASSWORD": "123"},
+        )
+
+        assert result.success
+        assert result.task_results[0].response == "[redacted]"
+
+    def test_task_env_and_provider_credentials_are_registered(self):
+        pf = parse("""\
+llm openai [key=provider-secret]
+
+task show [env:PASSWORD=123]:
+    !printf '%s' "$PASSWORD"
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+
+        assert result.task_results[0].response == "[redacted]"
+        assert runner._redact("provider-secret") == "[redacted]"
+
     def test_secret_injection_masks_in_dry_run(self, monkeypatch):
         monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
         pf = parse("""\
@@ -1208,12 +1426,131 @@ task show:
 
         assert result.success
         assert dispatcher.dispatched[0][0] == "reveal ***"
-        assert result.task_results[0].prompt_sent == "reveal ***"
+
+    def test_secret_resolution_audit_logs_without_value(self, monkeypatch, capsys):
+        monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
+        pf = parse("""\
+set secrets "env"
+set secrets-audit
+
+task show:
+    !echo {{#secret:PF_TEST_SECRET}}
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+        err = capsys.readouterr().err
+
+        assert result.success
+        assert "PF_TEST_SECRET" in err
+        assert "supersecret" not in err
+
+    def test_secret_policy_blocks_llm_prompt_secrets(self, monkeypatch):
+        monkeypatch.setenv("PF_TEST_SECRET", "supersecret")
+        pf = parse("""\
+set secrets "env"
+set allow-secrets-in-prompts false
+
+task show:
+    reveal {{#secret:PF_TEST_SECRET}}
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        with pytest.raises(Exception, match="secret in an LLM prompt"):
+            runner.run("show")
+
+    @patch("makethlm.secrets.run_subprocess")
+    def test_infisical_backend_is_called(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="resolved\n",
+            stderr="",
+        )
+        pf = parse("""\
+set secrets "infisical"
+set secrets-project "project-id"
+set secrets-environment "prod"
+
+task show:
+    !echo {{#secret:DB_PASSWORD}}
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+
+        assert result.success
+        assert mock_run.call_args.args[0] == [
+            "infisical",
+            "secrets",
+            "get",
+            "DB_PASSWORD",
+            "--plain",
+            "--projectId=project-id",
+            "--env=prod",
+        ]
+
+    @patch("makethlm.secrets.run_subprocess")
+    def test_onepassword_backend_is_called(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="resolved\n",
+            stderr="",
+        )
+        pf = parse("""\
+set secrets "1password"
+set secrets-vault "DevOps"
+
+task show:
+    !echo {{#secret:Deploy Token/credential}}
+""")
+        runner = Runner(pf, DryRunDispatcher(), verbose=False)
+
+        result = runner.run("show")
+
+        assert result.success
+        assert mock_run.call_args.args[0] == [
+            "op",
+            "read",
+            "op://Deploy Token/credential",
+        ]
+
+    @patch("makethlm.secrets.run_subprocess")
+    def test_sops_backend_is_called(self, mock_run, tmp_path):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="resolved\n",
+            stderr="",
+        )
+        promptfile = tmp_path / "Promptfile"
+        promptfile.write_text("""\
+set secrets "sops"
+set secrets-file "secrets.yaml"
+
+task show:
+    !echo {{#secret:db/password}}
+""")
+        pf = parse(promptfile.read_text(), filename=str(promptfile))
+        runner = Runner(pf, DryRunDispatcher(), verbose=False, promptfile_path=str(promptfile))
+
+        result = runner.run("show")
+
+        assert result.success
+        assert mock_run.call_args.args[0] == [
+            "sops",
+            "decrypt",
+            "--extract",
+            '["db"]["password"]',
+            str(tmp_path / "secrets.yaml"),
+        ]
 
 
 # ---------------------------------------------------------------------------
 # Runner — default makethlm env vars
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerDefaultEnvVars:
     def test_makethlm_task_env_var(self):
@@ -1254,9 +1591,11 @@ task show:
 # Runner — no-cd
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerNoCd:
     def test_no_cd_ignores_working_dir(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             pf = parse(f"""\
 set working-dir "{tmpdir}"
@@ -1278,6 +1617,7 @@ task build [no-cd]:
 # ---------------------------------------------------------------------------
 # Runner — variadic args
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerVariadicArgs:
     def test_plus_variadic_collects_remaining(self):
@@ -1308,6 +1648,7 @@ task greet(*names):
 # Runner — ignore-comments
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerIgnoreComments:
     def test_ignore_comments_strips_comments(self):
         pf = parse("""\
@@ -1330,6 +1671,7 @@ task build:
 # Runner — built-in functions
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerBuiltinFunctions:
     def test_os_in_prompt(self):
         pf = parse("""\
@@ -1345,6 +1687,7 @@ task show:
 
     def test_arch_in_shell(self):
         import platform
+
         pf = parse("""\
 task show:
     !echo {{arch()}}
@@ -1360,6 +1703,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Runner — if/else in templates
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerIfElse:
     def test_if_else_in_prompt(self):
@@ -1394,6 +1738,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Runner — shell command features (pipes, redirection, &&, ||, etc.)
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerShellFeatures:
     def _run_shell(self, cmd: str) -> str:
@@ -1441,6 +1786,7 @@ class TestRunnerShellFeatures:
 
     def test_redirect_to_file(self):
         import tempfile
+
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             path = f.name
         try:
@@ -1452,6 +1798,7 @@ class TestRunnerShellFeatures:
 
     def test_append_redirect(self):
         import tempfile
+
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as f:
             f.write("line1\n")
             path = f.name
@@ -1508,6 +1855,7 @@ class TestRunnerShellFeatures:
 # ---------------------------------------------------------------------------
 # Runner — agent integration
 # ---------------------------------------------------------------------------
+
 
 class TestRunnerAgents:
     def test_agent_instructions_prepended_to_prompt(self):
@@ -1613,6 +1961,7 @@ task multi [agent=expert]:
 # Runner — guidance integration
 # ---------------------------------------------------------------------------
 
+
 class TestRunnerGuidance:
     def test_guidance_prepended_to_prompt(self):
         pf = parse("""\
@@ -1696,6 +2045,7 @@ task build:
 # Dispatcher — Claude naming
 # ---------------------------------------------------------------------------
 
+
 class TestClaudeDispatcherNaming:
     def test_system_prompt_includes_task_name(self):
         from makethlm.dispatcher import ClaudeDispatcher
@@ -1712,8 +2062,9 @@ class TestClaudeDispatcherNaming:
         # by checking the dispatch method's internal cmd assembly
         # Let's patch run_subprocess to capture the command
         captured = []
+
         def mock_run(*args, **kwargs):
-            captured.append(args[0] if args else kwargs.get('cmd'))
+            captured.append(args[0] if args else kwargs.get("cmd"))
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="ok", stderr="")
 
         with patch("makethlm.dispatcher.run_subprocess", side_effect=mock_run):
@@ -1735,11 +2086,15 @@ class TestClaudeDispatcherNaming:
         captured = []
 
         def mock_run(*args, **kwargs):
-            captured.append(args[0] if args else kwargs.get('cmd'))
+            captured.append(args[0] if args else kwargs.get("cmd"))
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="ok", stderr="")
 
-        task1 = Task(name="build", steps=[TaskStep(kind="prompt", content="t")], options=TaskOptions())
-        task2 = Task(name="deploy", steps=[TaskStep(kind="prompt", content="t")], options=TaskOptions())
+        task1 = Task(
+            name="build", steps=[TaskStep(kind="prompt", content="t")], options=TaskOptions()
+        )
+        task2 = Task(
+            name="deploy", steps=[TaskStep(kind="prompt", content="t")], options=TaskOptions()
+        )
 
         with patch("makethlm.dispatcher.run_subprocess", side_effect=mock_run):
             dispatcher.dispatch("prompt1", task1)
@@ -1756,6 +2111,7 @@ class TestClaudeDispatcherNaming:
 # ---------------------------------------------------------------------------
 # Artifacts
 # ---------------------------------------------------------------------------
+
 
 class TestArtifacts:
     def test_artifact_stored_by_task_name(self):
@@ -1919,6 +2275,7 @@ task analyze:
 # Webhooks
 # ---------------------------------------------------------------------------
 
+
 class TestWebhooks:
     def test_webhook_option_parsed(self):
         pf = parse("""\
@@ -1948,6 +2305,7 @@ task deploy [webhook=https://hooks.example.com/test]:
             assert mock_urlopen.called
             req = mock_urlopen.call_args[0][0]
             import json
+
             payload = json.loads(req.data)
             assert payload["task"] == "deploy"
             assert payload["status"] == "success"
@@ -1992,6 +2350,7 @@ task ok [webhook=https://hooks.example.com/test, webhook-on=failure]:
 
     def test_webhook_invalid_on_raises(self):
         from makethlm.parser import ParseError
+
         with pytest.raises(ParseError, match="webhook_on must be"):
             parse("""\
 task t [webhook=https://example.com, webhook-on=bogus]:
@@ -2002,6 +2361,7 @@ task t [webhook=https://example.com, webhook-on=bogus]:
 # ---------------------------------------------------------------------------
 # Rollback hooks
 # ---------------------------------------------------------------------------
+
 
 class TestRollback:
     def test_failed_task_runs_rollback_task(self):
@@ -2039,6 +2399,7 @@ task deploy [rollback=rollback]:
 # ---------------------------------------------------------------------------
 # Conditional execution (when)
 # ---------------------------------------------------------------------------
+
 
 class TestConditionalExecution:
     def test_when_true_executes(self):
@@ -2181,6 +2542,7 @@ task t [when=x == "y"]:
 # Sandboxing
 # ---------------------------------------------------------------------------
 
+
 class TestSandboxing:
     def test_sandbox_docker_wraps_command(self):
         pf = parse("""\
@@ -2195,6 +2557,7 @@ task build [sandbox=docker]:
         assert "run" in wrapped
         assert "--rm" in wrapped
         assert "/workspace" in wrapped
+        assert "--net none" in wrapped
         assert "make all" in wrapped
 
     def test_sandbox_docker_custom_image(self):
@@ -2230,6 +2593,28 @@ task build [sandbox=docker, sandbox-net=host]:
         wrapped = runner._sandbox_command("deploy.sh", task)
         assert "--net" in wrapped
         assert "host" in wrapped
+
+    def test_sandbox_docker_read_only_workspace(self):
+        pf = parse("""\
+task build [sandbox=docker, sandbox-read-only]:
+    !make all
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        task = pf.tasks["build"]
+        wrapped = runner._sandbox_command("make all", task)
+        assert ":/workspace:ro" in wrapped
+
+    def test_sandbox_bwrap_read_only_workspace(self):
+        pf = parse("""\
+task risky [sandbox=bwrap, sandbox-read-only]:
+    !./untrusted
+""")
+        dispatcher = DryRunDispatcher()
+        runner = Runner(pf, dispatcher)
+        task = pf.tasks["risky"]
+        wrapped = runner._sandbox_command("./untrusted", task)
+        assert wrapped.count("--ro-bind") >= 2
 
     def test_sandbox_systemd_wraps_command(self):
         pf = parse("""\
@@ -2321,6 +2706,7 @@ task build [sandbox=docker]:
 
         # Mock _run_subprocess to capture the command
         captured = []
+
         def mock_run(cmd, **kwargs):
             captured.append(cmd)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
@@ -2336,9 +2722,11 @@ task build [sandbox=docker]:
 # Topological levels & parallel execution
 # ---------------------------------------------------------------------------
 
+
 class TestTopologicalLevels:
     def test_single_task_single_level(self):
         from makethlm.runner import topological_levels
+
         pf = parse("""\
 task build:
     !make all
@@ -2348,6 +2736,7 @@ task build:
 
     def test_linear_deps_one_per_level(self):
         from makethlm.runner import topological_levels
+
         pf = parse("""\
 task a:
     !echo a
@@ -2366,6 +2755,7 @@ task c: b:
 
     def test_independent_deps_same_level(self):
         from makethlm.runner import topological_levels
+
         pf = parse("""\
 task lint:
     !echo lint
@@ -2384,6 +2774,7 @@ task build: lint test:
 
     def test_diamond_dependency(self):
         from makethlm.runner import topological_levels
+
         pf = parse("""\
 task a:
     !echo a
@@ -2499,25 +2890,31 @@ task build:
 # Cache duration parsing
 # ---------------------------------------------------------------------------
 
+
 class TestCacheDuration:
     def test_parse_seconds(self):
         from makethlm.runner import _parse_cache_duration
+
         assert _parse_cache_duration("30s") == 30
 
     def test_parse_minutes(self):
         from makethlm.runner import _parse_cache_duration
+
         assert _parse_cache_duration("5m") == 300
 
     def test_parse_hours(self):
         from makethlm.runner import _parse_cache_duration
+
         assert _parse_cache_duration("1h") == 3600
 
     def test_parse_days(self):
         from makethlm.runner import _parse_cache_duration
+
         assert _parse_cache_duration("2d") == 172800
 
     def test_parse_invalid_raises(self):
         from makethlm.runner import _parse_cache_duration
+
         with pytest.raises(ValueError, match="invalid cache duration"):
             _parse_cache_duration("invalid")
 
@@ -2525,6 +2922,7 @@ class TestCacheDuration:
 # ---------------------------------------------------------------------------
 # Task caching
 # ---------------------------------------------------------------------------
+
 
 class TestTaskCaching:
     def test_cache_option_parsed(self):
@@ -2535,7 +2933,6 @@ task expensive [cache=1h]:
         assert pf.tasks["expensive"].options.cache == "1h"
 
     def test_cache_saves_and_retrieves(self):
-        import tempfile
         pf = parse("""\
 task expensive [cache=1h]:
     !echo expensive-result
@@ -2544,7 +2941,6 @@ task expensive [cache=1h]:
         runner = Runner(pf, dispatcher)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            from pathlib import Path
             runner._cache_dir = Path(tmpdir)
 
             # First run should execute
@@ -2581,3 +2977,306 @@ task normal:
         runner = Runner(pf, dispatcher)
         task = pf.tasks["normal"]
         assert runner._get_cached_result(task) is None
+
+    def test_cache_filename_does_not_use_task_name_as_path(self):
+        pf = parse("""\
+task ../evil [cache=1h]:
+    !echo evil
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        task = pf.tasks["../evil"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "cache"
+            runner._cache_dir = cache_dir
+            runner._save_cached_result(
+                task,
+                TaskResult(task_name=task.name, prompt_sent="", response="ok", success=True),
+            )
+
+            assert list(cache_dir.glob("*.json"))
+            assert not list(Path(tmpdir).glob("evil*"))
+
+    def test_cache_key_changes_with_variables_and_arguments(self):
+        pf = parse("""\
+name := "one"
+
+task greet(who) [cache=1h]:
+    greet {{name}} {{who}}
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        task = pf.tasks["greet"]
+        first = runner._cache_key(task, {"who": "alice"})
+
+        pf.variables["name"] = "two"
+        changed_variable = runner._cache_key(task, {"who": "alice"})
+        changed_argument = runner._cache_key(task, {"who": "bob"})
+
+        assert first != changed_variable
+        assert changed_variable != changed_argument
+
+    def test_cache_key_changes_with_unbraced_environment(self, monkeypatch):
+        pf = parse("""\
+task deploy [cache=1h]:
+    !echo "$DEPLOY_ENV"
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        task = pf.tasks["deploy"]
+
+        monkeypatch.setenv("DEPLOY_ENV", "staging")
+        first = runner._cache_key(task)
+        monkeypatch.setenv("DEPLOY_ENV", "production")
+        second = runner._cache_key(task)
+
+        assert first != second
+
+    def test_cache_key_changes_with_function_body(self):
+        first_pf = parse("""\
+fn instructions:
+    version one
+
+task review [cache=1h]:
+    @use instructions
+""")
+        second_pf = parse("""\
+fn instructions:
+    version two
+
+task review [cache=1h]:
+    @use instructions
+""")
+
+        first = Runner(first_pf, DryRunDispatcher())._cache_key(first_pf.tasks["review"])
+        second = Runner(second_pf, DryRunDispatcher())._cache_key(second_pf.tasks["review"])
+
+        assert first != second
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            """\
+fn credentials:
+    use {{#secret:DEPLOY_TOKEN}}
+
+task review [cache=1h]:
+    @use credentials
+""",
+            """\
+credential := "{{#secret:DEPLOY_TOKEN}}"
+
+task review [cache=1h]:
+    use {{credential}}
+""",
+        ],
+    )
+    def test_indirect_secret_tasks_are_not_cached(self, source):
+        pf = parse(source)
+        runner = Runner(pf, DryRunDispatcher())
+        task = pf.tasks["review"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner._cache_dir = Path(tmpdir)
+            runner._save_cached_result(
+                task,
+                TaskResult(
+                    task_name="review",
+                    prompt_sent="",
+                    response="result",
+                    success=True,
+                ),
+            )
+
+            assert not list(Path(tmpdir).glob("*.json"))
+
+    def test_failed_results_are_not_cached(self):
+        pf = parse("""\
+task flaky [cache=1h]:
+    !false
+""")
+        runner = Runner(pf, DryRunDispatcher())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner._cache_dir = Path(tmpdir)
+            runner._save_cached_result(
+                pf.tasks["flaky"],
+                TaskResult(
+                    task_name="flaky",
+                    prompt_sent="",
+                    response="failed",
+                    success=False,
+                ),
+            )
+
+            assert runner._get_cached_result(pf.tasks["flaky"]) is None
+            assert not list(Path(tmpdir).glob("*.json"))
+
+    def test_cached_step_results_preserve_artifacts(self):
+        pf = parse("""\
+task build [cache=1h]:
+    !echo artifact
+""")
+        runner = Runner(pf, DryRunDispatcher())
+        original = TaskResult(
+            task_name="build",
+            prompt_sent="",
+            response="artifact",
+            success=True,
+            step_results=[
+                StepResult(
+                    kind="shell",
+                    content="echo artifact",
+                    response="artifact",
+                    success=True,
+                    exit_code=0,
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner._cache_dir = Path(tmpdir)
+            runner._save_cached_result(pf.tasks["build"], original)
+            cached = runner._get_cached_result(pf.tasks["build"])
+
+            assert cached is not None
+            runner._store_artifact(pf.tasks["build"], cached)
+            assert runner.artifacts["build"]["stdout"] == "artifact"
+            assert runner.artifacts["build"]["exit_code"] == "0"
+
+
+class TestRuntimeSettings:
+    def test_positional_arguments_reach_shell(self):
+        pf = parse("""\
+set positional-arguments
+
+task show(first, second="two"):
+    !printf '%s|%s' "$1" "$2"
+""")
+        result = Runner(pf, DryRunDispatcher()).run(
+            "show",
+            {"first": "one", "second": "two"},
+        )
+        assert result.success
+        assert result.task_results[0].response == "one|two"
+
+    def test_env_attribute_exports_named_task_arguments(self):
+        pf = parse("""\
+task show(first="default") [env]:
+    !printf '%s' "$first"
+""")
+        result = Runner(pf, DryRunDispatcher()).run("show")
+        assert result.success
+        assert result.task_results[0].response == "default"
+
+    def test_explicit_env_attribute_interpolates_task_arguments(self):
+        pf = parse("""\
+task show(first) [env(SELECTED, "{{first}}")]:
+    !printf '%s' "$SELECTED"
+""")
+        result = Runner(pf, DryRunDispatcher()).run("show", {"first": "value"})
+        assert result.success
+        assert result.task_results[0].response == "value"
+
+    def test_tempdir_controls_script_location(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pf = parse(f"""\
+set tempdir "{tmpdir}"
+
+task show [script]:
+    printf '%s' "$0"
+""")
+            result = Runner(pf, DryRunDispatcher()).run("show")
+
+        assert result.success
+        assert result.task_results[0].response.startswith(tmpdir)
+
+
+class TestWorkflowReliability:
+    def test_postmortem_runs_with_failed_task_artifact(self):
+        pf = parse("""\
+task diagnose:
+    explain exit {{build.exit_code}}
+
+task build [postmortem=diagnose]:
+    !exit 7
+""")
+        dispatcher = DryRunDispatcher()
+        result = Runner(pf, dispatcher).run("build")
+
+        assert not result.success
+        assert [task.task_name for task in result.task_results] == [
+            "build",
+            "diagnose",
+        ]
+        assert dispatcher.dispatched[0][0] == "explain exit 7"
+
+    def test_required_json_artifact_contract_passes(self):
+        pf = parse("""\
+task seed:
+    !printf '{"ready": true}'
+
+task consume [requires="seed.stdout:json"]: seed:
+    !echo consumed
+""")
+        result = Runner(pf, DryRunDispatcher()).run("consume")
+        assert result.success
+
+    def test_missing_required_artifact_fails_closed(self):
+        pf = parse("""\
+task consume [requires="seed.stdout:json"]:
+    !echo consumed
+""")
+        result = Runner(pf, DryRunDispatcher()).run("consume")
+        task_result = result.task_results[0]
+        assert not task_result.success
+        assert "is not available" in task_result.response
+        assert task_result.step_results[0].kind == "contract"
+
+    def test_output_contract_rejects_wrong_type(self):
+        pf = parse("""\
+task inspect [produces=object]:
+    !printf 'not-json'
+""")
+        result = Runner(pf, DryRunDispatcher()).run("inspect")
+        assert not result.success
+        assert "output is not object" in result.task_results[0].response
+
+    def test_provider_retries_then_uses_fallback(self):
+        class FailingDispatcher(Dispatcher):
+            def __init__(self):
+                self.calls = 0
+
+            def dispatch(self, prompt, task):
+                self.calls += 1
+                return DispatchResult(response="primary failed", success=False)
+
+        class SuccessDispatcher(Dispatcher):
+            def __init__(self):
+                self.calls = 0
+
+            def dispatch(self, prompt, task):
+                self.calls += 1
+                return DispatchResult(response="fallback worked", success=True)
+
+        pf = parse("""\
+llm backup [template="backup {prompt}"]
+
+task review [fallback-llm=backup, retries=1]:
+    review this
+""")
+        pf.default_llm = None
+        primary = FailingDispatcher()
+        fallback = SuccessDispatcher()
+        runner = Runner(pf, primary)
+
+        with patch(
+            "makethlm.runner._dispatcher_for_provider",
+            return_value=fallback,
+        ):
+            result = runner.run("review")
+
+        step = result.task_results[0].step_results[0]
+        assert result.success
+        assert primary.calls == 2
+        assert fallback.calls == 1
+        assert step.provider == "backup"
+        assert step.attempt == 3

@@ -20,12 +20,12 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
 | `--check` | | Validate Promptfile references, required tools, and risky capabilities |
+| `--capabilities` | | Explain transitive shell, SSH, Docker, LLM, secret, and webhook capabilities |
 | `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
 | `--graph` | | Print a task dependency graph and exit |
 | `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |
 | `--history [N]` | | Show recent local run history and exit |
 | `--no-history` | | Do not record this run in local history |
-| `--serve [HOST:PORT]` | | Serve a small local task UI/API |
 | `--evaluate EXPR` | | Evaluate an expression and print the result |
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--json` | | Emit machine-readable JSON output |
@@ -33,16 +33,18 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--jobs N` | | Limit parallel task workers; implies `--parallel` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
-| `--shell TEMPLATE` | | Use an arbitrary LLM CLI template (e.g., `'ollama run llama3 "{prompt}"'`) |
+| `--shell TEMPLATE` | | Use an LLM CLI argv template (e.g., `'ollama run llama3 "{prompt}"'`) |
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
 | `--openai` | | Use the native OpenAI API dispatcher as the default LLM dispatcher |
 | `--ollama` | | Use the native Ollama HTTP dispatcher as the default LLM dispatcher |
 | `--safe` | | Enable restrictive safety checks before execution |
-| `--allow-backticks` | | Allow parse-time backtick command substitution in safe mode |
+| `--allow-backticks` | | Allow parse-time backtick commands in safe or inspection modes |
 | `--allow-shell` | | Allow local shell steps in safe mode |
 | `--allow-ssh` | | Allow SSH shell steps in safe mode |
 | `--allow-docker` | | Allow docker blocks in safe mode |
 | `--allow-llm` | | Allow LLM prompt execution in safe mode |
+| `--allow-secrets` | | Allow secret reads and sensitive interpolation in safe mode |
+| `--allow-webhook` | | Allow webhook delivery in safe mode |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |
 
@@ -67,6 +69,8 @@ makethlm --dry-run deploy staging
 # Validate without executing
 makethlm --check
 makethlm --check --json
+makethlm --capabilities deploy
+makethlm --capabilities --json deploy
 
 # Emit machine-readable output
 makethlm --json deploy
@@ -88,12 +92,11 @@ makethlm --graph --graph-format dot deploy
 # Show local run history
 makethlm history
 makethlm --history 50
+makethlm replay 42
+makethlm --json replay 42
 
 # Run with explicit safety permissions
-makethlm --safe --allow-shell --allow-llm test
-
-# Start the local self-hosted UI/API
-makethlm --serve 127.0.0.1:8765
+makethlm --safe --allow-shell --allow-llm --allow-secrets test
 
 # Use a different model
 makethlm review -m sonnet

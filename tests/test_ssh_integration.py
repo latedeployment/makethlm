@@ -38,7 +38,6 @@ def _patched_build_ssh_command(key_path: str):
 
 
 class TestSSHIntegration:
-
     def test_ssh_echo(self, ssh_runner):
         """Run echo on the container and verify output."""
         (make_runner, key_path) = ssh_runner
@@ -221,6 +220,7 @@ task slow [on=target]:
             "makethlm.runner._build_ssh_command",
             _patched_build_ssh_command(key_path),
         ):
+
             def _short_timeout_ssh(step, host, group):
                 import subprocess as sp
 
@@ -229,6 +229,7 @@ task slow [on=target]:
                 ssh_cmd = _patched_build_ssh_command(key_path)(host, step.content, group)
                 try:
                     from makethlm.subprocess_util import run_subprocess
+
                     proc = run_subprocess(
                         ssh_cmd,
                         shell=True,

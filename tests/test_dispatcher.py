@@ -126,23 +126,43 @@ class TestNoninteractiveFlags:
     def test_codex_template_uses_exec(self):
         cmd = _inject_noninteractive_flags('codex "{prompt}"')
         assert cmd == (
-            'codex --ask-for-approval never exec '
-            '--sandbox workspace-write --color never "{prompt}"'
+            'codex --ask-for-approval never exec --sandbox workspace-write --color never "{prompt}"'
         )
 
     def test_codex_exec_template_gets_safe_defaults(self):
         cmd = _inject_noninteractive_flags('codex exec "{prompt}"')
         assert cmd == (
-            'codex --ask-for-approval never exec '
-            '--sandbox workspace-write --color never "{prompt}"'
+            'codex --ask-for-approval never exec --sandbox workspace-write --color never "{prompt}"'
         )
 
     def test_codex_exec_template_preserves_explicit_sandbox(self):
         cmd = _inject_noninteractive_flags('codex exec --sandbox read-only "{prompt}"')
         assert cmd == (
-            'codex --ask-for-approval never exec '
-            '--color never --sandbox read-only "{prompt}"'
+            'codex --ask-for-approval never exec --color never --sandbox read-only "{prompt}"'
         )
+
+
+class TestShellDispatcher:
+    @patch("makethlm.dispatcher.run_subprocess")
+    def test_dispatch_uses_argv_not_shell(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="done",
+            stderr="",
+        )
+        task = Task(name="review", steps=[TaskStep(kind="prompt", content="review it")])
+        d = ShellDispatcher('llm --prompt "{prompt}"')
+
+        result = d.dispatch('hello $(touch /tmp/pwn) "quoted"', task)
+
+        assert result.success
+        assert mock_run.call_args.args[0] == [
+            "llm",
+            "--prompt",
+            'hello $(touch /tmp/pwn) "quoted"',
+        ]
+        assert mock_run.call_args.kwargs["shell"] is False
 
 
 class TestCodexDispatcher:
@@ -167,7 +187,7 @@ class TestCodexDispatcher:
         assert "workspace-write" in cmd
         assert "--color" in cmd
         assert "never" in cmd
-        assert ["--model", "gpt-5-codex"] == cmd[cmd.index("--model"):cmd.index("--model") + 2]
+        assert ["--model", "gpt-5-codex"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
         assert cmd[-1] == "-"
         assert mock_run.call_args.kwargs["input"] == "review it"
 
@@ -189,7 +209,7 @@ class TestCodexDispatcher:
         d.dispatch("review it", task)
 
         cmd = mock_run.call_args.args[0]
-        assert ["--model", "gpt-5.1-codex"] == cmd[cmd.index("--model"):cmd.index("--model") + 2]
+        assert ["--model", "gpt-5.1-codex"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
 
     @patch("makethlm.dispatcher.run_subprocess")
     def test_llm_timeout_option_is_used(self, mock_run):
@@ -221,9 +241,11 @@ class TestOpenAIDispatcher:
 
     @patch("makethlm.dispatcher.urllib.request.urlopen")
     def test_dispatch_posts_chat_completion_request(self, mock_urlopen):
-        mock_urlopen.return_value = FakeHTTPResponse({
-            "choices": [{"message": {"content": "review complete"}}],
-        })
+        mock_urlopen.return_value = FakeHTTPResponse(
+            {
+                "choices": [{"message": {"content": "review complete"}}],
+            }
+        )
         task = Task(name="review", steps=[TaskStep(kind="prompt", content="review it")])
         dispatcher = OpenAIDispatcher(
             model="gpt-test",

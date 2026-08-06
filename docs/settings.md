@@ -25,7 +25,10 @@ set working-dir "/home/deploy/app"
 | `set secrets-environment "name"` | Infisical environment name |
 | `set secrets-vault "name"` | 1Password vault name |
 | `set secrets-file "path"` | SOPS encrypted secrets file |
+| `set secrets-audit` | Log secret resolution metadata without values |
+| `set allow-secrets-in-prompts false` | Block secret placeholders and secret-like environment/template inputs in LLM prompt steps |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
+| `set shell := ["bash", "-cu"]` | Use Just-style shell command array syntax |
 | `set working-dir "path"` | Set the working directory for all tasks |
 | `set export` | Export all variables to the environment |
 | `set positional-arguments` | Pass task arguments as `$1`, `$2`, etc. |
@@ -34,6 +37,12 @@ set working-dir "/home/deploy/app"
 | `set tempdir "path"` | Temporary directory for recipes |
 | `set allow-duplicate-tasks` | Allow redefining tasks (last wins) |
 | `set allow-duplicate-variables` | Allow redefining variables |
+
+`set positional-arguments` passes recipe arguments as `$1`, `$2`, and so on.
+The task name is `$0`. A task-level `[positional-arguments]` attribute enables
+the same behavior for one task. `[env]` exports named task arguments to shell
+steps, while `set tempdir` controls where script recipes create their temporary
+files.
 
 ### Variable References in Directives
 

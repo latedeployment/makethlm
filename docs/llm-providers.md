@@ -81,6 +81,24 @@ task lint [llm=openai]:
     Apply to src/.
 ```
 
+## Retry and Fallback Strategy
+
+Retry a provider and fall back to other declared providers:
+
+```
+llm openai [model=gpt-4o-mini, key=$OPENAI_API_KEY]
+llm local [model=llama3, base_url=http://127.0.0.1:11434]
+
+task review [llm=openai, retries=1, fallback-llm=local]:
+    review the current diff
+```
+
+`retries` applies to each provider and is limited to 10. Up to four distinct
+providers may be listed in `fallback-llm`; they are separated with `|`, tried in order, and recorded on the
+prompt step together with the successful attempt number. Every fallback
+receives the same resolved prompt, so review the provider chain with
+`makethlm --capabilities TASK` before using secrets or sensitive source text.
+
 ## CLI Overrides
 
 Override the model from the command line:

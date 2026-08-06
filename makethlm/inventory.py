@@ -11,7 +11,7 @@ YAML format, or dynamic inventory scripts.
 
 from __future__ import annotations
 
-from .models import HostGroup
+from .models import HostConnection, HostGroup
 
 
 def parse_ansible_inventory(path: str) -> dict[str, HostGroup]:
@@ -68,13 +68,11 @@ def parse_ansible_inventory(path: str) -> dict[str, HostGroup]:
 
         group = groups[current_group]
         group.hosts.append(hostname)
-
-        # Per-host vars override group-level settings.
-        # Use the first host's vars as the group default if not already set.
-        if host_user and group.user is None:
-            group.user = host_user
-        if host_port and group.port is None:
-            group.port = host_port
+        if host_user or host_port:
+            group.connections[hostname] = HostConnection(
+                user=host_user,
+                port=host_port,
+            )
 
     # Filter out empty groups
     return {name: grp for name, grp in groups.items() if grp.hosts}

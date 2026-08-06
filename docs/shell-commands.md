@@ -74,8 +74,19 @@ task review:
 project := "myapp"
 
 task build:
-    !docker build -t {{project}}:latest .
+    !docker build -t {{quote(project)}}:latest .
 ```
+
+Interpolation is textual; it does not shell-escape values automatically.
+Wrap every variable or task argument that becomes a shell word with
+`quote(...)`, especially values supplied on the command line:
+
+```
+task logs(service):
+    !docker compose logs --tail=100 {{quote(service)}}
+```
+
+Keep shell operators and fixed syntax outside the quoted value.
 
 ## Echo Steps
 

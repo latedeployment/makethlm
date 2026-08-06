@@ -22,6 +22,15 @@ makethlm test            # run it for real
 | **cmake-project/** | C/C++ CMake configure/build/test workflow with Codex review |
 | **compiler-diagnostics/** | Capture compiler failures as artifacts and ask an LLM to explain them |
 | **python-ci/** | Python lint, compile, test, and security-review workflow |
+| **docker-compose/** | Docker Compose deploy, logs, rollback, and review workflow |
+| **systemd-service/** | systemd service deployment with status, logs, and rollback |
+| **kubernetes/** | kubectl diff/apply/diagnose/logs workflow |
+| **ansible-deploy/** | Ansible inventory import with SSH deploy tasks |
+| **python-release/** | Python package check, build, validate, and release flow |
+| **cmake-compile-commands/** | CMake `compile_commands.json` generation and analysis |
+| **gitlab-ci/** | GitLab CI snippets that call makethlm tasks from pipeline jobs |
+| **forgejo-actions/** | Forgejo Actions example workflow without adding repo-level CI config |
+| **rollback-patterns/** | Production deploy, verify, and rollback task patterns |
 
 ## How Promptfiles work
 

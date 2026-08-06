@@ -1,0 +1,25 @@
+# Production rollback patterns
+
+service := "myapp"
+release_dir := "/opt/myapp/releases/current"
+previous_dir := "/opt/myapp/releases/previous"
+
+task preflight:
+    !test -d {{quote(release_dir)}}
+    !test -d {{quote(previous_dir)}}
+    !systemctl is-enabled {{quote(service)}}.service
+
+task deploy [confirm("Deploy and restart production service?"), rollback=rollback]:
+    !rsync -a --delete dist/ {{quote(release_dir)}}/
+    !systemctl restart {{quote(service)}}.service
+    !systemctl is-active {{quote(service)}}.service
+
+task verify:
+    !systemctl status {{quote(service)}}.service --no-pager || true |>
+    decide whether the deployment is healthy or rollback should run
+
+task rollback:
+    !rsync -a --delete {{quote(previous_dir)}}/ {{quote(release_dir)}}/
+    !systemctl restart {{quote(service)}}.service
+    !journalctl -u {{quote(service)}}.service -n 80 --no-pager |>
+    summarize what changed after rollback

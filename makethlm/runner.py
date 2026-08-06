@@ -10,12 +10,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .dispatcher import (
@@ -26,7 +25,19 @@ from .dispatcher import (
     OpenAIDispatcher,
     ShellDispatcher,
 )
+from .docker import (
+    docker_build_argv,
+    docker_dry_run_build_command,
+    docker_generate_prompt,
+    format_docker_build_command,
+    resolve_dockerfile_path,
+    run_docker_build,
+    strip_dockerfile_markdown_fence,
+)
 from .models import (
+    ARTIFACT_CONTRACT_TYPES,
+    MAX_FALLBACK_LLMS,
+    MAX_LLM_RETRIES,
     HostGroup,
     LLMProvider,
     Promptfile,
@@ -35,7 +46,11 @@ from .models import (
     evaluate_condition,
     parse_duration_seconds,
 )
+from .sandbox import build_sandbox_command
+from .secrets import is_secret_name, redact_text, secret_values_from_mapping
+from .ssh import build_ssh_argv, build_ssh_command, run_ssh_command
 from .subprocess_util import run_subprocess as _run_subprocess
+from .webhooks import send_webhook
 
 
 def _log(msg: str, *, bold: bool = False, dim: bool = False) -> None:
@@ -82,6 +97,8 @@ def topological_sort(pf: Promptfile, target: str) -> list[str]:
         in_stack.remove(name)
         visited.add(name)
         order.append(name)
+        for dep in pf.tasks[name].subsequent_dependencies:
+            visit(dep, path)
 
     visit(target, [])
     return order
@@ -94,6 +111,8 @@ def topological_levels(pf: Promptfile, target: str) -> list[list[str]]:
     be executed concurrently.
     """
     order = topological_sort(pf, target)
+    if any(pf.tasks[name].subsequent_dependencies for name in order):
+        return [[name] for name in order]
 
     # Build the in-degree map restricted to our subgraph
     order_set = set(order)
@@ -133,6 +152,7 @@ def _parse_cache_duration(duration: str) -> float:
 # Result types
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class StepResult:
     """Result of running a single step within a task."""
@@ -143,6 +163,8 @@ class StepResult:
     success: bool
     host: str | None = None  # set for SSH-executed steps
     exit_code: int | None = None
+    provider: str | None = None
+    attempt: int | None = None
 
 
 @dataclass
@@ -172,29 +194,20 @@ class RunResult:
 # Runner
 # ---------------------------------------------------------------------------
 
-_DOCKER_GENERATE_PREFIX = (
-    "Generate a Dockerfile based on the following description. "
-    "Output ONLY the raw Dockerfile content — no markdown fences, "
-    "no explanation, no commentary. Just the Dockerfile.\n\n"
-)
+
+def _build_ssh_argv(host: str, command: str, group: HostGroup) -> list[str]:
+    """Build SSH argv for remote execution."""
+    return build_ssh_argv(host, command, group)
 
 
 def _build_ssh_command(host: str, command: str, group: HostGroup) -> str:
-    """Build an SSH command string for remote execution."""
-    parts = ["ssh"]
-    if group.identity_file:
-        identity_file = os.path.expandvars(os.path.expanduser(group.identity_file))
-        parts.extend(["-i", shlex.quote(identity_file)])
-    if group.port:
-        parts.extend(["-p", str(group.port)])
-    parts.append("-o")
-    parts.append("BatchMode=yes")
-    if group.strict_host_key_checking:
-        parts.extend(["-o", f"StrictHostKeyChecking={group.strict_host_key_checking}"])
-    target = f"{group.user}@{host}" if group.user else host
-    parts.append(target)
-    parts.append(command)
-    return " ".join(parts)
+    """Build a shell-escaped SSH command string for display/backward compatibility."""
+    return build_ssh_command(host, command, group)
+
+
+def _resolve_dockerfile_path(context: str, dockerfile: str) -> tuple[Path, Path]:
+    """Return resolved context and Dockerfile paths, rejecting path escapes."""
+    return resolve_dockerfile_path(context, dockerfile)
 
 
 def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
@@ -266,41 +279,134 @@ class Runner:
         self.verbose = verbose and not quiet  # show progress unless quiet
         self.promptfile_path = promptfile_path
         self.dry_run = dry_run
-        self.artifacts: dict[str, dict[str, str]] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
+        self.artifacts: dict[
+            str, dict[str, str]
+        ] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
         self._cache_dir = Path(os.path.expanduser("~/.cache/makethlm"))
         self._rollback_stack: set[str] = set()
+        self._postmortem_stack: set[str] = set()
         self._runtime_secret_values: set[str] = set()
+        for task in self.pf.tasks.values():
+            self._register_named_secret_values(task.options.env)
+            self._register_named_secret_values(task.local_variables)
+        for provider in self.pf.llm_providers.values():
+            if provider.api_key:
+                self._register_secret_value(provider.api_key)
 
-    def _cache_key(self, task: Task) -> str:
-        """Generate a cache key for a task based on its name and inputs."""
-        h = hashlib.sha256()
-        h.update(task.name.encode())
-        # Include step content in the hash
-        for step in task.steps:
-            h.update(step.content.encode())
-        # Include resolved variables used by this task
-        return h.hexdigest()[:16]
+    def _cache_payload(
+        self,
+        task: Task,
+        args: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """Return the execution inputs that determine a cached task result."""
+        agent = self.pf.get_agent_for_task(task.name)
+        expanded_sources = self.pf.task_secret_sources(task.name, args)
+        raw_text = "\n".join(
+            [
+                *(step.content for step in task.steps),
+                task.guidance or "",
+                self.pf.guidance or "",
+                agent.instructions if agent else "",
+                *task.options.env.values(),
+                *expanded_sources,
+            ]
+        )
+        env_names = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", raw_text))
+        env_names.update(re.findall(r"(?<!\$)\$([A-Za-z_][A-Za-z0-9_]*)", raw_text))
+        env_names.update(
+            re.findall(
+                r'env_var\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']',
+                raw_text,
+            )
+        )
+        provider = self.pf.get_llm_for_task(task.name)
+        if agent and agent.llm:
+            provider = self.pf.llm_providers.get(agent.llm, provider)
+        artifact_name = task.options.register or task.name
+        own_artifact_prefix = f"{artifact_name}."
+        fallback = {
+            "type": type(self.dispatcher).__name__,
+            "model": getattr(self.dispatcher, "default_model", None),
+            "template": getattr(self.dispatcher, "template", None),
+        }
+        return {
+            "schema": 2,
+            "task": task.name,
+            "steps": [asdict(step) for step in task.steps],
+            "expanded_sources": expanded_sources,
+            "arguments": args or {},
+            "variables": {
+                name: value
+                for name, value in self.pf.variables.items()
+                if not name.startswith(own_artifact_prefix)
+            },
+            "task_variables": task.local_variables,
+            "artifacts": {
+                name: value for name, value in self.artifacts.items() if name != artifact_name
+            },
+            "options": asdict(task.options),
+            "docker": asdict(task.docker) if task.docker else None,
+            "provider": asdict(provider) if provider else fallback,
+            "fallback_providers": {
+                name: asdict(self.pf.llm_providers[name])
+                for name in task.options.fallback_llms
+                if name in self.pf.llm_providers
+            },
+            "agent": asdict(agent) if agent else None,
+            "guidance": self.pf.guidance,
+            "task_guidance": task.guidance,
+            "environment": {name: os.environ.get(name) for name in sorted(env_names)},
+        }
+
+    def _cache_key(self, task: Task, args: dict[str, str] | None = None) -> str:
+        """Generate a stable cache key from all known execution inputs."""
+        payload = json.dumps(
+            self._cache_payload(task, args),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+    def _cache_file(
+        self,
+        task: Task,
+        args: dict[str, str] | None = None,
+    ) -> Path:
+        """Return the cache file path without trusting task names as path data."""
+        return self._cache_dir / f"{self._cache_key(task, args)}.json"
 
     def _register_secret_value(self, value: str) -> None:
         """Record a resolved secret for later redaction."""
         if value:
             self._runtime_secret_values.add(value)
 
-    def _get_cached_result(self, task: Task) -> TaskResult | None:
+    def _register_named_secret_values(self, values: dict[str, str]) -> None:
+        """Record secret-like values from a named mapping."""
+        self._runtime_secret_values.update(
+            value for name, value in values.items() if is_secret_name(name) and value
+        )
+
+    def _get_cached_result(
+        self,
+        task: Task,
+        args: dict[str, str] | None = None,
+    ) -> TaskResult | None:
         """Return a cached TaskResult if valid, else None."""
-        if not task.options.cache or self._task_uses_secret_resolution(task):
+        if not task.options.cache or self._task_uses_secret_resolution(task, args):
             return None
         try:
             duration = _parse_cache_duration(task.options.cache)
         except ValueError:
             return None
 
-        cache_file = self._cache_dir / f"{task.name}_{self._cache_key(task)}.json"
+        cache_file = self._cache_file(task, args)
         if not cache_file.exists():
             return None
 
         try:
             data = json.loads(cache_file.read_text())
+            if data.get("schema") != 2:
+                return None
             cached_at = data.get("cached_at", 0)
             if time.time() - cached_at > duration:
                 cache_file.unlink(missing_ok=True)
@@ -309,28 +415,65 @@ class Runner:
                 task_name=data["task_name"],
                 prompt_sent=data.get("prompt_sent", ""),
                 response=data.get("response", ""),
-                success=data.get("success", True),
+                success=True,
+                step_results=[
+                    StepResult(
+                        kind=step["kind"],
+                        content=step.get("content", ""),
+                        response=step.get("response", ""),
+                        success=step.get("success", True),
+                        host=step.get("host"),
+                        exit_code=step.get("exit_code"),
+                        provider=step.get("provider"),
+                        attempt=step.get("attempt"),
+                    )
+                    for step in data.get("step_results", [])
+                ],
             )
-        except (json.JSONDecodeError, KeyError, OSError):
+        except (json.JSONDecodeError, KeyError, OSError, TypeError):
             return None
 
-    def _save_cached_result(self, task: Task, result: TaskResult) -> None:
+    def _save_cached_result(
+        self,
+        task: Task,
+        result: TaskResult,
+        args: dict[str, str] | None = None,
+    ) -> None:
         """Save a task result to the cache."""
-        if not task.options.cache:
+        if (
+            not task.options.cache
+            or not result.success
+            or self._task_uses_secret_resolution(task, args)
+        ):
             return
+        cache_tmp_path: Path | None = None
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file = self._cache_dir / f"{task.name}_{self._cache_key(task)}.json"
+            cache_file = self._cache_file(task, args)
             data = {
+                "schema": 2,
                 "task_name": result.task_name,
                 "prompt_sent": result.prompt_sent,
                 "response": result.response,
-                "success": result.success,
+                "step_results": [asdict(step) for step in result.step_results],
                 "cached_at": time.time(),
             }
-            cache_file.write_text(json.dumps(data))
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=self._cache_dir,
+                prefix=".cache-",
+                suffix=".tmp",
+                delete=False,
+            ) as cache_tmp:
+                cache_tmp.write(json.dumps(data))
+                cache_tmp_path = Path(cache_tmp.name)
+            os.chmod(cache_tmp_path, 0o600)
+            os.replace(cache_tmp_path, cache_file)
         except OSError:
             pass
+        finally:
+            if cache_tmp_path is not None:
+                cache_tmp_path.unlink(missing_ok=True)
 
     def _get_dispatcher(self, task: Task) -> Dispatcher:
         """Return the appropriate dispatcher for a task.
@@ -404,39 +547,48 @@ class Runner:
 
     def _secret_values(self) -> list[str]:
         """Return likely secret values for log/artifact redaction."""
-        secret_keys = re.compile(r"(SECRET|TOKEN|PASSWORD|PASS|API_KEY|KEY)", re.IGNORECASE)
-        values: set[str] = set()
-        for key, value in os.environ.items():
-            if secret_keys.search(key) and len(value) >= 4:
-                values.add(value)
-        for key, value in self.pf.get_exported_env().items():
-            if secret_keys.search(key) and len(value) >= 4:
-                values.add(value)
-        values.update(v for v in self._runtime_secret_values if len(v) >= 4)
+        values = secret_values_from_mapping(dict(os.environ))
+        values.update(
+            value
+            for name, value in {
+                **self.pf.variables,
+                **self.pf.get_exported_env(),
+            }.items()
+            if is_secret_name(name) and value
+        )
+        values.update(self._runtime_secret_values)
         return sorted(values, key=len, reverse=True)
 
     def _redact(self, text: str) -> str:
         """Redact likely secrets from command, prompt, webhook, and artifact output."""
-        redacted = text
-        for value in self._secret_values():
-            redacted = redacted.replace(value, "[redacted]")
-        return redacted
+        return redact_text(text, self._secret_values())
 
     @staticmethod
-    def _effective_host_group(task: Task, host_group: HostGroup) -> HostGroup:
+    def _effective_host_group(
+        task: Task,
+        host_group: HostGroup,
+        host: str | None = None,
+    ) -> HostGroup:
         """Return host settings with task-level SSH overrides applied."""
+        connection = host_group.connections.get(host) if host else None
         return HostGroup(
             name=host_group.name,
-            hosts=list(host_group.hosts),
-            user=host_group.user,
-            port=host_group.port,
-            identity_file=task.options.ssh_identity or host_group.identity_file,
+            hosts=[host] if host else list(host_group.hosts),
+            user=connection.user if connection and connection.user else host_group.user,
+            port=connection.port if connection and connection.port else host_group.port,
+            identity_file=(
+                task.options.ssh_identity
+                or (connection.identity_file if connection else None)
+                or host_group.identity_file
+            ),
             strict_host_key_checking=(
                 task.options.ssh_strict_host_key_checking
+                or (connection.strict_host_key_checking if connection else None)
                 or host_group.strict_host_key_checking
             ),
             timeout=task.options.timeout,
             line_number=host_group.line_number,
+            connections=dict(host_group.connections),
         )
 
     def _should_echo(self, task: Task, step: TaskStep) -> bool:
@@ -456,7 +608,9 @@ class Runner:
             "stdout": sr.response,
             "stderr": "",
             "output": sr.response,
-            "exit_code": str(sr.exit_code if sr.exit_code is not None else (0 if sr.success else 1)),
+            "exit_code": str(
+                sr.exit_code if sr.exit_code is not None else (0 if sr.success else 1)
+            ),
             "success": "true" if sr.success else "false",
         }
 
@@ -514,7 +668,9 @@ class Runner:
             return
 
         if self.verbose:
-            _log(f"         running rollback task {rollback_target} for {failed_task.name}", dim=True)
+            _log(
+                f"         running rollback task {rollback_target} for {failed_task.name}", dim=True
+            )
 
         self._rollback_stack.update({failed_task.name, rollback_target})
         try:
@@ -524,19 +680,54 @@ class Runner:
             self._rollback_stack.discard(failed_task.name)
             self._rollback_stack.discard(rollback_target)
 
-    def _task_uses_secret_resolution(self, task: Task) -> bool:
+    def _run_postmortem(self, failed_task: Task, result: RunResult) -> None:
+        """Run a diagnostic task after failure, preserving its result in the run."""
+        target = failed_task.options.postmortem
+        if not target:
+            return
+        target = self.pf.resolve_alias(target)
+        if failed_task.name in self._postmortem_stack or target in self._postmortem_stack:
+            if self.verbose:
+                _log(
+                    f"         postmortem skipped for {failed_task.name} (cycle guard)",
+                    dim=True,
+                )
+            return
+        if target not in self.pf.tasks:
+            if self.verbose:
+                _log(f"         postmortem target not found: {target}", dim=True)
+            return
+        if self.verbose:
+            _log(
+                f"         running postmortem task {target} for {failed_task.name}",
+                dim=True,
+            )
+        self._postmortem_stack.update({failed_task.name, target})
+        try:
+            postmortem_result = self.run(target)
+            result.task_results.extend(postmortem_result.task_results)
+        finally:
+            self._postmortem_stack.discard(failed_task.name)
+            self._postmortem_stack.discard(target)
+
+    def _run_failure_hooks(self, failed_task: Task, result: RunResult) -> None:
+        """Run diagnostics before attempting rollback."""
+        self._run_postmortem(failed_task, result)
+        self._run_rollback(failed_task, result)
+
+    def _task_uses_secret_resolution(
+        self,
+        task: Task,
+        args: dict[str, str] | None = None,
+    ) -> bool:
         """Return True if a task declares or references secrets."""
-        if any("{{#secret:" in step.content for step in task.steps):
-            return True
-        agent = self.pf.get_agent_for_task(task.name)
-        if agent and "{{#secret:" in agent.instructions:
-            return True
-        return bool(self.pf.guidance and "{{#secret:" in self.pf.guidance)
+        return self.pf.task_references_secret(task.name, args)
 
     def run(self, target: str | None = None, args: dict[str, str] | None = None) -> RunResult:
         """Run a target task and all its dependencies."""
         self._ensure_dotenv()
         self._apply_exports()
+        self._register_named_secret_values(args or {})
 
         if target is None:
             target = self.pf.default_task
@@ -559,17 +750,23 @@ class Runner:
 
         for idx, task_name in enumerate(execution_order, 1):
             task = self.pf.tasks[task_name]
+            task_args = args if task_name == target else None
 
             # OS filter: skip tasks not meant for this OS
             if task.options.should_skip_for_os():
                 if self.verbose:
-                    _log(f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})", dim=True)
-                result.task_results.append(TaskResult(
-                    task_name=task_name,
-                    prompt_sent="",
-                    response=f"[skipped] not applicable on this OS (requires {task.options.os_filter})",
-                    success=True,
-                ))
+                    _log(
+                        f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})",
+                        dim=True,
+                    )
+                result.task_results.append(
+                    TaskResult(
+                        task_name=task_name,
+                        prompt_sent="",
+                        response=f"[skipped] not applicable on this OS (requires {task.options.os_filter})",
+                        success=True,
+                    )
+                )
                 continue
 
             # When conditions: evaluate before running
@@ -582,13 +779,18 @@ class Runner:
                 all_met = all(evaluate_condition(cond, context) for cond in task.options.when)
                 if not all_met:
                     if self.verbose:
-                        _log(f"  [{idx}/{total}] {task_name} ... skipped (when condition not met)", dim=True)
-                    result.task_results.append(TaskResult(
-                        task_name=task_name,
-                        prompt_sent="",
-                        response="[skipped] when condition not met",
-                        success=True,
-                    ))
+                        _log(
+                            f"  [{idx}/{total}] {task_name} ... skipped (when condition not met)",
+                            dim=True,
+                        )
+                    result.task_results.append(
+                        TaskResult(
+                            task_name=task_name,
+                            prompt_sent="",
+                            response="[skipped] when condition not met",
+                            success=True,
+                        )
+                    )
                     # Still store a "skipped" artifact
                     self.artifacts[task_name] = {
                         "stdout": "",
@@ -602,16 +804,18 @@ class Runner:
             # Confirm prompt (only for the explicitly targeted task)
             if task_name == target and task.options.confirm:
                 if not self._prompt_confirm(task):
-                    result.task_results.append(TaskResult(
-                        task_name=task_name,
-                        prompt_sent="",
-                        response="[skipped] user declined confirmation",
-                        success=True,
-                    ))
+                    result.task_results.append(
+                        TaskResult(
+                            task_name=task_name,
+                            prompt_sent="",
+                            response="[skipped] user declined confirmation",
+                            success=True,
+                        )
+                    )
                     return result
 
             # Check cache
-            cached = self._get_cached_result(task)
+            cached = self._get_cached_result(task, task_args)
             if cached is not None:
                 if self.verbose:
                     _log(f"  [{idx}/{total}] {task_name} ... cached", dim=True)
@@ -636,14 +840,13 @@ class Runner:
                 step_desc = f" ({', '.join(parts)})" if parts else ""
                 _log(f"  [{idx}/{total}] {task_name}{step_desc} ...", bold=True)
 
-            task_args = args if task_name == target else None
             t0 = time.monotonic()
             task_result = self._run_task(task, task_args)
             elapsed = time.monotonic() - t0
             result.task_results.append(task_result)
 
             # Save to cache if configured
-            self._save_cached_result(task, task_result)
+            self._save_cached_result(task, task_result, task_args)
 
             # Store artifact
             self._store_artifact(task, task_result)
@@ -664,7 +867,7 @@ class Runner:
                 _log(f"  [{idx}/{total}] {task_name} {status} ({_fmt_elapsed(elapsed)})")
 
             if not task_result.success:
-                self._run_rollback(task, result)
+                self._run_failure_hooks(task, result)
                 break
 
         return result
@@ -686,6 +889,7 @@ class Runner:
 
         self._ensure_dotenv()
         self._apply_exports()
+        self._register_named_secret_values(args or {})
 
         if target is None:
             target = self.pf.default_task
@@ -710,13 +914,20 @@ class Runner:
                 idx += 1
                 task_name = level[0]
                 task_result = self._run_single_task_in_pipeline(
-                    task_name, target, args, idx, total, result,
+                    task_name,
+                    target,
+                    args,
+                    idx,
+                    total,
+                    result,
                 )
                 if task_result is not None and not task_result.success:
                     break
             else:
                 # Multiple tasks — run in parallel
-                level_results = self._run_level_parallel(level, target, args, idx, total, result, jobs)
+                level_results = self._run_level_parallel(
+                    level, target, args, idx, total, result, jobs
+                )
                 idx += len(level)
                 failed = any(not tr.success for tr in level_results if tr is not None)
                 if failed:
@@ -738,13 +949,21 @@ class Runner:
         Returns the TaskResult, or None if skipped.
         """
         task = self.pf.tasks[task_name]
+        task_args = args if task_name == target else None
 
         # OS filter
         if task.options.should_skip_for_os():
             if self.verbose:
-                _log(f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})", dim=True)
-            tr = TaskResult(task_name=task_name, prompt_sent="",
-                            response="[skipped] not applicable on this OS", success=True)
+                _log(
+                    f"  [{idx}/{total}] {task_name} ... skipped (requires {task.options.os_filter})",
+                    dim=True,
+                )
+            tr = TaskResult(
+                task_name=task_name,
+                prompt_sent="",
+                response="[skipped] not applicable on this OS",
+                success=True,
+            )
             result.task_results.append(tr)
             return tr
 
@@ -756,15 +975,28 @@ class Runner:
                     context[f"{art_name}.{key}"] = value
             if not all(evaluate_condition(cond, context) for cond in task.options.when):
                 if self.verbose:
-                    _log(f"  [{idx}/{total}] {task_name} ... skipped (when condition not met)", dim=True)
-                tr = TaskResult(task_name=task_name, prompt_sent="",
-                                response="[skipped] when condition not met", success=True)
+                    _log(
+                        f"  [{idx}/{total}] {task_name} ... skipped (when condition not met)",
+                        dim=True,
+                    )
+                tr = TaskResult(
+                    task_name=task_name,
+                    prompt_sent="",
+                    response="[skipped] when condition not met",
+                    success=True,
+                )
                 result.task_results.append(tr)
-                self.artifacts[task_name] = {"stdout": "", "stderr": "", "exit_code": "0", "success": "skipped", "response": ""}
+                self.artifacts[task_name] = {
+                    "stdout": "",
+                    "stderr": "",
+                    "exit_code": "0",
+                    "success": "skipped",
+                    "response": "",
+                }
                 return tr
 
         # Cache check
-        cached = self._get_cached_result(task)
+        cached = self._get_cached_result(task, task_args)
         if cached is not None:
             if self.verbose:
                 _log(f"  [{idx}/{total}] {task_name} ... cached", dim=True)
@@ -779,8 +1011,12 @@ class Runner:
         # Confirm
         if task_name == target and task.options.confirm:
             if not self._prompt_confirm(task):
-                tr = TaskResult(task_name=task_name, prompt_sent="",
-                                response="[skipped] user declined confirmation", success=True)
+                tr = TaskResult(
+                    task_name=task_name,
+                    prompt_sent="",
+                    response="[skipped] user declined confirmation",
+                    success=True,
+                )
                 result.task_results.append(tr)
                 return tr
 
@@ -796,13 +1032,12 @@ class Runner:
             step_desc = f" ({', '.join(parts)})" if parts else ""
             _log(f"  [{idx}/{total}] {task_name}{step_desc} ...", bold=True)
 
-        task_args = args if task_name == target else None
         t0 = time.monotonic()
         task_result = self._run_task(task, task_args)
         elapsed = time.monotonic() - t0
         result.task_results.append(task_result)
 
-        self._save_cached_result(task, task_result)
+        self._save_cached_result(task, task_result, task_args)
         self._store_artifact(task, task_result)
         artifact_name = task.options.register or task.name
         if artifact_name in self.artifacts:
@@ -815,7 +1050,7 @@ class Runner:
             _log(f"  [{idx}/{total}] {task_name} {status} ({_fmt_elapsed(elapsed)})")
 
         if not task_result.success:
-            self._run_rollback(task, result)
+            self._run_failure_hooks(task, result)
 
         return task_result
 
@@ -848,6 +1083,24 @@ class Runner:
 
     def _run_task(self, task: Task, args: dict[str, str] | None) -> TaskResult:
         """Execute a single task's steps."""
+        self._register_named_secret_values(self._resolved_task_args(task, args))
+        contract_error = self._required_artifact_error(task)
+        if contract_error:
+            return TaskResult(
+                task_name=task.name,
+                prompt_sent="",
+                response=contract_error,
+                success=False,
+                step_results=[
+                    StepResult(
+                        kind="contract",
+                        content="requires",
+                        response=contract_error,
+                        success=False,
+                        exit_code=2,
+                    )
+                ],
+            )
         resolved_steps = self.pf.resolve_steps(
             task.name,
             args,
@@ -864,16 +1117,126 @@ class Runner:
         )
 
         if task.docker:
-            return self._run_docker_task(task, resolved_steps, prompt_sent)
+            result = self._run_docker_task(task, resolved_steps, prompt_sent)
+            return self._apply_output_contract(task, result)
 
         host_group = self.pf.get_hosts_for_task(task.name)
         if host_group:
-            return self._run_on_hosts(task, resolved_steps, prompt_sent, host_group)
+            result = self._run_on_hosts(
+                task,
+                resolved_steps,
+                prompt_sent,
+                host_group,
+            )
+            return self._apply_output_contract(task, result)
 
-        return self._run_local(task, resolved_steps, prompt_sent)
+        result = self._run_local(task, resolved_steps, prompt_sent, args)
+        return self._apply_output_contract(task, result)
+
+    @staticmethod
+    def _value_matches_contract(value: str, expected: str) -> bool:
+        """Return whether a string value satisfies a supported contract type."""
+        if expected == "text":
+            return True
+        if expected == "nonempty":
+            return bool(value.strip())
+        if expected == "integer":
+            try:
+                int(value)
+            except ValueError:
+                return False
+            return True
+        if expected == "number":
+            try:
+                float(value)
+            except ValueError:
+                return False
+            return True
+        if expected == "boolean":
+            return value.strip().lower() in ("true", "false")
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+        if expected == "json":
+            return True
+        if expected == "object":
+            return isinstance(parsed, dict)
+        if expected == "array":
+            return isinstance(parsed, list)
+        return False
+
+    @staticmethod
+    def _split_artifact_contract(contract: str) -> tuple[str, str, str]:
+        """Split ``artifact.field[:type]`` into its components."""
+        possible_reference, separator, suffix = contract.rpartition(":")
+        if separator and "." not in suffix:
+            reference = possible_reference
+            expected = suffix
+        else:
+            reference = contract
+            expected = "nonempty"
+        artifact, dot, field_name = reference.rpartition(".")
+        if not dot or not artifact or not field_name:
+            raise ValueError(
+                f"invalid artifact contract {contract!r}; expected artifact.field[:type]"
+            )
+        return artifact, field_name, expected.lower()
+
+    def _required_artifact_error(self, task: Task) -> str | None:
+        """Return an actionable error for the first unmet input contract."""
+        for contract in task.options.requires:
+            try:
+                artifact, field_name, expected = self._split_artifact_contract(contract)
+            except ValueError as e:
+                return f"artifact contract failed: {e}"
+            if expected not in ARTIFACT_CONTRACT_TYPES:
+                return f"artifact contract failed: unknown type {expected!r} in {contract!r}"
+            if artifact not in self.artifacts:
+                return f"artifact contract failed: {artifact!r} is not available"
+            values = self.artifacts[artifact]
+            if field_name not in values:
+                return (
+                    f"artifact contract failed: field {field_name!r} is not "
+                    f"available on {artifact!r}"
+                )
+            if not self._value_matches_contract(values[field_name], expected):
+                return f"artifact contract failed: {artifact}.{field_name} is not {expected}"
+        return None
+
+    def _apply_output_contract(
+        self,
+        task: Task,
+        result: TaskResult,
+    ) -> TaskResult:
+        """Fail a successful task whose aggregate output has the wrong type."""
+        expected = task.options.produces
+        if (
+            not expected
+            or not result.success
+            or self._value_matches_contract(result.response, expected)
+        ):
+            return result
+        message = f"artifact contract failed: task {task.name!r} output is not {expected}"
+        result.success = False
+        result.response = "\n".join(value for value in (result.response, message) if value)
+        result.step_results.append(
+            StepResult(
+                kind="contract",
+                content=f"produces={expected}",
+                response=message,
+                success=False,
+                exit_code=2,
+            )
+        )
+        return result
 
     def _run_local(
-        self, task: Task, resolved_steps: list[TaskStep], prompt_sent: str
+        self,
+        task: Task,
+        resolved_steps: list[TaskStep],
+        prompt_sent: str,
+        args: dict[str, str] | None,
     ) -> TaskResult:
         """Run steps locally."""
         step_results: list[StepResult] = []
@@ -884,20 +1247,34 @@ class Runner:
         success = True
         dispatcher = self._get_dispatcher(task)
         working_dir = self._resolve_working_dir(task)
+        resolved_task_args = self._resolved_task_args(task, args)
+        positional_args = self._task_positional_args(task, resolved_task_args)
 
         for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
-                sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
+                sr = StepResult(
+                    kind="echo", content=self._redact(step.content), response="", success=True
+                )
             elif step.kind == "shell":
                 if self.verbose:
                     redacted_cmd = self._redact(step.content)
-                    cmd_preview = redacted_cmd if len(redacted_cmd) <= 60 else redacted_cmd[:57] + "..."
+                    cmd_preview = (
+                        redacted_cmd if len(redacted_cmd) <= 60 else redacted_cmd[:57] + "..."
+                    )
                     _log(f"         $ {cmd_preview}", dim=True)
                 if self.dry_run:
-                    sr = StepResult(kind="shell", content=self._redact(step.content), response="", success=True)
+                    sr = StepResult(
+                        kind="shell", content=self._redact(step.content), response="", success=True
+                    )
                 else:
-                    sr = self._run_shell_step(step, task=task, working_dir=working_dir)
+                    sr = self._run_shell_step(
+                        step,
+                        task=task,
+                        working_dir=working_dir,
+                        task_args=resolved_task_args,
+                        positional_args=positional_args,
+                    )
                 self._record_step_context(runtime_context, step, sr, step_index)
                 if step.pipe_output and sr.response:
                     pending_pipe_outputs.append(self._format_pipe_context(step, sr))
@@ -949,7 +1326,9 @@ class Runner:
         for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
-                sr = StepResult(kind="echo", content=self._redact(step.content), response="", success=True)
+                sr = StepResult(
+                    kind="echo", content=self._redact(step.content), response="", success=True
+                )
                 step_results.append(sr)
                 continue
             elif step.kind == "shell":
@@ -957,21 +1336,32 @@ class Runner:
                 # step are attempted; failure stops the next task step.
                 if self.dry_run:
                     for host in effective_group.hosts:
-                        step_results.append(StepResult(
-                            kind="ssh",
-                            content=self._redact(step.content),
-                            response="",
-                            success=True,
-                            host=host,
-                        ))
+                        step_results.append(
+                            StepResult(
+                                kind="ssh",
+                                content=self._redact(step.content),
+                                response="",
+                                success=True,
+                                host=host,
+                            )
+                        )
                 elif task.options.ssh_parallel and len(effective_group.hosts) > 1:
                     if self.verbose:
-                        _log(f"         $ {self._redact(step.content)} (on {len(effective_group.hosts)} hosts in parallel)", dim=True)
+                        _log(
+                            f"         $ {self._redact(step.content)} (on {len(effective_group.hosts)} hosts in parallel)",
+                            dim=True,
+                        )
                     with ThreadPoolExecutor(max_workers=len(effective_group.hosts)) as executor:
                         host_results = list(
                             executor.map(
                                 lambda h, current_step=step: self._run_ssh_step(
-                                    current_step, h, effective_group
+                                    current_step,
+                                    h,
+                                    self._effective_host_group(
+                                        task,
+                                        host_group,
+                                        h,
+                                    ),
                                 ),
                                 effective_group.hosts,
                             )
@@ -981,7 +1371,9 @@ class Runner:
                     combined = StepResult(
                         kind="ssh",
                         content=self._redact(step.content),
-                        response="\n".join(sr.response for sr in host_results if sr.response).strip(),
+                        response="\n".join(
+                            sr.response for sr in host_results if sr.response
+                        ).strip(),
                         success=not any(not sr.success for sr in host_results),
                         exit_code=next((sr.exit_code for sr in host_results if sr.exit_code), 0),
                     )
@@ -995,7 +1387,15 @@ class Runner:
                     for host in effective_group.hosts:
                         if self.verbose:
                             _log(f"         $ {self._redact(step.content)} (on {host})", dim=True)
-                        sr = self._run_ssh_step(step, host, effective_group)
+                        sr = self._run_ssh_step(
+                            step,
+                            host,
+                            self._effective_host_group(
+                                task,
+                                host_group,
+                                host,
+                            ),
+                        )
                         step_results.append(sr)
                         all_responses.append(sr.response)
                         host_step_results.append(sr)
@@ -1005,9 +1405,13 @@ class Runner:
                     combined = StepResult(
                         kind="ssh",
                         content=self._redact(step.content),
-                        response="\n".join(sr.response for sr in host_step_results if sr.response).strip(),
+                        response="\n".join(
+                            sr.response for sr in host_step_results if sr.response
+                        ).strip(),
                         success=not any(not sr.success for sr in host_step_results),
-                        exit_code=next((sr.exit_code for sr in host_step_results if sr.exit_code), 0),
+                        exit_code=next(
+                            (sr.exit_code for sr in host_step_results if sr.exit_code), 0
+                        ),
                     )
                     self._record_step_context(runtime_context, step, combined, step_index)
                     if step.pipe_output and combined.response:
@@ -1036,61 +1440,92 @@ class Runner:
             step_results=step_results,
         )
 
-    def _sandbox_command(self, cmd: str, task: Task) -> str:
+    def _sandbox_command(
+        self,
+        cmd: str,
+        task: Task,
+        working_dir: str | None = None,
+        positional_args: list[str] | None = None,
+    ) -> str:
         """Wrap a shell command with sandbox isolation if configured.
 
         Returns the original command if no sandbox is active.
         """
-        sandbox = task.options.sandbox or self.pf.settings.sandbox
-        if not sandbox or sandbox == "none":
-            return cmd
+        return build_sandbox_command(
+            cmd,
+            task,
+            global_sandbox=self.pf.settings.sandbox,
+            cwd=working_dir,
+            positional_args=positional_args,
+        )
 
-        if sandbox == "docker":
-            image = task.options.sandbox_image or "ubuntu:latest"
-            cwd = os.getcwd()
-            parts = ["docker", "run", "--rm", "-v", f"{cwd}:/workspace", "-w", "/workspace"]
-            if task.options.sandbox_mount:
-                parts.extend(["-v", task.options.sandbox_mount])
-            net = task.options.sandbox_net
-            if net:
-                parts.extend(["--net", net])
-            parts.append(image)
-            parts.extend(["sh", "-c", cmd])
-            return " ".join(shlex.quote(p) for p in parts)
+    def _task_positional_args(
+        self,
+        task: Task,
+        args: dict[str, str] | None,
+    ) -> list[str]:
+        """Return ordered shell positional arguments when the setting is enabled."""
+        enabled = (
+            task.options.positional_arguments
+            if task.options.positional_arguments is not None
+            else self.pf.settings.positional_arguments
+        )
+        if not enabled:
+            return []
+        values = args or {}
+        return [values.get(argument.name, argument.default or "") for argument in task.arguments]
 
-        elif sandbox == "systemd":
-            parts = [
-                "systemd-run", "--scope", "--quiet",
-                "--property=PrivateTmp=yes",
-                "--property=NoNewPrivileges=yes",
-                "--property=ProtectSystem=strict",
-                "sh", "-c", cmd,
-            ]
-            return " ".join(shlex.quote(p) for p in parts)
+    @staticmethod
+    def _resolved_task_args(
+        task: Task,
+        args: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """Fill task argument defaults for shell positional/env behavior."""
+        values = dict(args or {})
+        for argument in task.arguments:
+            if argument.name not in values and argument.default is not None:
+                values[argument.name] = argument.default
+        return values
 
-        elif sandbox == "bwrap":
-            cwd = os.getcwd()
-            parts = [
-                "bwrap",
-                "--ro-bind", "/", "/",
-                "--dev", "/dev",
-                "--tmpfs", "/tmp",
-                "--bind", cwd, cwd,
-                "sh", "-c", cmd,
-            ]
-            return " ".join(shlex.quote(p) for p in parts)
-
-        return cmd
+    def _task_environment(
+        self,
+        task: Task,
+        task_args: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """Resolve explicit task environment values without invoking an LLM."""
+        context = self.pf._build_context(
+            task.name,
+            task_args,
+            promptfile_path=self.promptfile_path,
+        )
+        resolved: dict[str, str] = {}
+        for name, raw_value in task.options.env.items():
+            value = self.pf._interpolate(raw_value, context)
+            value = self.pf._resolve_env_vars(value)
+            value = self.pf._resolve_secrets(
+                value,
+                task,
+                promptfile_path=self.promptfile_path,
+                secret_callback=self._register_secret_value,
+            )
+            resolved[name] = value
+        self._register_named_secret_values(resolved)
+        return resolved
 
     def _run_shell_step(
         self,
         step: TaskStep,
         task: Task | None = None,
         working_dir: str | None = None,
+        task_args: dict[str, str] | None = None,
+        positional_args: list[str] | None = None,
     ) -> StepResult:
         """Execute a shell command locally."""
         shell_exe = self.pf.settings.shell or shutil.which("bash") or "/bin/bash"
         cmd = step.content
+        sandboxed = bool(
+            task and (task.options.sandbox or self.pf.settings.sandbox) not in (None, "none")
+        )
 
         # Strip inline comments if ignore-comments is set
         if self.pf.settings.ignore_comments and "#" in cmd:
@@ -1108,7 +1543,21 @@ class Runner:
 
         # Apply sandbox wrapping if configured
         if task:
-            cmd = self._sandbox_command(cmd, task)
+            try:
+                cmd = self._sandbox_command(
+                    cmd,
+                    task,
+                    working_dir,
+                    positional_args,
+                )
+            except ValueError as e:
+                return StepResult(
+                    kind="shell",
+                    content=self._redact(step.content),
+                    response=f"error: {e}",
+                    success=False,
+                    exit_code=2,
+                )
 
         # Build environment with exported vars + makethlm defaults
         env = dict(os.environ)
@@ -1116,7 +1565,9 @@ class Runner:
         if exported:
             env.update(exported)
         if task and task.options.env:
-            env.update(task.options.env)
+            env.update(self._task_environment(task, task_args))
+        if task and task.options.env_enabled:
+            env.update(task_args or {})
 
         # Inject MAKETHLM_* env vars
         if task:
@@ -1128,16 +1579,85 @@ class Runner:
 
         try:
             timeout = self._shell_timeout(task)
-            proc = _run_subprocess(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=working_dir,
-                executable=shell_exe,
-                env=env,
-            )
+            task_name = task.name if task else "makethlm"
+            shell_args = positional_args or []
+            tempdir = self.pf.settings.tempdir
+            if tempdir:
+                tempdir = os.path.abspath(os.path.expandvars(os.path.expanduser(tempdir)))
+            if step.script:
+                suffix = f".{task.options.extension}" if task and task.options.extension else ".sh"
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    delete=False,
+                    prefix="makethlm-",
+                    suffix=suffix,
+                    dir=tempdir,
+                ) as script_file:
+                    script_file.write(cmd)
+                    script_file.write("\n")
+                    script_path = script_file.name
+                os.chmod(script_path, 0o700)
+                try:
+                    first_line = cmd.splitlines()[0] if cmd.splitlines() else ""
+                    if task and task.options.script_command:
+                        script_cmd: str | list[str] = [
+                            *shlex.split(task.options.script_command),
+                            script_path,
+                            *shell_args,
+                        ]
+                    elif first_line.startswith("#!"):
+                        script_cmd = [script_path, *shell_args]
+                    else:
+                        script_cmd = [shell_exe, script_path, *shell_args]
+                    proc = _run_subprocess(
+                        script_cmd,
+                        shell=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        cwd=working_dir,
+                        env=env,
+                    )
+                finally:
+                    try:
+                        os.unlink(script_path)
+                    except OSError:
+                        pass
+            elif sandboxed:
+                proc = _run_subprocess(
+                    shlex.split(cmd),
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=working_dir,
+                    env=env,
+                )
+            elif self.pf.settings.shell_argv:
+                proc = _run_subprocess(
+                    [
+                        *self.pf.settings.shell_argv,
+                        cmd,
+                        task_name,
+                        *shell_args,
+                    ],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=working_dir,
+                    env=env,
+                )
+            else:
+                proc = _run_subprocess(
+                    [shell_exe, "-c", cmd, task_name, *shell_args],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=working_dir,
+                    env=env,
+                )
             output = proc.stdout
             if proc.stderr:
                 output += proc.stderr
@@ -1158,40 +1678,34 @@ class Runner:
                 success=step.ignore_error,
                 exit_code=124,
             )
+        except OSError as e:
+            return StepResult(
+                kind="shell",
+                content=self._redact(step.content),
+                response=f"error: could not execute command: {e}",
+                success=step.ignore_error,
+                exit_code=1,
+            )
 
     def _run_ssh_step(self, step: TaskStep, host: str, group: HostGroup) -> StepResult:
         """Execute a shell command on a remote host via SSH."""
-        ssh_cmd = _build_ssh_command(host, step.content, group)
-        timeout = parse_duration_seconds(group.timeout) if group.timeout else 120
-        try:
-            proc = _run_subprocess(
-                ssh_cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            output = proc.stdout
-            if proc.stderr:
-                output += proc.stderr
-            ok = proc.returncode == 0 or step.ignore_error
-            return StepResult(
-                kind="ssh",
-                content=self._redact(step.content),
-                response=self._redact(output.strip()) if not step.silent else "",
-                success=ok,
-                host=host,
-                exit_code=proc.returncode,
-            )
-        except subprocess.TimeoutExpired:
-            return StepResult(
-                kind="ssh",
-                content=self._redact(step.content),
-                response=f"error: SSH to {host} timed out after {_fmt_elapsed(timeout)}",
-                success=step.ignore_error,
-                host=host,
-                exit_code=124,
-            )
+        result = run_ssh_command(
+            host,
+            step.content,
+            group,
+            ignore_error=step.ignore_error,
+            silent=step.silent,
+            build_command=_build_ssh_command,
+            run_process=_run_subprocess,
+        )
+        return StepResult(
+            kind="ssh",
+            content=self._redact(step.content),
+            response=self._redact(result.response),
+            success=result.success,
+            host=host,
+            exit_code=result.exit_code,
+        )
 
     def _run_prompt_step(
         self,
@@ -1207,12 +1721,57 @@ class Runner:
             prompt = self.pf._interpolate(prompt, runtime_context)
         if pipe_context:
             prompt = f"{pipe_context}\n\n{prompt}"
-        dr = dispatcher.dispatch(prompt, task)
+        primary_name = (
+            self.pf.get_agent_for_task(task.name).llm
+            if self.pf.get_agent_for_task(task.name) and self.pf.get_agent_for_task(task.name).llm
+            else task.options.llm or self.pf.default_llm
+        )
+        primary_label = primary_name or type(dispatcher).__name__
+        candidates: list[tuple[str, Dispatcher]] = [(primary_label, dispatcher)]
+        seen_providers = {primary_label}
+        for provider_name in task.options.fallback_llms:
+            provider = self.pf.llm_providers.get(provider_name)
+            if (
+                provider
+                and provider_name not in seen_providers
+                and len(candidates) <= MAX_FALLBACK_LLMS
+            ):
+                candidates.append((provider_name, _dispatcher_for_provider(provider)))
+                seen_providers.add(provider_name)
+
+        last_response = ""
+        total_attempt = 0
+        last_provider: str | None = None
+        for provider_name, candidate in candidates:
+            retries = min(max(task.options.retries, 0), MAX_LLM_RETRIES)
+            for provider_attempt in range(1, retries + 2):
+                total_attempt += 1
+                last_provider = provider_name
+                if self.verbose and total_attempt > 1:
+                    _log(
+                        f"         retrying prompt with {provider_name} "
+                        f"(attempt {provider_attempt})",
+                        dim=True,
+                    )
+                dispatch_result = candidate.dispatch(prompt, task)
+                last_response = dispatch_result.response
+                if dispatch_result.success:
+                    return StepResult(
+                        kind="prompt",
+                        content=self._redact(prompt),
+                        response=self._redact(last_response),
+                        success=True,
+                        provider=provider_name,
+                        attempt=total_attempt,
+                    )
+
         return StepResult(
             kind="prompt",
             content=self._redact(prompt),
-            response=self._redact(dr.response),
-            success=dr.success,
+            response=self._redact(last_response),
+            success=False,
+            provider=last_provider,
+            attempt=total_attempt,
         )
 
     def _run_docker_task(
@@ -1223,29 +1782,35 @@ class Runner:
     ) -> TaskResult:
         """Handle a docker block: generate Dockerfile via LLM, then build."""
         docker = task.docker
-        assert docker is not None
+        if docker is None:
+            raise ValueError(f"task {task.name!r} is not a docker task")
         step_results: list[StepResult] = []
         dispatcher = self._get_dispatcher(task)
 
-        description = "\n".join(s.content for s in resolved_steps if s.kind == "prompt")
-        generate_prompt = _DOCKER_GENERATE_PREFIX + description
+        generate_prompt = docker_generate_prompt(resolved_steps)
 
         if self.verbose:
             _log("         > generating Dockerfile via LLM ...", dim=True)
         if self.dry_run:
-            step_results.append(StepResult(
-                kind="docker-generate",
-                content=self._redact(generate_prompt),
-                response="[dry-run] generate Dockerfile",
-                success=True,
-            ))
-            build_cmd = f"docker build -t {task.name}:{docker.tag} -f {os.path.join(docker.context, docker.file)} {docker.context}"
-            step_results.append(StepResult(
-                kind="docker-build",
-                content=build_cmd,
-                response="[dry-run] build Docker image",
-                success=True,
-            ))
+            step_results.append(
+                StepResult(
+                    kind="docker-generate",
+                    content=self._redact(generate_prompt),
+                    response="[dry-run] generate Dockerfile",
+                    success=True,
+                )
+            )
+            build_cmd = docker_dry_run_build_command(
+                task.name, docker.tag, docker.context, docker.file
+            )
+            step_results.append(
+                StepResult(
+                    kind="docker-build",
+                    content=build_cmd,
+                    response="[dry-run] build Docker image",
+                    success=True,
+                )
+            )
             return TaskResult(
                 task_name=task.name,
                 prompt_sent=self._redact(prompt_sent),
@@ -1255,12 +1820,14 @@ class Runner:
             )
 
         dr = dispatcher.dispatch(generate_prompt, task)
-        step_results.append(StepResult(
-            kind="docker-generate",
-            content=self._redact(generate_prompt),
-            response=self._redact(dr.response),
-            success=dr.success,
-        ))
+        step_results.append(
+            StepResult(
+                kind="docker-generate",
+                content=self._redact(generate_prompt),
+                response=self._redact(dr.response),
+                success=dr.success,
+            )
+        )
 
         if not dr.success:
             return TaskResult(
@@ -1271,27 +1838,39 @@ class Runner:
                 step_results=step_results,
             )
 
-        dockerfile_path = os.path.join(docker.context, docker.file)
-        dockerfile_content = dr.response.strip()
-        if dockerfile_content.startswith("```"):
-            lines = dockerfile_content.split("\n")
-            if lines[-1].strip() == "```":
-                lines = lines[1:-1]
-            else:
-                lines = lines[1:]
-            dockerfile_content = "\n".join(lines)
+        try:
+            context_path, dockerfile_path = _resolve_dockerfile_path(docker.context, docker.file)
+        except ValueError as e:
+            step_results.append(
+                StepResult(
+                    kind="docker-build",
+                    content=f"write {docker.file}",
+                    response=f"error writing Dockerfile: {e}",
+                    success=False,
+                )
+            )
+            return TaskResult(
+                task_name=task.name,
+                prompt_sent=self._redact(prompt_sent),
+                response=f"error writing Dockerfile: {e}",
+                success=False,
+                step_results=step_results,
+            )
+        dockerfile_content = strip_dockerfile_markdown_fence(dr.response)
 
         try:
-            os.makedirs(os.path.dirname(dockerfile_path) or ".", exist_ok=True)
+            os.makedirs(dockerfile_path.parent, exist_ok=True)
             with open(dockerfile_path, "w") as f:
                 f.write(dockerfile_content + "\n")
         except OSError as e:
-            step_results.append(StepResult(
-                kind="docker-build",
-                content=f"write {dockerfile_path}",
-                response=f"error writing Dockerfile: {e}",
-                success=False,
-            ))
+            step_results.append(
+                StepResult(
+                    kind="docker-build",
+                    content=f"write {dockerfile_path}",
+                    response=f"error writing Dockerfile: {e}",
+                    success=False,
+                )
+            )
             return TaskResult(
                 task_name=task.name,
                 prompt_sent=self._redact(prompt_sent),
@@ -1300,11 +1879,19 @@ class Runner:
                 step_results=step_results,
             )
 
-        tag = f"{task.name}:{docker.tag}"
-        build_cmd = f"docker build -t {tag} -f {dockerfile_path} {docker.context}"
-        build_step = TaskStep(kind="shell", content=build_cmd)
-        build_result = self._run_shell_step(build_step, task=task)
-        build_result.kind = "docker-build"
+        build_cmd = docker_build_argv(task.name, docker.tag, dockerfile_path, context_path)
+        build_execution = run_docker_build(
+            build_cmd,
+            self._shell_timeout(task),
+            run_process=_run_subprocess,
+        )
+        build_result = StepResult(
+            kind="docker-build",
+            content=self._redact(format_docker_build_command(build_cmd)),
+            response=self._redact(build_execution.response),
+            success=build_execution.success,
+            exit_code=build_execution.exit_code,
+        )
         step_results.append(build_result)
 
         all_responses = [sr.response for sr in step_results if sr.response]
@@ -1345,80 +1932,13 @@ class Runner:
 
     def _fire_webhook(self, task: Task, task_result: TaskResult, elapsed: float) -> None:
         """Send a webhook notification if configured."""
-        webhook_url = task.options.webhook
-        if not webhook_url:
-            return
-
-        status = "success" if task_result.success else "failure"
-        webhook_on = task.options.webhook_on
-
-        if webhook_on == "success" and not task_result.success:
-            return
-        if webhook_on == "failure" and task_result.success:
-            return
-
-        payload = {
-            "task": task.name,
-            "status": status,
-            "exit_code": 0 if task_result.success else 1,
-            "stdout": self._redact(task_result.response)[:4096],  # limit size
-            "duration_ms": int(elapsed * 1000),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        try:
-            preset = None
-            url = webhook_url
-            if ":" in webhook_url:
-                maybe_preset, maybe_url = webhook_url.split(":", 1)
-                if maybe_preset in ("ntfy", "gotify", "discord", "slack") and maybe_url.startswith(("http://", "https://")):
-                    preset = maybe_preset
-                    url = maybe_url
-
-            if preset == "ntfy":
-                body = f"{task.name}: {status}\n{payload['stdout']}".encode()
-                req = urllib.request.Request(
-                    url,
-                    data=body,
-                    headers={
-                        "Title": f"makethlm {task.name}",
-                        "Tags": "white_check_mark" if task_result.success else "warning",
-                    },
-                    method="POST",
-                )
-            elif preset == "gotify":
-                data = json.dumps({
-                    "title": f"makethlm {task.name}: {status}",
-                    "message": payload["stdout"],
-                    "priority": 5 if task_result.success else 8,
-                }).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            elif preset in ("discord", "slack"):
-                data = json.dumps({
-                    "content" if preset == "discord" else "text": (
-                        f"makethlm `{task.name}` {status}\n{payload['stdout']}"
-                    )
-                }).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            else:
-                data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-            urllib.request.urlopen(req, timeout=10)
-        except (urllib.error.URLError, OSError) as e:
-            if self.verbose:
-                _log(f"         webhook failed: {e}", dim=True)
+        error = send_webhook(
+            task,
+            task_result,
+            elapsed,
+            redact=self._redact,
+            request_factory=urllib.request.Request,
+            urlopen=urllib.request.urlopen,
+        )
+        if error and self.verbose:
+            _log(f"         webhook failed: {error}", dim=True)

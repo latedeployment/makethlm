@@ -1,0 +1,15 @@
+name: makethlm
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: docker
+    container:
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: uv sync
+      - run: uv run makethlm -f examples/forgejo-actions/Promptfile check

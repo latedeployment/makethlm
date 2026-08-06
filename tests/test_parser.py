@@ -11,6 +11,7 @@ from makethlm.parser import ParseError, parse
 # Basic parsing
 # ---------------------------------------------------------------------------
 
+
 class TestBasicParsing:
     def test_single_task(self):
         src = """\
@@ -19,7 +20,10 @@ task build:
 """
         pf = parse(src)
         assert "build" in pf.tasks
-        assert pf.tasks["build"].prompt == "check if moo.md is newer, if so, build the docker from scratch"
+        assert (
+            pf.tasks["build"].prompt
+            == "check if moo.md is newer, if so, build the docker from scratch"
+        )
         assert pf.tasks["build"].dependencies == []
 
     def test_multiline_prompt(self):
@@ -153,10 +157,59 @@ _helper:
         pf = parse(src)
         assert pf.tasks["_helper"].options.private is True
 
+    def test_bare_recipe_shebang_script(self):
+        src = """\
+script:
+    #!/usr/bin/env python3
+    print("hello")
+"""
+        pf = parse(src)
+        step = pf.tasks["script"].steps[0]
+        assert step.script is True
+        assert "python3" in step.content
+
+    def test_subsequent_dependencies(self):
+        src = """\
+build: setup && notify
+    echo build
+
+setup:
+    echo setup
+
+notify:
+    echo notify
+"""
+        pf = parse(src)
+        assert pf.tasks["build"].dependencies == ["setup"]
+        assert pf.tasks["build"].subsequent_dependencies == ["notify"]
+
+    def test_shell_array_setting(self):
+        src = """\
+set shell := ["bash", "-cu"]
+
+build:
+    echo build
+"""
+        pf = parse(src)
+        assert pf.settings.shell_argv == ["bash", "-cu"]
+
+    def test_script_attribute(self):
+        src = """\
+build [script("python3"), extension("py")]:
+    print("build")
+"""
+        pf = parse(src)
+        task = pf.tasks["build"]
+        assert task.options.script is True
+        assert task.options.script_command == "python3"
+        assert task.options.extension == "py"
+        assert task.steps[0].script is True
+
 
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
+
 
 class TestVariables:
     def test_variable_definition(self):
@@ -181,12 +234,12 @@ task deploy:
         assert pf.resolve_prompt("deploy") == "deploy myapp to staging"
 
     def test_escaped_quotes_in_variable(self):
-        src = r'''
+        src = r"""
 name := "hello \"world\""
 
 task greet:
     say {{name}}
-'''
+"""
         pf = parse(src)
         assert pf.variables["name"] == 'hello "world"'
 
@@ -206,6 +259,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
+
 
 class TestDependencies:
     def test_single_dependency(self):
@@ -245,6 +299,7 @@ task deploy: nonexistent:
 # ---------------------------------------------------------------------------
 # Task options
 # ---------------------------------------------------------------------------
+
 
 class TestTaskOptions:
     def test_model_option(self):
@@ -307,6 +362,7 @@ task bad [temperature=hot]:
 # Comments and whitespace
 # ---------------------------------------------------------------------------
 
+
 class TestCommentsAndWhitespace:
     def test_comments_are_ignored(self):
         src = """\
@@ -345,6 +401,7 @@ task complex:
 # ---------------------------------------------------------------------------
 # Error cases
 # ---------------------------------------------------------------------------
+
 
 class TestErrors:
     def test_duplicate_task(self):
@@ -385,6 +442,7 @@ task second:
 # ---------------------------------------------------------------------------
 # Shell commands with !
 # ---------------------------------------------------------------------------
+
 
 class TestShellCommands:
     def test_single_shell_command(self):
@@ -603,6 +661,7 @@ task analyze:
 # Functions
 # ---------------------------------------------------------------------------
 
+
 class TestFunctions:
     def test_basic_function(self):
         src = """\
@@ -694,6 +753,7 @@ task review:
 # Task arguments
 # ---------------------------------------------------------------------------
 
+
 class TestTaskArguments:
     def test_single_required_arg(self):
         src = """\
@@ -779,6 +839,7 @@ task deploy(env, region="us-east"): build [model=haiku]:
 # ---------------------------------------------------------------------------
 # Docker blocks
 # ---------------------------------------------------------------------------
+
 
 class TestDockerBlocks:
     def test_basic_docker(self):
@@ -866,6 +927,7 @@ docker myapp:
 # Include directive
 # ---------------------------------------------------------------------------
 
+
 class TestIncludes:
     def test_include_basic(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -920,6 +982,36 @@ task build:
         pf = parse(src)
         assert "build" in pf.tasks
 
+    def test_mod_prefixes_tasks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module = os.path.join(tmpdir, "ops.pf")
+            with open(module, "w") as f:
+                f.write("""\
+task deploy:
+    deploy module
+""")
+
+            pf = parse('mod ops "ops.pf"\n', filename=os.path.join(tmpdir, "Promptfile"))
+
+            assert "ops::deploy" in pf.tasks
+            assert pf.tasks["ops::deploy"].name == "ops::deploy"
+
+    def test_mod_prefixes_aliases(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module = os.path.join(tmpdir, "ops.pf")
+            with open(module, "w") as f:
+                f.write("""\
+task deploy:
+    deploy module
+
+alias d := deploy
+""")
+
+            pf = parse('mod ops "ops.pf"\n', filename=os.path.join(tmpdir, "Promptfile"))
+
+            assert pf.aliases["ops::d"] == "ops::deploy"
+            assert pf.resolve_alias("ops::d") == "ops::deploy"
+
     def test_circular_include_raises(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             a = os.path.join(tmpdir, "a.pf")
@@ -949,6 +1041,7 @@ task build:
 # ---------------------------------------------------------------------------
 # Environment variables
 # ---------------------------------------------------------------------------
+
 
 class TestEnvVars:
     def test_env_var_in_prompt(self):
@@ -992,6 +1085,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Full integration-style parse
 # ---------------------------------------------------------------------------
+
 
 class TestIntegration:
     def test_realistic_promptfile(self):
@@ -1081,6 +1175,7 @@ docker api [tag=v1]:
 # ---------------------------------------------------------------------------
 # LLM providers
 # ---------------------------------------------------------------------------
+
 
 class TestLLMProviders:
     def test_basic_llm_declaration(self):
@@ -1172,6 +1267,7 @@ task build:
 # ---------------------------------------------------------------------------
 # Host groups
 # ---------------------------------------------------------------------------
+
 
 class TestHostGroups:
     def test_basic_host_group(self):
@@ -1293,6 +1389,7 @@ task check [on=cluster]:
 # Full integration with all features
 # ---------------------------------------------------------------------------
 
+
 class TestFullIntegration:
     def test_everything_together(self):
         src = """\
@@ -1360,6 +1457,7 @@ docker api-image [tag=v2]:
 # ---------------------------------------------------------------------------
 # Set directives
 # ---------------------------------------------------------------------------
+
 
 class TestSetDirectives:
     def test_set_dotenv_load(self):
@@ -1453,6 +1551,7 @@ task build:
 # Aliases
 # ---------------------------------------------------------------------------
 
+
 class TestAliases:
     def test_basic_alias(self):
         src = """\
@@ -1525,6 +1624,7 @@ alias x = build
 # Backtick variables
 # ---------------------------------------------------------------------------
 
+
 class TestBacktickVariables:
     def test_backtick_variable(self):
         src = """\
@@ -1564,6 +1664,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Private, group, doc, confirm, os options
 # ---------------------------------------------------------------------------
+
 
 class TestNewTaskOptions:
     def test_private_option_bare(self):
@@ -1739,9 +1840,11 @@ task secret [private, model=haiku]:
 # OS filter — should_skip_for_os
 # ---------------------------------------------------------------------------
 
+
 class TestOsFilter:
     def test_no_filter_never_skips(self):
         from makethlm.models import TaskOptions
+
         opts = TaskOptions()
         assert opts.should_skip_for_os() is False
 
@@ -1749,6 +1852,7 @@ class TestOsFilter:
         import platform
 
         from makethlm.models import TaskOptions
+
         current = platform.system().lower()
         # Map back to our naming
         reverse_map = {"linux": "linux", "darwin": "macos", "windows": "windows"}
@@ -1758,6 +1862,7 @@ class TestOsFilter:
 
     def test_non_matching_os_skips(self):
         from makethlm.models import TaskOptions
+
         # Use a platform that definitely won't match
         opts = TaskOptions(os_filter="freebsd")
         assert opts.should_skip_for_os() is True
@@ -1767,9 +1872,11 @@ class TestOsFilter:
 # TaskOptions merge
 # ---------------------------------------------------------------------------
 
+
 class TestTaskOptionsMerge:
     def test_merge_basic(self):
         from makethlm.models import TaskOptions
+
         base = TaskOptions(model="base-model", group="ci")
         override = TaskOptions(model="new-model")
         merged = base.merge(override)
@@ -1778,6 +1885,7 @@ class TestTaskOptionsMerge:
 
     def test_merge_private(self):
         from makethlm.models import TaskOptions
+
         base = TaskOptions(private=False)
         override = TaskOptions(private=True)
         merged = base.merge(override)
@@ -1785,6 +1893,7 @@ class TestTaskOptionsMerge:
 
     def test_merge_confirm(self):
         from makethlm.models import TaskOptions
+
         base = TaskOptions(confirm=False)
         override = TaskOptions(confirm="Are you sure?")
         merged = base.merge(override)
@@ -1794,6 +1903,7 @@ class TestTaskOptionsMerge:
 # ---------------------------------------------------------------------------
 # Extended set directives (Justfile-compatible)
 # ---------------------------------------------------------------------------
+
 
 class TestExtendedSetDirectives:
     def test_set_export(self):
@@ -2022,6 +2132,7 @@ task build:
 # Export variables
 # ---------------------------------------------------------------------------
 
+
 class TestExportVariables:
     def test_export_variable(self):
         pf = parse("""\
@@ -2073,6 +2184,7 @@ task build:
 # String concatenation
 # ---------------------------------------------------------------------------
 
+
 class TestStringConcatenation:
     def test_concat_quoted_strings(self):
         pf = parse("""\
@@ -2097,6 +2209,7 @@ task show:
 # ---------------------------------------------------------------------------
 # If/else expressions
 # ---------------------------------------------------------------------------
+
 
 class TestIfElseExpressions:
     def test_if_else_in_variable(self):
@@ -2144,9 +2257,11 @@ task show:
 # Built-in functions
 # ---------------------------------------------------------------------------
 
+
 class TestBuiltinFunctions:
     def test_os_function(self):
         import platform
+
         pf = parse("""\
 task show:
     running on {{os()}}
@@ -2159,6 +2274,7 @@ task show:
 
     def test_arch_function(self):
         import platform
+
         pf = parse("""\
 task show:
     arch is {{arch()}}
@@ -2168,6 +2284,7 @@ task show:
 
     def test_num_cpus_function(self):
         import os
+
         pf = parse("""\
 task show:
     cpus: {{num_cpus()}}
@@ -2187,6 +2304,7 @@ task show:
 # ---------------------------------------------------------------------------
 # String functions
 # ---------------------------------------------------------------------------
+
 
 class TestStringFunctions:
     def test_uppercase(self):
@@ -2431,6 +2549,7 @@ task show:
 # Bash-style parameter expansion
 # ---------------------------------------------------------------------------
 
+
 class TestParameterExpansion:
     def test_hash_shortest_prefix(self):
         pf = parse("""\
@@ -2490,6 +2609,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Version functions and v"..." syntax
 # ---------------------------------------------------------------------------
+
 
 class TestVersionFunctions:
     def test_version_literal(self):
@@ -2629,6 +2749,7 @@ task show:
 # Default environment variables (makethlm_task, makethlm_file, makethlm_dir)
 # ---------------------------------------------------------------------------
 
+
 class TestDefaultEnvVars:
     def test_makethlm_task_variable(self):
         pf = parse("""\
@@ -2678,6 +2799,7 @@ task build:
 # Variadic arguments
 # ---------------------------------------------------------------------------
 
+
 class TestVariadicArguments:
     def test_plus_variadic(self):
         pf = parse("""\
@@ -2710,6 +2832,7 @@ task deploy(target, +files):
 # Bare OS attributes
 # ---------------------------------------------------------------------------
 
+
 class TestBareOsAttributes:
     def test_linux_attribute(self):
         pf = parse("""\
@@ -2736,6 +2859,7 @@ task build [unix]:
         import platform
 
         from makethlm.models import TaskOptions
+
         opts = TaskOptions(os_filter="unix")
         if platform.system().lower() in ("linux", "darwin"):
             assert opts.should_skip_for_os() is False
@@ -2746,6 +2870,7 @@ task build [unix]:
 # ---------------------------------------------------------------------------
 # no-cd, no-exit-message, no-quiet attributes
 # ---------------------------------------------------------------------------
+
 
 class TestNewAttributes:
     def test_no_cd(self):
@@ -2781,6 +2906,7 @@ task build [positional-arguments]:
 # Underscore private convention
 # ---------------------------------------------------------------------------
 
+
 class TestUnderscorePrivate:
     def test_underscore_prefix_is_private(self):
         pf = parse("""\
@@ -2797,6 +2923,7 @@ task build:
 # ---------------------------------------------------------------------------
 # Line continuation
 # ---------------------------------------------------------------------------
+
 
 class TestLineContinuation:
     def test_backslash_continuation(self):
@@ -2822,6 +2949,7 @@ task show:
 # Single-quoted strings
 # ---------------------------------------------------------------------------
 
+
 class TestSingleQuotedStrings:
     def test_single_quoted_variable(self):
         pf = parse("""\
@@ -2836,6 +2964,7 @@ task show:
 # ---------------------------------------------------------------------------
 # Quiet prefix
 # ---------------------------------------------------------------------------
+
 
 class TestQuietPrefix:
     def test_at_quiet_prefix(self):
@@ -2856,6 +2985,7 @@ task build:
 # Agents
 # ---------------------------------------------------------------------------
 
+
 class TestAgents:
     def test_basic_agent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2871,7 +3001,10 @@ task audit [agent=security]:
 """
             pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
             assert "security" in pf.agents
-            assert pf.agents["security"].instructions == "You are a security expert.\nFocus on vulnerabilities."
+            assert (
+                pf.agents["security"].instructions
+                == "You are a security expert.\nFocus on vulnerabilities."
+            )
             assert pf.tasks["audit"].options.agent == "security"
 
     def test_agent_with_llm_and_model(self):
@@ -3031,6 +3164,7 @@ task t [agent=myagent]:
 # Ansible Inventory directive
 # ---------------------------------------------------------------------------
 
+
 class TestInventoryDirective:
     def test_basic_inventory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3062,8 +3196,9 @@ task backup [on=databases]:
 """
             pf = parse(main_src, filename=os.path.join(tmpdir, "Promptfile"))
             grp = pf.host_groups["databases"]
-            assert grp.user == "postgres"
-            assert grp.port == 5432
+            connection = grp.connections["db1.example.com"]
+            assert connection.user == "postgres"
+            assert connection.port == 5432
 
     def test_inventory_file_not_found(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3149,6 +3284,7 @@ task deploy_db [on=databases]:
 # ---------------------------------------------------------------------------
 # Guidance directive
 # ---------------------------------------------------------------------------
+
 
 class TestGuidance:
     def test_inline_guidance(self):
@@ -3302,6 +3438,7 @@ task build:
 # Sandbox options
 # ---------------------------------------------------------------------------
 
+
 class TestSandboxOptions:
     def test_sandbox_docker_option(self):
         pf = parse("""\
@@ -3360,6 +3497,20 @@ task build [sandbox=docker, sandbox-net=host]:
 """)
         assert pf.tasks["build"].options.sandbox_net == "host"
 
+    def test_invalid_sandbox_network_is_rejected(self):
+        with pytest.raises(ParseError, match="sandbox_net must be"):
+            parse("""\
+task build [sandbox=docker, sandbox-net=noen]:
+    !make all
+""")
+
+    def test_sandbox_read_only(self):
+        pf = parse("""\
+task build [sandbox=docker, sandbox-read-only]:
+    !make all
+""")
+        assert pf.tasks["build"].options.sandbox_read_only is True
+
     def test_set_sandbox_global(self):
         pf = parse("""\
 set sandbox docker
@@ -3371,12 +3522,13 @@ task build:
 
     def test_sandbox_underscore_forms(self):
         pf = parse("""\
-task build [sandbox=docker, sandbox_image=python:3.11, sandbox_mount=./src:/app, sandbox_net=none]:
+task build [sandbox=docker, sandbox_image=python:3.11, sandbox_mount=./src:/app, sandbox_net=none, sandbox_read_only]:
     !python build.py
 """)
         assert pf.tasks["build"].options.sandbox_image == "python:3.11"
         assert pf.tasks["build"].options.sandbox_mount == "./src:/app"
         assert pf.tasks["build"].options.sandbox_net == "none"
+        assert pf.tasks["build"].options.sandbox_read_only is True
 
 
 class TestExamplesCompile:
@@ -3448,3 +3600,183 @@ class TestExamplesCompile:
                 source = f.read()
             pf = parse(source, filename=pf_path)
             assert len(pf.tasks) > 0, f"{pf_path} parsed but has no tasks"
+
+
+class TestParserHardening:
+    def test_quoted_plus_is_literal(self):
+        pf = parse("""\
+url := "https://example.test/search?q=a+b"
+
+task show:
+    {{url}}
+""")
+        assert pf.variables["url"] == "https://example.test/search?q=a+b"
+
+    def test_failed_backtick_is_parse_error(self):
+        with pytest.raises(ParseError, match="status 7"):
+            parse("""\
+value := `exit 7`
+
+task show:
+    {{value}}
+""")
+
+    def test_failed_backtick_in_set_is_not_downgraded_to_literal(self):
+        with pytest.raises(ParseError, match="status 9"):
+            parse("""\
+set working-dir `exit 9`
+
+task show:
+    !pwd
+""")
+
+    def test_duplicate_variables_require_opt_in(self):
+        with pytest.raises(ParseError, match="duplicate variable"):
+            parse("""\
+value := "one"
+value := "two"
+
+task show:
+    {{value}}
+""")
+
+        pf = parse("""\
+set allow-duplicate-variables
+value := "one"
+value := "two"
+
+task show:
+    {{value}}
+""")
+        assert pf.variables["value"] == "two"
+
+    def test_diamond_includes_are_not_reported_as_cycles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            common = os.path.join(tmpdir, "common.pf")
+            left = os.path.join(tmpdir, "left.pf")
+            right = os.path.join(tmpdir, "right.pf")
+            with open(common, "w") as f:
+                f.write("task common:\n    shared\n")
+            with open(left, "w") as f:
+                f.write('include "common.pf"\n')
+            with open(right, "w") as f:
+                f.write('include "common.pf"\n')
+
+            pf = parse(
+                'include "left.pf"\ninclude "right.pf"\n',
+                filename=os.path.join(tmpdir, "Promptfile"),
+            )
+
+        assert list(pf.tasks) == ["common"]
+
+    def test_module_resources_remain_namespaced_and_resolve(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module_path = os.path.join(tmpdir, "ops.pf")
+            with open(module_path, "w") as f:
+                f.write("""\
+service := "payments"
+llm openai [model=gpt-test]
+hosts web [user=deploy]:
+    web.example.test
+fn checklist:
+    inspect {{service}}
+guidance:
+    Follow module policy.
+task undo:
+    !echo undo
+task deploy [llm=openai, on=web, rollback=undo]:
+    @use checklist
+""")
+
+            pf = parse(
+                'service := "local"\nmod ops "ops.pf"\n',
+                filename=os.path.join(tmpdir, "Promptfile"),
+            )
+
+        task = pf.tasks["ops::deploy"]
+        assert task.options.llm == "ops::openai"
+        assert task.options.on == "ops::web"
+        assert task.options.rollback == "ops::undo"
+        assert "ops::checklist" in pf.functions
+        assert "ops::openai" in pf.llm_providers
+        assert "ops::web" in pf.host_groups
+        resolved = pf.resolve_steps("ops::deploy")
+        assert resolved[0].content == ("Follow module policy.\n\ninspect payments")
+
+
+class TestWorkflowOptions:
+    def test_postmortem_contracts_and_provider_strategy(self):
+        pf = parse("""\
+llm primary [template="primary {prompt}"]
+llm backup [template="backup {prompt}"]
+
+task diagnose:
+    diagnose
+
+task build [postmortem=diagnose, fallback-llm=backup, retries=2, requires="seed.stdout:json", produces=object]:
+    build
+""")
+        options = pf.tasks["build"].options
+        assert options.postmortem == "diagnose"
+        assert options.fallback_llms == ["backup"]
+        assert options.retries == 2
+        assert options.requires == ["seed.stdout:json"]
+        assert options.produces == "object"
+
+    def test_unknown_fallback_provider_is_rejected(self):
+        with pytest.raises(ParseError, match="unknown fallback LLM"):
+            parse("""\
+task review [fallback-llm=missing]:
+    review
+""")
+
+    def test_invalid_retry_count_is_rejected(self):
+        with pytest.raises(ParseError, match="between 0 and 10"):
+            parse("""\
+task review [retries=99]:
+            review
+""")
+
+    def test_fallback_providers_are_deduplicated(self):
+        pf = parse("""\
+llm backup [template="backup {prompt}"]
+
+task review [fallback-llm="backup|backup"]:
+    review
+""")
+
+        assert pf.tasks["review"].options.fallback_llms == ["backup"]
+
+    def test_too_many_fallback_providers_are_rejected(self):
+        with pytest.raises(ParseError, match="at most 4"):
+            parse("""\
+llm one [template="one {prompt}"]
+llm two [template="two {prompt}"]
+llm three [template="three {prompt}"]
+llm four [template="four {prompt}"]
+llm five [template="five {prompt}"]
+
+task review [fallback-llm="one|two|three|four|five"]:
+    review
+""")
+
+    @pytest.mark.parametrize("value", ["0", "1000001"])
+    def test_invalid_max_tokens_is_rejected(self, value):
+        with pytest.raises(ParseError, match="max_tokens must be between"):
+            parse(f"""\
+task review [max_tokens={value}]:
+    review
+""")
+
+    def test_invalid_artifact_contract_is_rejected(self):
+        with pytest.raises(ParseError, match="artifact.field"):
+            parse("""\
+task publish [requires=missing]:
+    publish
+""")
+
+        with pytest.raises(ParseError, match="unknown artifact contract type"):
+            parse("""\
+task publish [requires=build.stdout:yaml]:
+    publish
+""")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import urllib.error
@@ -92,7 +93,9 @@ class ClaudeDispatcher(Dispatcher):
         if model:
             cmd.extend(["--model", model])
         # Name the subagent so it's identifiable as spawned by makethlm
-        system_prompt = f"[makethlm-{task.name}] You are a makethlm sub-agent executing task '{task.name}'."
+        system_prompt = (
+            f"[makethlm-{task.name}] You are a makethlm sub-agent executing task '{task.name}'."
+        )
         cmd.extend(["--system-prompt", system_prompt])
 
         try:
@@ -134,10 +137,13 @@ class CodexDispatcher(Dispatcher):
         model = task.options.model or self.default_model
         cmd = [
             "codex",
-            "--ask-for-approval", "never",
+            "--ask-for-approval",
+            "never",
             "exec",
-            "--sandbox", self.sandbox,
-            "--color", "never",
+            "--sandbox",
+            self.sandbox,
+            "--color",
+            "never",
         ]
         if model:
             cmd.extend(["--model", model])
@@ -222,7 +228,9 @@ class OpenAIDispatcher(Dispatcher):
             return DispatchResult(response=content, success=bool(content))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            return DispatchResult(response=f"error: OpenAI API returned {e.code}: {detail}", success=False)
+            return DispatchResult(
+                response=f"error: OpenAI API returned {e.code}: {detail}", success=False
+            )
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             return DispatchResult(response=f"error: OpenAI API request failed: {e}", success=False)
 
@@ -250,7 +258,9 @@ class OllamaDispatcher(Dispatcher):
             return DispatchResult(response=content, success=not data.get("error") and bool(content))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
-            return DispatchResult(response=f"error: Ollama returned {e.code}: {detail}", success=False)
+            return DispatchResult(
+                response=f"error: Ollama returned {e.code}: {detail}", success=False
+            )
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             return DispatchResult(response=f"error: Ollama request failed: {e}", success=False)
 
@@ -262,10 +272,26 @@ _NONINTERACTIVE_FLAGS: dict[str, str] = {
 
 
 _CODEX_SUBCOMMANDS = {
-    "exec", "review", "login", "logout", "mcp", "plugin", "mcp-server",
-    "app-server", "remote-control", "completion", "update", "sandbox",
-    "debug", "apply", "resume", "fork", "cloud", "exec-server",
-    "features", "help",
+    "exec",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "mcp-server",
+    "app-server",
+    "remote-control",
+    "completion",
+    "update",
+    "sandbox",
+    "debug",
+    "apply",
+    "resume",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
 }
 
 
@@ -276,7 +302,7 @@ def _inject_codex_exec(template: str) -> str | None:
         return None
 
     tool = m.group(1)
-    rest = template[m.end():]
+    rest = template[m.end() :]
     stripped = rest.lstrip()
     first = stripped.split(None, 1)[0] if stripped else ""
 
@@ -294,13 +320,7 @@ def _inject_codex_exec(template: str) -> str | None:
     if first == "exec":
         exec_match = re.match(r"^(\s+exec\b)(.*)$", rest)
         if exec_match:
-            return (
-                tool
-                + _root_flags()
-                + exec_match.group(1)
-                + _exec_flags()
-                + exec_match.group(2)
-            )
+            return tool + _root_flags() + exec_match.group(1) + _exec_flags() + exec_match.group(2)
         return template
 
     if first in _CODEX_SUBCOMMANDS:
@@ -348,16 +368,17 @@ class ShellDispatcher(Dispatcher):
         return None
 
     def dispatch(self, prompt: str, task: Task) -> DispatchResult:
-        # Escape single quotes in the prompt for safe shell interpolation
-        safe_prompt = prompt.replace("'", "'\\''")
-        cmd = _inject_noninteractive_flags(
-            self.template.replace("{prompt}", safe_prompt)
-        )
+        cmd = [
+            part.replace("{prompt}", prompt)
+            for part in shlex.split(_inject_noninteractive_flags(self.template))
+        ]
+        if not cmd:
+            return DispatchResult(response="error: empty shell template", success=False)
 
         try:
             result = run_subprocess(
                 cmd,
-                shell=True,
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=_llm_timeout(task),

@@ -16,6 +16,17 @@
 - Just-style `import`, optional `import?`, `[default]`, `[confirm("...")]`, and `[env(NAME, VALUE)]`.
 - Shell completion generation with `makethlm completions bash|zsh|fish`.
 - Native OpenAI and Ollama dispatchers via `llm openai`, `llm ollama`, `--openai`, and `--ollama`.
+- Release preparation script for version bump, changelog, commit, tag, build, and publish flow.
+- Secret backend tests, value-free secret audit logging, and a policy to block secrets in LLM prompts.
+- Just compatibility for shebang/script recipes, `script("COMMAND")`, modules, `&&` subsequent dependencies, multi-task invocation, shell arrays, and more built-ins.
+- Real-world examples for Docker Compose, systemd, Kubernetes, Ansible inventory, Python package release, and CMake `compile_commands.json` analysis.
+- Fail-closed sandbox selection, network-deny defaults, read-only workspace support, and sandbox working-directory propagation.
+- Failure postmortem tasks, typed artifact contracts, and retry/fallback LLM provider strategies.
+- Transitive capability inspection with `--capabilities`.
+- Replayable, redacted local run bundles with `makethlm replay RUN_ID`.
+- Cache keys that include task arguments, variables, providers, agents, options, artifacts, and referenced environment inputs.
+- Module-scoped variables, functions, providers, agents, host groups, guidance, rollback hooks, and nested namespaces.
+- Per-host Ansible inventory connection settings.
 
 ## 0.1.0 - 2026-05-24
 
@@ -28,7 +39,6 @@
 - SSH identity files, host key policies, and `ssh-parallel` host execution.
 - Rollback hooks with `rollback=<task>`.
 - Local SQLite run history with `history`, `--history`, and `--no-history`.
-- Local self-hosted UI/API server with `--serve`.
 - Safe mode with explicit `--allow-*` permissions.
 - Parse-time backtick blocking in safe mode.
 - Secret redaction for likely secret environment and exported variables.

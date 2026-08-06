@@ -23,6 +23,7 @@ from makethlm.runner import Runner
 # --no-docker flag: skip integration tests on machines without Docker
 # ---------------------------------------------------------------------------
 
+
 def pytest_addoption(parser):
     parser.addoption(
         "--no-docker",
@@ -101,8 +102,7 @@ def ssh_container(ssh_keypair):
     Stops and removes the container on teardown.
     """
     if not _docker_available():
-        pytest.fail("Docker is required for integration tests. "
-                     "Use --no-docker to skip them.")
+        pytest.fail("Docker is required for integration tests. Use --no-docker to skip them.")
 
     private_key, public_key = ssh_keypair
 
@@ -132,9 +132,13 @@ def ssh_container(ssh_keypair):
         # Start container
         subprocess.run(
             [
-                "docker", "run", "-d",
-                "--name", _CONTAINER_NAME,
-                "-p", f"127.0.0.1:{port}:22",
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                _CONTAINER_NAME,
+                "-p",
+                f"127.0.0.1:{port}:22",
                 _IMAGE_NAME,
             ],
             capture_output=True,
@@ -167,12 +171,18 @@ def _wait_for_sshd(host: str, port: int, key_path: str, timeout: int = 30) -> No
             result = subprocess.run(
                 [
                     "ssh",
-                    "-o", "BatchMode=yes",
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "ConnectTimeout=2",
-                    "-i", key_path,
-                    "-p", str(port),
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "ConnectTimeout=2",
+                    "-i",
+                    key_path,
+                    "-p",
+                    str(port),
                     f"testuser@{host}",
                     "true",
                 ],
@@ -211,8 +221,7 @@ def ssh_runner(ssh_container):
     def _make_runner(promptfile_text: str) -> tuple[Runner, object]:
         # Substitute {host}, {port}, {user} placeholders
         text = (
-            promptfile_text
-            .replace("{host}", host)
+            promptfile_text.replace("{host}", host)
             .replace("{port}", str(port))
             .replace("{user}", user)
         )

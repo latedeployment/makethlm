@@ -64,6 +64,8 @@ nav:
     - LLM Providers: llm-providers.md
     - Settings & Directives: settings.md
     - Just Compatibility: just-compatibility.md
+    - Reliable Workflows: reliability.md
     - Security: security.md
+    - Kubernetes Testing: testing/kubernetes.md
   - CLI Reference: cli.md
   - Secrets: secrets-injection.md

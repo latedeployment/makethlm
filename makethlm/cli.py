@@ -5,13 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 from .dispatcher import (
     ClaudeDispatcher,
@@ -22,8 +19,14 @@ from .dispatcher import (
     OpenAIDispatcher,
     ShellDispatcher,
 )
-from .history import list_runs, record_run
-from .models import Promptfile, SecretError, _builtin_functions, _evaluate_expression
+from .history import get_run, list_runs, record_run
+from .models import (
+    Promptfile,
+    SecretError,
+    _builtin_functions,
+    _evaluate_expression,
+    condition_uses_shell,
+)
 from .parser import ParseError, parse
 from .runner import (
     CycleError,
@@ -33,6 +36,12 @@ from .runner import (
     TaskResult,
     _dispatcher_for_provider,
     topological_sort,
+)
+from .secrets import (
+    is_secret_name,
+    redact_named_values,
+    redact_text,
+    secret_values_from_mapping,
 )
 
 PROMPTFILE_NAMES = ["Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"]
@@ -51,10 +60,16 @@ _SANDBOX_TOOLS = {
 
 
 def find_promptfile(directory: Path | None = None) -> Path | None:
-    """Search for a Promptfile in the given directory (default: cwd)."""
+    """Search current/parent directories, then a global config Promptfile."""
     d = directory or Path.cwd()
+    for search_dir in (d, *d.parents):
+        for name in PROMPTFILE_NAMES:
+            candidate = search_dir / name
+            if candidate.is_file():
+                return candidate
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     for name in PROMPTFILE_NAMES:
-        candidate = d / name
+        candidate = config_home / "makethlm" / name
         if candidate.is_file():
             return candidate
     return None
@@ -78,7 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Positional arguments for the task",
     )
     ap.add_argument(
-        "-f", "--file",
+        "-f",
+        "--file",
         type=Path,
         default=None,
         help="Path to Promptfile (default: auto-detect)",
@@ -106,13 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of parallel task workers",
     )
     ap.add_argument(
-        "--list", "-l",
+        "--list",
+        "-l",
         action="store_true",
         dest="list_tasks",
         help="List available tasks and exit",
     )
     ap.add_argument(
-        "--summary", "-s",
+        "--summary",
+        "-s",
         action="store_true",
         help="List task names only (compact, one per line)",
     )
@@ -125,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Validate Promptfile references, tools, and risky capabilities",
+    )
+    ap.add_argument(
+        "--capabilities",
+        action="store_true",
+        help="Explain the transitive execution capabilities required by a task",
     )
     ap.add_argument(
         "--plan",
@@ -155,27 +178,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not record this run in local history",
     )
     ap.add_argument(
-        "--serve",
-        nargs="?",
-        const="127.0.0.1:8765",
-        default=None,
-        help="Serve a small local task UI/API, optionally HOST:PORT",
-    )
-    ap.add_argument(
         "--evaluate",
         metavar="EXPR",
         default=None,
         help="Evaluate an expression and print the result",
     )
     ap.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         default=None,
         help="Default LLM model to use",
     )
     ap.add_argument(
         "--shell",
         default=None,
-        help='Shell template for LLM CLI, e.g. \'openai chat -p "{prompt}"\'',
+        help="LLM CLI argv template, e.g. 'openai chat -p \"{prompt}\"'",
     )
     ap.add_argument(
         "--codex",
@@ -200,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--allow-backticks",
         action="store_true",
-        help="Allow Promptfile backtick command substitution in safe mode",
+        help="Allow Promptfile backtick commands in safe or inspection modes",
     )
     ap.add_argument(
         "--allow-shell",
@@ -223,13 +240,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow LLM prompt execution in safe mode",
     )
     ap.add_argument(
-        "--var", "-V",
+        "--allow-secrets",
+        action="store_true",
+        help="Allow tasks to read or interpolate secrets in safe mode",
+    )
+    ap.add_argument(
+        "--allow-webhook",
+        action="store_true",
+        help="Allow webhook delivery in safe mode",
+    )
+    ap.add_argument(
+        "--var",
+        "-V",
         action="append",
         default=[],
         help="Override a variable: -V name=value",
     )
     ap.add_argument(
-        "--quiet", "-q",
+        "--quiet",
+        "-q",
         action="store_true",
         help="Suppress command echoing",
     )
@@ -241,6 +270,52 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _build_dispatcher(args: argparse.Namespace, *, honor_dry_run: bool = True) -> Dispatcher:
+    """Build the CLI-selected fallback dispatcher."""
+    if honor_dry_run and args.dry_run:
+        return DryRunDispatcher()
+    if args.shell:
+        return ShellDispatcher(args.shell)
+    if args.codex:
+        return CodexDispatcher(model=args.model)
+    if args.openai:
+        return OpenAIDispatcher(model=args.model)
+    if args.ollama:
+        return OllamaDispatcher(model=args.model)
+    return ClaudeDispatcher(model=args.model)
+
+
+def _task_dispatchers(
+    pf: Promptfile,
+    task_name: str,
+    fallback_dispatcher: Dispatcher,
+) -> list[Dispatcher]:
+    """Return the primary and fallback dispatchers reachable by a task."""
+    dispatchers: list[Dispatcher] = []
+    provider_name = _provider_for_check(pf, task_name)
+    provider = pf.llm_providers.get(provider_name) if provider_name else None
+    dispatchers.append(_dispatcher_for_provider(provider) if provider else fallback_dispatcher)
+    task = pf.tasks[task_name]
+    for fallback_name in task.options.fallback_llms:
+        fallback = pf.llm_providers.get(fallback_name)
+        if fallback:
+            dispatchers.append(_dispatcher_for_provider(fallback))
+    return dispatchers
+
+
+def _task_uses_local_execution_provider(
+    pf: Promptfile,
+    task_name: str,
+    fallback_dispatcher: Dispatcher,
+) -> bool:
+    """Return whether a task can reach an LLM dispatcher that executes locally."""
+    local_dispatchers = (ClaudeDispatcher, CodexDispatcher, ShellDispatcher)
+    return any(
+        isinstance(dispatcher, local_dispatchers)
+        for dispatcher in _task_dispatchers(pf, task_name, fallback_dispatcher)
+    )
+
+
 def _validate_tools(dispatcher: Dispatcher, pf, target: str | None) -> list[str]:
     """Validate that all required LLM CLI tools are installed.
 
@@ -248,18 +323,24 @@ def _validate_tools(dispatcher: Dispatcher, pf, target: str | None) -> list[str]
     """
     errors: list[str] = []
     checked: set[str] = set()
+    if isinstance(dispatcher, DryRunDispatcher):
+        return errors
 
     def _check(d: Dispatcher, label: str) -> None:
-        key = repr(d)
+        key = repr(
+            (
+                type(d).__name__,
+                getattr(d, "default_model", None),
+                getattr(d, "template", None),
+                getattr(d, "base_url", None),
+            )
+        )
         if key in checked:
             return
         checked.add(key)
         err = d.validate_tool()
         if err:
             errors.append(f"{err} (needed by {label})")
-
-    # Validate the default dispatcher
-    _check(dispatcher, "default dispatcher")
 
     # Determine which tasks will actually execute
     if target is None:
@@ -272,10 +353,11 @@ def _validate_tools(dispatcher: Dispatcher, pf, target: str | None) -> list[str]
         return errors
 
     try:
-        execution_order = topological_sort(pf, target)
+        execution_order = _execution_task_names(pf, target)
     except CycleError:
         return errors  # cycle errors are reported later
 
+    fallback_needed = False
     for task_name in execution_order:
         task = pf.tasks[task_name]
         # Skip shell-only tasks — they don't invoke the LLM
@@ -284,11 +366,32 @@ def _validate_tools(dispatcher: Dispatcher, pf, target: str | None) -> list[str]
         if not has_prompt and not has_docker:
             continue
 
-        # Check per-task LLM dispatcher if configured
-        provider = pf.get_llm_for_task(task_name)
-        if provider:
-            per_task_dispatcher = _dispatcher_for_provider(provider)
-            _check(per_task_dispatcher, f"task '{task_name}'")
+        provider_name = _provider_for_check(pf, task_name)
+        if provider_name:
+            provider = pf.llm_providers.get(provider_name)
+            if provider is None:
+                errors.append(
+                    f"error: task {task_name!r} references unknown LLM provider {provider_name!r}"
+                )
+                continue
+            _check(_dispatcher_for_provider(provider), f"task '{task_name}'")
+        else:
+            fallback_needed = True
+        for fallback_name in task.options.fallback_llms:
+            fallback_provider = pf.llm_providers.get(fallback_name)
+            if fallback_provider is None:
+                errors.append(
+                    f"error: task {task_name!r} references unknown fallback "
+                    f"LLM provider {fallback_name!r}"
+                )
+                continue
+            _check(
+                _dispatcher_for_provider(fallback_provider),
+                f"fallback for task '{task_name}'",
+            )
+
+    if fallback_needed:
+        _check(dispatcher, "default dispatcher")
 
     return errors
 
@@ -299,28 +402,75 @@ def _resolve_target(pf: Promptfile, target: str | None) -> str | None:
     return pf.resolve_alias(target)
 
 
-def _build_task_args(pf: Promptfile, target: str | None, raw_args: list[str]) -> tuple[dict[str, str] | None, str | None]:
+def _execution_task_names(pf: Promptfile, target: str) -> list[str]:
+    """Return normal execution plus failure-hook dependency closures."""
+    task_names = topological_sort(pf, target)
+    seen = set(task_names)
+    index = 0
+    while index < len(task_names):
+        task = pf.tasks[task_names[index]]
+        index += 1
+        for hook in (task.options.postmortem, task.options.rollback):
+            if not hook:
+                continue
+            hook = pf.resolve_alias(hook)
+            for hook_task in topological_sort(pf, hook):
+                if hook_task not in seen:
+                    seen.add(hook_task)
+                    task_names.append(hook_task)
+    return task_names
+
+
+def _build_task_args(
+    pf: Promptfile, target: str | None, raw_args: list[str]
+) -> tuple[dict[str, str] | None, str | None]:
     """Build task argument mapping for the selected target."""
     target = _resolve_target(pf, target)
-    if not target or target not in pf.tasks or not pf.tasks[target].arguments:
+    if not target or target not in pf.tasks:
+        return None, None
+    if not pf.tasks[target].arguments:
+        if raw_args:
+            return None, f"task {target!r} does not accept arguments: {' '.join(raw_args)}"
         return None, None
 
     task_def = pf.tasks[target]
     task_args: dict[str, str] = {}
+    consumed = 0
     for idx, arg_def in enumerate(task_def.arguments):
         if arg_def.variadic:
             remaining = raw_args[idx:]
             if arg_def.variadic == "+" and not remaining:
                 return None, f"task {target!r} requires at least one value for +{arg_def.name}"
             task_args[arg_def.name] = " ".join(remaining)
+            consumed = len(raw_args)
             break
         if idx < len(raw_args):
             task_args[arg_def.name] = raw_args[idx]
+            consumed += 1
         elif arg_def.default is not None:
             task_args[arg_def.name] = arg_def.default
         else:
             return None, f"task {target!r} requires argument {arg_def.name!r}"
+    if consumed < len(raw_args):
+        extras = " ".join(raw_args[consumed:])
+        return None, f"task {target!r} received unexpected arguments: {extras}"
     return task_args, None
+
+
+def _multi_task_targets(pf: Promptfile, task: str | None, raw_args: list[str]) -> list[str] | None:
+    """Return multiple task targets when ARGS are task names, not task arguments."""
+    if not task or not raw_args:
+        return None
+    first = pf.resolve_alias(task)
+    if first not in pf.tasks or pf.tasks[first].arguments:
+        return None
+    targets = [first]
+    for raw in raw_args:
+        resolved = pf.resolve_alias(raw)
+        if resolved not in pf.tasks or pf.tasks[resolved].arguments:
+            return None
+        targets.append(resolved)
+    return targets
 
 
 def _provider_label(pf: Promptfile, task_name: str) -> str:
@@ -344,6 +494,16 @@ def _task_plan_options(task) -> list[str]:
         options.append(f"llm-timeout={task.options.llm_timeout}")
     if task.options.rollback:
         options.append(f"rollback={task.options.rollback}")
+    if task.options.postmortem:
+        options.append(f"postmortem={task.options.postmortem}")
+    if task.options.fallback_llms:
+        options.append(f"fallback-llm={'|'.join(task.options.fallback_llms)}")
+    if task.options.retries:
+        options.append(f"retries={task.options.retries}")
+    if task.options.requires:
+        options.append(f"requires={'|'.join(task.options.requires)}")
+    if task.options.produces:
+        options.append(f"produces={task.options.produces}")
     if task.options.when:
         options.append(f"when={'; '.join(task.options.when)}")
     if task.options.ssh_identity:
@@ -355,6 +515,34 @@ def _task_plan_options(task) -> list[str]:
     return options
 
 
+def _promptfile_secret_values(
+    pf: Promptfile,
+    task_args: dict[str, str] | None = None,
+) -> set[str]:
+    """Return secret-like values that must not appear in CLI previews."""
+    values = secret_values_from_mapping(dict(os.environ))
+    values.update(
+        value
+        for name, value in {
+            **pf.variables,
+            **pf.get_exported_env(),
+        }.items()
+        if is_secret_name(name) and value
+    )
+    values.update(
+        value for name, value in (task_args or {}).items() if is_secret_name(name) and value
+    )
+    for task in pf.tasks.values():
+        values.update(
+            value for name, value in task.options.env.items() if is_secret_name(name) and value
+        )
+        values.update(
+            value for name, value in task.local_variables.items() if is_secret_name(name) and value
+        )
+    values.update(provider.api_key for provider in pf.llm_providers.values() if provider.api_key)
+    return values
+
+
 def _plan_payload(
     pf: Promptfile,
     target: str,
@@ -364,6 +552,7 @@ def _plan_payload(
     """Return an execution plan without running tasks."""
     order = topological_sort(pf, target)
     tasks: list[dict[str, object]] = []
+    secret_values = _promptfile_secret_values(pf, task_args)
     for idx, task_name in enumerate(order, 1):
         task = pf.tasks[task_name]
         args = task_args if task_name == target else None
@@ -387,21 +576,29 @@ def _plan_payload(
             content = step.content
             if step.kind == "prompt":
                 content = step.content.splitlines()[0] if step.content else ""
-            steps.append({"kind": step.kind, "content": content})
+            steps.append(
+                {
+                    "kind": step.kind,
+                    "content": redact_text(content, secret_values),
+                }
+            )
 
-        tasks.append({
-            "index": idx,
-            "name": task_name,
-            "provider": _provider_label(pf, task_name),
-            "hosts": host_payload,
-            "dependencies": list(task.dependencies),
-            "options": _task_plan_options(task),
-            "steps": steps,
-        })
+        tasks.append(
+            {
+                "index": idx,
+                "name": task_name,
+                "provider": _provider_label(pf, task_name),
+                "hosts": host_payload,
+                "dependencies": list(task.dependencies),
+                "subsequent_dependencies": list(task.subsequent_dependencies),
+                "options": _task_plan_options(task),
+                "steps": steps,
+            }
+        )
 
     return {
         "target": target,
-        "variables": {key: pf.variables[key] for key in sorted(pf.variables)},
+        "variables": redact_named_values({key: pf.variables[key] for key in sorted(pf.variables)}),
         "execution_order": order,
         "tasks": tasks,
     }
@@ -411,16 +608,20 @@ def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, promptfile_path: str) -> None:
+def _print_plan(
+    pf: Promptfile, target: str, task_args: dict[str, str] | None, promptfile_path: str
+) -> None:
     """Print an execution plan without running tasks."""
     payload = _plan_payload(pf, target, task_args, promptfile_path)
     order = payload["execution_order"]
+    secret_values = _promptfile_secret_values(pf, task_args)
+    display_variables = redact_named_values(pf.variables)
     print(f"Plan for {target}")
     print()
     print("Variables:")
     if pf.variables:
         for key in sorted(pf.variables):
-            print(f"  {key}={pf.variables[key]!r}")
+            print(f"  {key}={display_variables[key]!r}")
     else:
         print("  (none)")
     print()
@@ -441,6 +642,8 @@ def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, p
         print(f"     hosts: {host_label}")
         if task.dependencies:
             print(f"     deps: {', '.join(task.dependencies)}")
+        if task.subsequent_dependencies:
+            print(f"     after: {', '.join(task.subsequent_dependencies)}")
         if options:
             print(f"     options: {', '.join(options)}")
         print("     steps:")
@@ -450,12 +653,13 @@ def _print_plan(pf: Promptfile, target: str, task_args: dict[str, str] | None, p
             promptfile_path=promptfile_path,
             mask_secrets=True,
         ):
+            content = redact_text(step.content, secret_values)
             if step.kind == "shell":
-                print(f"       ! {step.content}")
+                print(f"       ! {content}")
             elif step.kind == "echo":
-                print(f"       @echo {step.content}")
+                print(f"       @echo {content}")
             else:
-                first_line = step.content.splitlines()[0] if step.content else ""
+                first_line = content.splitlines()[0] if content else ""
                 if len(first_line) > 100:
                     first_line = first_line[:97] + "..."
                 print(f"       > {first_line}")
@@ -480,6 +684,12 @@ def _graph_payload(pf: Promptfile, target: str | None) -> dict[str, object]:
         for dep in pf.tasks[task_name].dependencies
         if dep in task_set
     ]
+    edges.extend(
+        {"from": task_name, "to": dep, "kind": "subsequent"}
+        for task_name in tasks
+        for dep in pf.tasks[task_name].subsequent_dependencies
+        if dep in task_set
+    )
     return {
         "target": pf.resolve_alias(target) if target else None,
         "nodes": tasks,
@@ -498,6 +708,9 @@ def _print_graph(pf: Promptfile, target: str | None, fmt: str) -> None:
             for dep in pf.tasks[task_name].dependencies:
                 if dep in task_set:
                     print(f'  "{dep}" -> "{task_name}";')
+            for dep in pf.tasks[task_name].subsequent_dependencies:
+                if dep in task_set:
+                    print(f'  "{task_name}" -> "{dep}";')
         print("}")
         return
 
@@ -511,6 +724,10 @@ def _print_graph(pf: Promptfile, target: str | None, fmt: str) -> None:
             if dep in task_set:
                 dep_id = "task_" + "".join(ch if ch.isalnum() else "_" for ch in dep)
                 print(f"  {dep_id} --> {task_id}")
+        for dep in pf.tasks[task_name].subsequent_dependencies:
+            if dep in task_set:
+                dep_id = "task_" + "".join(ch if ch.isalnum() else "_" for ch in dep)
+                print(f"  {task_id} --> {dep_id}")
 
 
 def _validate_safe_mode(
@@ -521,14 +738,25 @@ def _validate_safe_mode(
     allow_ssh: bool,
     allow_docker: bool,
     allow_llm: bool,
+    allow_secrets: bool = False,
+    allow_webhook: bool = False,
+    task_args: dict[str, str] | None = None,
+    dispatcher: Dispatcher | None = None,
 ) -> list[str]:
     """Return safe-mode violations for the target execution subgraph."""
     errors: list[str] = []
-    for task_name in topological_sort(pf, target):
+    task_names = _execution_task_names(pf, target)
+    fallback_dispatcher = dispatcher or ClaudeDispatcher()
+
+    for task_name in task_names:
         task = pf.tasks[task_name]
         has_shell = any(step.kind == "shell" for step in task.steps)
-        has_prompt = any(step.kind == "prompt" for step in task.steps)
+        has_prompt = any(step.kind == "prompt" for step in task.steps) or task.docker is not None
         has_ssh = has_shell and bool(task.options.on)
+        has_condition_shell = any(
+            condition_uses_shell(condition) for condition in task.options.when
+        )
+        secret_backend = task.options.secrets or pf.settings.secrets or "env"
 
         if task.docker and not allow_docker:
             errors.append(f"task {task_name!r} uses a docker block; pass --allow-docker")
@@ -536,9 +764,175 @@ def _validate_safe_mode(
             errors.append(f"task {task_name!r} runs shell steps over SSH; pass --allow-ssh")
         if has_shell and not has_ssh and not allow_shell:
             errors.append(f"task {task_name!r} runs local shell steps; pass --allow-shell")
+        if has_condition_shell and not allow_shell:
+            errors.append(f"task {task_name!r} runs a local shell condition; pass --allow-shell")
+        args = task_args if task_name == target else None
+        references_secret = _task_references_secret(pf, task_name, args)
+        if references_secret:
+            if not allow_secrets:
+                errors.append(
+                    f"task {task_name!r} reads or interpolates sensitive values; "
+                    "pass --allow-secrets"
+                )
+            if secret_backend != "env" and not allow_shell:
+                errors.append(
+                    f"task {task_name!r} invokes the {secret_backend!r} secret backend; "
+                    "pass --allow-shell"
+                )
         if has_prompt and not allow_llm:
             errors.append(f"task {task_name!r} sends prompts to an LLM; pass --allow-llm")
+        if (
+            has_prompt
+            and _task_uses_local_execution_provider(
+                pf,
+                task_name,
+                fallback_dispatcher,
+            )
+            and not allow_shell
+        ):
+            errors.append(
+                f"task {task_name!r} uses an LLM dispatcher with local execution access; "
+                "pass --allow-shell"
+            )
+        if task.options.webhook and not allow_webhook:
+            errors.append(f"task {task_name!r} sends a webhook; pass --allow-webhook")
     return errors
+
+
+def _capability_payload(
+    pf: Promptfile,
+    target: str,
+    task_args: dict[str, str] | None = None,
+    dispatcher: Dispatcher | None = None,
+) -> dict[str, object]:
+    """Return a transitive, machine-readable execution capability manifest."""
+    tasks = _execution_task_names(pf, target)
+    capabilities: list[dict[str, str]] = []
+    fallback_dispatcher = dispatcher or ClaudeDispatcher()
+
+    def add(
+        task_name: str,
+        capability: str,
+        reason: str,
+        allow_flag: str,
+    ) -> None:
+        capabilities.append(
+            {
+                "task": task_name,
+                "capability": capability,
+                "reason": reason,
+                "allow_flag": allow_flag,
+            }
+        )
+
+    for task_name in tasks:
+        task = pf.tasks[task_name]
+        has_shell = any(step.kind == "shell" for step in task.steps)
+        has_prompt = any(step.kind == "prompt" for step in task.steps)
+        if task.docker:
+            add(
+                task_name,
+                "docker",
+                "generates and builds a Docker artifact",
+                "--allow-docker",
+            )
+            add(
+                task_name,
+                "llm",
+                "uses an LLM to generate a Dockerfile",
+                "--allow-llm",
+            )
+        elif has_prompt:
+            provider_names = [
+                name
+                for name in (
+                    _provider_for_check(pf, task_name),
+                    *task.options.fallback_llms,
+                )
+                if name
+            ]
+            provider_detail = f" using {' -> '.join(provider_names)}" if provider_names else ""
+            add(
+                task_name,
+                "llm",
+                f"sends one or more prompt steps to an LLM{provider_detail}",
+                "--allow-llm",
+            )
+        if has_prompt and _task_uses_local_execution_provider(
+            pf,
+            task_name,
+            fallback_dispatcher,
+        ):
+            add(
+                task_name,
+                "shell",
+                "uses an LLM dispatcher with local execution access",
+                "--allow-shell",
+            )
+        if has_shell and task.options.on:
+            add(
+                task_name,
+                "ssh",
+                f"runs shell steps on host group {task.options.on!r}",
+                "--allow-ssh",
+            )
+        elif has_shell:
+            add(
+                task_name,
+                "shell",
+                "runs local shell steps",
+                "--allow-shell",
+            )
+        if any(condition_uses_shell(condition) for condition in task.options.when):
+            add(
+                task_name,
+                "shell",
+                "evaluates a shell-backed when condition",
+                "--allow-shell",
+            )
+        backend = task.options.secrets or pf.settings.secrets or "env"
+        args = task_args if task_name == target else None
+        secret_refs = _secret_refs_for_task(pf, task_name, args)
+        if secret_refs:
+            reference_detail = ", ".join(secret_refs)
+            add(
+                task_name,
+                "secrets",
+                f"reads sensitive input via {backend!r}: {reference_detail}",
+                "--allow-secrets",
+            )
+            if backend != "env":
+                add(
+                    task_name,
+                    "shell",
+                    f"invokes the external {backend!r} secret backend",
+                    "--allow-shell",
+                )
+        if task.options.webhook:
+            add(
+                task_name,
+                "webhook",
+                "sends completion data to its configured webhook",
+                "--allow-webhook",
+            )
+
+    return {
+        "target": target,
+        "tasks": tasks,
+        "capabilities": capabilities,
+        "required": sorted({item["capability"] for item in capabilities}),
+    }
+
+
+def _print_capabilities(payload: dict[str, object]) -> None:
+    """Print an execution capability manifest."""
+    print(f"Capabilities for {payload['target']}")
+    capabilities = payload["capabilities"]
+    if not capabilities:
+        print("  none")
+        return
+    for item in capabilities:
+        print(f"  {item['capability']:<8} {item['task']}: {item['reason']} ({item['allow_flag']})")
 
 
 def _check_issue(
@@ -554,30 +948,22 @@ def _check_issue(
     return issue
 
 
-def _task_references_secret(pf: Promptfile, task_name: str) -> bool:
+def _task_references_secret(
+    pf: Promptfile,
+    task_name: str,
+    args: dict[str, str] | None = None,
+) -> bool:
     """Return True if a task/guidance/agent includes secret placeholders."""
-    task = pf.tasks[task_name]
-    if any("{{#secret:" in step.content for step in task.steps):
-        return True
-    agent = pf.get_agent_for_task(task_name)
-    if agent and "{{#secret:" in agent.instructions:
-        return True
-    return bool(pf.guidance and "{{#secret:" in pf.guidance)
+    return pf.task_references_secret(task_name, args)
 
 
-def _secret_refs_for_task(pf: Promptfile, task_name: str) -> list[str]:
+def _secret_refs_for_task(
+    pf: Promptfile,
+    task_name: str,
+    args: dict[str, str] | None = None,
+) -> list[str]:
     """Return secret reference names used by a task."""
-    task = pf.tasks[task_name]
-    texts = [step.content for step in task.steps]
-    agent = pf.get_agent_for_task(task_name)
-    if agent:
-        texts.append(agent.instructions)
-    if pf.guidance:
-        texts.append(pf.guidance)
-    refs: list[str] = []
-    for text in texts:
-        refs.extend(match.strip() for match in re.findall(r"\{\{#secret:(.+?)\}\}", text))
-    return refs
+    return sorted(pf.task_secret_references(task_name, args))
 
 
 def _provider_for_check(pf: Promptfile, task_name: str) -> str | None:
@@ -640,6 +1026,7 @@ def _check_promptfile(
                 used_providers.add(provider_name)
             elif not provider_name:
                 fallback_claude_needed = True
+            used_providers.update(task.options.fallback_llms)
 
         if has_shell:
             if task.options.on:
@@ -657,17 +1044,25 @@ def _check_promptfile(
                 )
 
         if task.docker:
-            warn("docker-generation", f"task {task_name!r} generates/builds Docker artifacts", task=task_name)
+            warn(
+                "docker-generation",
+                f"task {task_name!r} generates/builds Docker artifacts",
+                task=task_name,
+            )
 
         sandbox = task.options.sandbox or pf.settings.sandbox
         if sandbox and sandbox != "none" and has_shell:
             used_sandboxes.add(sandbox)
         if task.options.sandbox_net == "host":
-            warn("sandbox-host-network", f"task {task_name!r} uses sandbox-net=host", task=task_name)
+            warn(
+                "sandbox-host-network", f"task {task_name!r} uses sandbox-net=host", task=task_name
+            )
 
         if _task_references_secret(pf, task_name):
             backend = task.options.secrets or pf.settings.secrets or "env"
-            used_secret_backends.setdefault(backend, set()).update(_secret_refs_for_task(pf, task_name))
+            used_secret_backends.setdefault(backend, set()).update(
+                _secret_refs_for_task(pf, task_name)
+            )
 
     for provider_name in sorted(used_providers):
         provider = pf.llm_providers[provider_name]
@@ -694,7 +1089,10 @@ def _check_promptfile(
     for sandbox in sorted(used_sandboxes):
         tool = _SANDBOX_TOOLS.get(sandbox)
         if tool and shutil.which(tool) is None:
-            error("missing-sandbox-tool", f"{tool!r} required for sandbox {sandbox!r} was not found on PATH")
+            error(
+                "missing-sandbox-tool",
+                f"{tool!r} required for sandbox {sandbox!r} was not found on PATH",
+            )
 
     base_dir = os.path.dirname(os.path.abspath(promptfile_path))
     for backend, refs in sorted(used_secret_backends.items()):
@@ -708,7 +1106,10 @@ def _check_promptfile(
             error("unknown-secrets-backend", f"unknown secrets backend {backend!r}")
             continue
         if shutil.which(tool) is None:
-            error("missing-secrets-tool", f"{tool!r} required for secrets backend {backend!r} was not found on PATH")
+            error(
+                "missing-secrets-tool",
+                f"{tool!r} required for secrets backend {backend!r} was not found on PATH",
+            )
         if backend == "sops":
             if not pf.settings.secrets_file:
                 error("missing-sops-file", "sops secrets require set secrets-file")
@@ -737,15 +1138,9 @@ def _print_check_result(payload: dict[str, object]) -> None:
         print(f"warning[{issue['code']}]: {issue['message']}")
     summary = payload["summary"]
     if payload["ok"]:
-        print(
-            f"OK: {summary['tasks']} task(s), "
-            f"{summary['warnings']} warning(s)"
-        )
+        print(f"OK: {summary['tasks']} task(s), {summary['warnings']} warning(s)")
     else:
-        print(
-            f"FAILED: {summary['errors']} error(s), "
-            f"{summary['warnings']} warning(s)"
-        )
+        print(f"FAILED: {summary['errors']} error(s), {summary['warnings']} warning(s)")
 
 
 def _history_payload(limit_raw: str | None = None) -> dict[str, object]:
@@ -781,13 +1176,248 @@ def _print_history(limit_raw: str | None = None) -> None:
         )
 
 
+def _print_replay(bundle: dict[str, object]) -> None:
+    """Print a recorded run bundle without re-executing any task."""
+    status = "ok" if bundle["success"] else "FAILED"
+    print(f"Run {bundle['id']}  {status}  {bundle['target']}  {bundle['duration_ms']}ms")
+    print(f"Started: {bundle['started_at']}")
+    if bundle.get("promptfile"):
+        print(f"Promptfile: {bundle['promptfile']}")
+    for task in bundle["tasks"]:
+        task_status = "ok" if task.get("success") else "FAILED"
+        print(f"\n[{task_status}] {task.get('task', '(unknown)')}")
+        response = str(task.get("response", "")).strip()
+        for line in response.splitlines():
+            print(f"  {line}")
+
+
+def _task_args_display(task) -> str:
+    parts = []
+    for arg in task.arguments:
+        prefix = arg.variadic or ""
+        if arg.default is not None:
+            default = "[redacted]" if is_secret_name(arg.name) else arg.default
+            parts.append(f'{prefix}{arg.name}="{default}"')
+        else:
+            parts.append(f"{prefix}{arg.name}")
+    return ", ".join(parts)
+
+
+def _task_description(task) -> str:
+    desc = task.options.doc or task.prompt.split("\n")[0]
+    if len(desc) > 60:
+        desc = desc[:57] + "..."
+    return desc
+
+
+def _task_attributes(task) -> list[str]:
+    attrs: list[str] = []
+    options = task.options
+    if options.default:
+        attrs.append("default")
+    if options.confirm:
+        attrs.append("confirm")
+    if options.script:
+        attrs.append("script")
+    if options.script_command:
+        attrs.append(f"script={options.script_command}")
+    if options.extension:
+        attrs.append(f"extension={options.extension}")
+    if options.metadata:
+        attrs.append("metadata")
+    if options.env_enabled:
+        attrs.append("env")
+    if options.cache:
+        attrs.append(f"cache={options.cache}")
+    if options.timeout:
+        attrs.append(f"timeout={options.timeout}")
+    if options.llm_timeout:
+        attrs.append(f"llm-timeout={options.llm_timeout}")
+    if options.rollback:
+        attrs.append(f"rollback={options.rollback}")
+    if options.sandbox:
+        attrs.append(f"sandbox={options.sandbox}")
+    if options.sandbox_read_only:
+        attrs.append("sandbox-read-only")
+    if options.ssh_parallel:
+        attrs.append("ssh-parallel")
+    if options.webhook:
+        attrs.append(f"webhook-on={options.webhook_on}")
+    if options.when:
+        attrs.append("when")
+    return attrs
+
+
+def _list_payload(pf: Promptfile) -> dict[str, object]:
+    aliases_by_target: dict[str, list[str]] = {}
+    for alias_name, target in pf.aliases.items():
+        aliases_by_target.setdefault(target, []).append(alias_name)
+
+    tasks = []
+    for name in pf.task_order:
+        task = pf.tasks[name]
+        if task.options.private:
+            continue
+        module = name.split("::", 1)[0] if "::" in name else None
+        tasks.append(
+            {
+                "name": name,
+                "module": module,
+                "group": task.options.group,
+                "description": _task_description(task),
+                "aliases": aliases_by_target.get(name, []),
+                "attributes": _task_attributes(task),
+                "dependencies": task.dependencies,
+                "subsequent_dependencies": task.subsequent_dependencies,
+                "arguments": _task_args_display(task).split(", ") if task.arguments else [],
+                "docker": task.docker.tag if task.docker else None,
+                "llm": task.options.llm,
+                "agent": task.options.agent,
+                "on": task.options.on,
+            }
+        )
+
+    return {
+        "tasks": tasks,
+        "aliases": pf.aliases,
+        "functions": sorted(pf.functions),
+        "llm_providers": sorted(pf.llm_providers),
+        "host_groups": sorted(pf.host_groups),
+        "agents": sorted(pf.agents),
+    }
+
+
+def _print_list(pf: Promptfile) -> None:
+    aliases_by_target: dict[str, list[str]] = {}
+    for alias_name, target in pf.aliases.items():
+        aliases_by_target.setdefault(target, []).append(alias_name)
+
+    ungrouped: list[str] = []
+    groups: dict[str, list[str]] = {}
+    modules: dict[str, list[str]] = {}
+    for name in pf.task_order:
+        task = pf.tasks[name]
+        if task.options.private:
+            continue
+        if "::" in name:
+            modules.setdefault(name.split("::", 1)[0], []).append(name)
+        elif task.options.group:
+            groups.setdefault(task.options.group, []).append(name)
+        else:
+            ungrouped.append(name)
+
+    def _print_task(name: str, indent: str = "  ") -> None:
+        task = pf.tasks[name]
+        parts: list[str] = []
+        if task.dependencies:
+            parts.append(f"depends: {', '.join(task.dependencies)}")
+        if task.subsequent_dependencies:
+            parts.append(f"then: {', '.join(task.subsequent_dependencies)}")
+        if task.arguments:
+            parts.append(f"args: {_task_args_display(task)}")
+        if aliases_by_target.get(name):
+            parts.append(f"aliases: {', '.join(aliases_by_target[name])}")
+        if task.docker:
+            parts.append(f"docker: {task.docker.tag}")
+        if task.options.llm:
+            parts.append(f"llm: {task.options.llm}")
+        if task.options.agent:
+            parts.append(f"agent: {task.options.agent}")
+        if task.options.on:
+            parts.append(f"on: {task.options.on}")
+        if task.options.secrets:
+            parts.append(f"secrets: {task.options.secrets}")
+        if task.options.os_filter:
+            parts.append(f"os: {task.options.os_filter}")
+        attrs = _task_attributes(task)
+        if attrs:
+            parts.append(f"attrs: {', '.join(attrs)}")
+        suffix = f" ({'; '.join(parts)})" if parts else ""
+        print(f"{indent}{name}{suffix}")
+        print(f"{indent}  {_task_description(task)}")
+
+    for name in ungrouped:
+        _print_task(name)
+
+    for group_name, task_names in groups.items():
+        print()
+        print(f"  [{group_name}]")
+        for name in task_names:
+            _print_task(name)
+
+    if modules:
+        print()
+        print("  modules:")
+        for module_name, task_names in modules.items():
+            print(f"    [{module_name}]")
+            for name in task_names:
+                _print_task(name, indent="      ")
+
+    if pf.aliases:
+        print()
+        print("  aliases:")
+        for alias_name, alias_target in pf.aliases.items():
+            print(f"    {alias_name} -> {alias_target}")
+
+    if pf.functions:
+        print()
+        print("  functions:")
+        for fn_name, fn in pf.functions.items():
+            first_line = fn.body.split("\n")[0]
+            if len(first_line) > 60:
+                first_line = first_line[:57] + "..."
+            print(f"    {fn_name}: {first_line}")
+
+    if pf.llm_providers:
+        print()
+        default = pf.default_llm
+        print("  llm providers:")
+        for pname, prov in pf.llm_providers.items():
+            marker = " (default)" if pname == default else ""
+            model_str = f" model={prov.model}" if prov.model else ""
+            print(f"    {pname}{model_str}{marker}")
+
+    if pf.host_groups:
+        print()
+        print("  host groups:")
+        for gname, group in pf.host_groups.items():
+            user_str = f" user={group.user}" if group.user else ""
+            port_str = f" port={group.port}" if group.port else ""
+            print(f"    {gname}{user_str}{port_str}: {', '.join(group.hosts)}")
+
+    if pf.guidance:
+        print()
+        first_line = pf.guidance.split("\n")[0]
+        if len(first_line) > 60:
+            first_line = first_line[:57] + "..."
+        print(f"  guidance: {first_line}")
+
+    if pf.agents:
+        print()
+        print("  agents:")
+        for aname, agent in pf.agents.items():
+            parts = []
+            if agent.llm:
+                parts.append(f"llm={agent.llm}")
+            if agent.model:
+                parts.append(f"model={agent.model}")
+            suffix = f" ({', '.join(parts)})" if parts else ""
+            first_line = agent.instructions.split("\n")[0]
+            if len(first_line) > 60:
+                first_line = first_line[:57] + "..."
+            print(f"    {aname}{suffix}: {first_line}")
+
+
 def _completion_script(shell: str) -> str:
     """Return a shell completion script for makethlm."""
     common_opts = (
         "--file -f --dry-run --json --parallel --jobs --list -l --summary "
-        "--dump --check --plan --graph --graph-format --history --no-history "
-        "--serve --evaluate --model -m --shell --codex --openai --ollama --safe "
+        "--dump --check --capabilities --plan --graph --graph-format "
+        "--history --no-history "
+        "--evaluate --model -m --shell --codex --openai --ollama --safe "
         "--allow-backticks --allow-shell --allow-ssh --allow-docker --allow-llm "
+        "--allow-secrets "
+        "--allow-webhook "
         "--var -V --quiet -q --verbose"
     )
     if shell == "bash":
@@ -795,12 +1425,12 @@ def _completion_script(shell: str) -> str:
 _makethlm_complete() {{
     local cur="${{COMP_WORDS[COMP_CWORD]}}"
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "{common_opts} completions history" -- "$cur") )
+        COMPREPLY=( $(compgen -W "{common_opts} completions history replay" -- "$cur") )
         return 0
     fi
     local tasks
     tasks="$(makethlm --summary 2>/dev/null || true)"
-    COMPREPLY=( $(compgen -W "completions history $tasks" -- "$cur") )
+    COMPREPLY=( $(compgen -W "completions history replay $tasks" -- "$cur") )
 }}
 complete -F _makethlm_complete makethlm
 """
@@ -809,7 +1439,7 @@ complete -F _makethlm_complete makethlm
 # zsh completion for makethlm
 _makethlm() {{
   local -a opts tasks
-  opts=(${{=:-"{common_opts} completions history"}})
+  opts=(${{=:-"{common_opts} completions history replay"}})
   tasks=(${{(f)"$(makethlm --summary 2>/dev/null)"}})
   _describe 'option' opts
   _describe 'task' tasks
@@ -829,104 +1459,9 @@ _makethlm "$@"
             elif opt.startswith("-") and len(opt) == 2:
                 lines.append(f"complete -c makethlm -s {opt[1:]}")
         lines.append("complete -c makethlm -a '(__makethlm_tasks)'")
-        lines.append("complete -c makethlm -a 'completions history'")
+        lines.append("complete -c makethlm -a 'completions history replay'")
         return "\n".join(lines) + "\n"
     raise ValueError(f"unsupported shell: {shell!r} (expected bash, zsh, or fish)")
-
-
-def _serve(pf: Promptfile, dispatcher: Dispatcher, promptfile_path: str, bind: str) -> int:
-    """Run a small local HTTP UI/API for self-hosted use."""
-    host, _, port_raw = bind.partition(":")
-    host = host or "127.0.0.1"
-    port = int(port_raw or "8765")
-
-    class Handler(BaseHTTPRequestHandler):
-        def _json(self, status: int, payload: object) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/tasks":
-                self._json(200, [
-                    {
-                        "name": name,
-                        "private": pf.tasks[name].options.private,
-                        "doc": pf.tasks[name].options.doc or (pf.tasks[name].prompt.splitlines() or [""])[0],
-                    }
-                    for name in pf.task_order
-                    if not pf.tasks[name].options.private
-                ])
-                return
-            if parsed.path == "/api/history":
-                self._json(200, list_runs(20))
-                return
-            if parsed.path not in ("/", "/index.html"):
-                self._json(404, {"error": "not found"})
-                return
-            rows = "".join(
-                f"<li><form method='post' action='/api/run?task={name}'>"
-                f"<button type='submit'>{name}</button> "
-                f"{pf.tasks[name].options.doc or (pf.tasks[name].prompt.splitlines() or [''])[0]}"
-                "</form></li>"
-                for name in pf.task_order
-                if not pf.tasks[name].options.private
-            )
-            body = (
-                "<!doctype html><title>makethlm</title>"
-                "<h1>makethlm</h1><h2>Tasks</h2><ul>"
-                + rows
-                + "</ul><p>API: <code>/api/tasks</code>, <code>/api/history</code>, "
-                "<code>POST /api/run?task=name</code></p>"
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            parsed = urlparse(self.path)
-            if parsed.path != "/api/run":
-                self._json(404, {"error": "not found"})
-                return
-            task = parse_qs(parsed.query).get("task", [None])[0]
-            if not task:
-                self._json(400, {"error": "missing task"})
-                return
-            runner = Runner(pf, dispatcher, quiet=True, verbose=False, promptfile_path=promptfile_path)
-            started = time.monotonic()
-            try:
-                result = runner.run(task)
-                duration_ms = int((time.monotonic() - started) * 1000)
-                run_id = record_run(result, duration_ms=duration_ms, promptfile_path=promptfile_path)
-                self._json(200 if result.success else 500, {
-                    "id": run_id,
-                    "target": result.target,
-                    "success": result.success,
-                    "tasks": [
-                        {"task": tr.task_name, "success": tr.success, "response": tr.response}
-                        for tr in result.task_results
-                    ],
-                })
-            except Exception as e:  # pragma: no cover - defensive server boundary
-                self._json(500, {"error": str(e)})
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = HTTPServer((host, port), Handler)
-    print(f"Serving makethlm on http://{host}:{port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print()
-        return 130
-    return 0
 
 
 def _step_result_payload(step: StepResult) -> dict[str, object]:
@@ -938,6 +1473,8 @@ def _step_result_payload(step: StepResult) -> dict[str, object]:
         "success": step.success,
         "exit_code": step.exit_code if step.exit_code is not None else (0 if step.success else 1),
         "host": step.host,
+        "provider": step.provider,
+        "attempt": step.attempt,
     }
 
 
@@ -1005,6 +1542,25 @@ def main(argv: list[str] | None = None) -> int:
             _print_history(limit)
         return 0
 
+    if args.task == "replay":
+        if len(args.task_args) != 1:
+            print("error: replay requires exactly one run ID", file=sys.stderr)
+            return 1
+        try:
+            run_id = int(args.task_args[0])
+        except ValueError:
+            print("error: replay run ID must be an integer", file=sys.stderr)
+            return 1
+        bundle = get_run(run_id)
+        if bundle is None:
+            print(f"error: run {run_id} was not found", file=sys.stderr)
+            return 1
+        if args.json_output:
+            _print_json(bundle)
+        else:
+            _print_replay(bundle)
+        return 0
+
     if args.task in ("completions", "completion"):
         if not args.task_args:
             print("error: completions requires a shell: bash, zsh, or fish", file=sys.stderr)
@@ -1028,7 +1584,20 @@ def main(argv: list[str] | None = None) -> int:
     # Parse
     try:
         source = pf_path.read_text()
-        allow_backticks = (not args.safe and not args.check) or args.allow_backticks
+        inspection_mode = any(
+            (
+                args.check,
+                args.capabilities,
+                args.plan,
+                args.graph,
+                args.dump,
+                args.list_tasks,
+                args.summary,
+                args.dry_run,
+                args.evaluate is not None,
+            )
+        )
+        allow_backticks = args.allow_backticks or not args.safe and not inspection_mode
         pf = parse(source, filename=str(pf_path), allow_backticks=allow_backticks)
     except ParseError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1037,10 +1606,17 @@ def main(argv: list[str] | None = None) -> int:
     # Apply variable overrides from CLI
     for var_str in args.var:
         if "=" not in var_str:
-            print(f"error: invalid --var format (expected name=value): {var_str!r}", file=sys.stderr)
+            print(
+                f"error: invalid --var format (expected name=value): {var_str!r}", file=sys.stderr
+            )
             return 1
         key, value = var_str.split("=", 1)
         pf.variables[key.strip()] = value.strip()
+
+    # A CLI model selection is an explicit run-wide override.
+    if args.model:
+        for task in pf.tasks.values():
+            task.options.model = args.model
 
     # --evaluate: evaluate an expression
     if args.evaluate is not None:
@@ -1069,7 +1645,8 @@ def main(argv: list[str] | None = None) -> int:
     # --dump: dump parsed structure
     if args.dump:
         print("variables:")
-        for k, v in pf.variables.items():
+        display_variables = redact_named_values(pf.variables)
+        for k, v in display_variables.items():
             exported = " (exported)" if k in pf.exported_vars else ""
             print(f"  {k} = {v!r}{exported}")
         if pf.settings.export:
@@ -1130,141 +1707,47 @@ def main(argv: list[str] | None = None) -> int:
             deps_str = f" : {' '.join(task.dependencies)}" if task.dependencies else ""
             args_str = ""
             if task.arguments:
-                parts = []
-                for a in task.arguments:
-                    prefix = a.variadic or ""
-                    if a.default is not None:
-                        parts.append(f'{prefix}{a.name}="{a.default}"')
-                    else:
-                        parts.append(f"{prefix}{a.name}")
-                args_str = f"({', '.join(parts)})"
+                args_str = f"({_task_args_display(task)})"
             print(f"  {name}{args_str}{deps_str}{flag_str}")
         return 0
 
     # List mode
     if args.list_tasks:
-        # Collect tasks by group, filtering out private tasks
-        ungrouped: list[str] = []
-        groups: dict[str, list[str]] = {}
-        for name in pf.task_order:
-            task = pf.tasks[name]
-            if task.options.private:
-                continue
-            group = task.options.group
-            if group:
-                groups.setdefault(group, []).append(name)
-            else:
-                ungrouped.append(name)
-
-        def _print_task(name: str) -> None:
-            task = pf.tasks[name]
-            parts: list[str] = []
-            if task.dependencies:
-                parts.append(f"depends: {', '.join(task.dependencies)}")
-            if task.arguments:
-                arg_strs = []
-                for a in task.arguments:
-                    prefix = a.variadic or ""
-                    if a.default is not None:
-                        arg_strs.append(f'{prefix}{a.name}="{a.default}"')
-                    else:
-                        arg_strs.append(f"{prefix}{a.name}")
-                parts.append(f"args: {', '.join(arg_strs)}")
-            if task.docker:
-                parts.append(f"docker:{task.docker.tag}")
-            if task.options.llm:
-                parts.append(f"llm: {task.options.llm}")
-            if task.options.agent:
-                parts.append(f"agent: {task.options.agent}")
-            if task.options.on:
-                parts.append(f"on: {task.options.on}")
-            if task.options.secrets:
-                parts.append(f"secrets: {task.options.secrets}")
-            if task.options.os_filter:
-                parts.append(f"os: {task.options.os_filter}")
-            suffix = f" ({'; '.join(parts)})" if parts else ""
-            doc = task.options.doc
-            if doc:
-                desc = doc
-            else:
-                desc = task.prompt.split("\n")[0]
-            if len(desc) > 60:
-                desc = desc[:57] + "..."
-            print(f"  {name}{suffix}")
-            print(f"    {desc}")
-
-        for name in ungrouped:
-            _print_task(name)
-
-        for group_name, task_names in groups.items():
-            print()
-            print(f"  [{group_name}]")
-            for name in task_names:
-                _print_task(name)
-
-        # List aliases
-        if pf.aliases:
-            print()
-            print("  aliases:")
-            for alias_name, alias_target in pf.aliases.items():
-                print(f"    {alias_name} -> {alias_target}")
-
-        # List functions
-        if pf.functions:
-            print()
-            print("  functions:")
-            for fn_name, fn in pf.functions.items():
-                first_line = fn.body.split("\n")[0]
-                if len(first_line) > 60:
-                    first_line = first_line[:57] + "..."
-                print(f"    {fn_name}: {first_line}")
-
-        # List LLM providers
-        if pf.llm_providers:
-            print()
-            default = pf.default_llm
-            print("  llm providers:")
-            for pname, prov in pf.llm_providers.items():
-                marker = " (default)" if pname == default else ""
-                model_str = f" model={prov.model}" if prov.model else ""
-                print(f"    {pname}{model_str}{marker}")
-
-        # List host groups
-        if pf.host_groups:
-            print()
-            print("  host groups:")
-            for gname, group in pf.host_groups.items():
-                user_str = f" user={group.user}" if group.user else ""
-                port_str = f" port={group.port}" if group.port else ""
-                print(f"    {gname}{user_str}{port_str}: {', '.join(group.hosts)}")
-
-        # List guidance
-        if pf.guidance:
-            print()
-            first_line = pf.guidance.split("\n")[0]
-            if len(first_line) > 60:
-                first_line = first_line[:57] + "..."
-            print(f"  guidance: {first_line}")
-
-        # List agents
-        if pf.agents:
-            print()
-            print("  agents:")
-            for aname, agent in pf.agents.items():
-                parts = []
-                if agent.llm:
-                    parts.append(f"llm={agent.llm}")
-                if agent.model:
-                    parts.append(f"model={agent.model}")
-                suffix = f" ({', '.join(parts)})" if parts else ""
-                first_line = agent.instructions.split("\n")[0]
-                if len(first_line) > 60:
-                    first_line = first_line[:57] + "..."
-                print(f"    {aname}{suffix}: {first_line}")
-
+        if args.json_output:
+            _print_json(_list_payload(pf))
+        else:
+            _print_list(pf)
         return 0
 
     target = _resolve_target(pf, args.task)
+    configured_dispatcher = _build_dispatcher(args, honor_dry_run=False)
+
+    if args.capabilities:
+        if target is None:
+            print("error: no tasks defined in Promptfile", file=sys.stderr)
+            return 1
+        if target not in pf.tasks:
+            print(f"error: unknown task: {target!r}", file=sys.stderr)
+            return 1
+        capability_args, arg_error = _build_task_args(pf, args.task, args.task_args)
+        if arg_error:
+            print(f"error: {arg_error}", file=sys.stderr)
+            return 1
+        try:
+            payload = _capability_payload(
+                pf,
+                target,
+                capability_args,
+                configured_dispatcher,
+            )
+        except CycleError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if args.json_output:
+            _print_json(payload)
+        else:
+            _print_capabilities(payload)
+        return 0
 
     if args.graph:
         try:
@@ -1278,7 +1761,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    task_args, arg_error = _build_task_args(pf, args.task, args.task_args)
+    multi_targets = _multi_task_targets(pf, args.task, args.task_args)
+    if multi_targets and args.plan:
+        print("error: --plan does not support multiple task invocation", file=sys.stderr)
+        return 1
+
+    if multi_targets:
+        task_args = None
+        arg_error = None
+    else:
+        task_args, arg_error = _build_task_args(pf, args.task, args.task_args)
     if arg_error:
         print(f"error: {arg_error}", file=sys.stderr)
         return 1
@@ -1300,46 +1792,45 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    # Build dispatcher
-    if args.dry_run:
-        dispatcher = DryRunDispatcher()
-    elif args.shell:
-        dispatcher = ShellDispatcher(args.shell)
-    elif args.codex:
-        dispatcher = CodexDispatcher(model=args.model)
-    elif args.openai:
-        dispatcher = OpenAIDispatcher(model=args.model)
-    elif args.ollama:
-        dispatcher = OllamaDispatcher(model=args.model)
-    else:
-        dispatcher = ClaudeDispatcher(model=args.model)
-
-    if args.serve:
-        return _serve(pf, dispatcher, str(pf_path), args.serve)
+    dispatcher = _build_dispatcher(args)
 
     # Validate that required CLI tools are installed
-    tool_errors = _validate_tools(dispatcher, pf, args.task)
+    tool_errors: list[str] = []
+    for validation_target in multi_targets or [args.task]:
+        tool_errors.extend(_validate_tools(dispatcher, pf, validation_target))
     if tool_errors:
         for err in tool_errors:
             print(err, file=sys.stderr)
         return 1
 
     if args.safe and not args.dry_run:
-        if target is None:
+        safe_targets = multi_targets or [target]
+        if any(safe_target is None for safe_target in safe_targets):
             print("error: no tasks defined in Promptfile", file=sys.stderr)
             return 1
-        if target not in pf.tasks:
-            print(f"error: unknown task: {target!r}", file=sys.stderr)
-            return 1
         try:
-            safe_errors = _validate_safe_mode(
-                pf,
-                target,
-                allow_shell=args.allow_shell,
-                allow_ssh=args.allow_ssh,
-                allow_docker=args.allow_docker,
-                allow_llm=args.allow_llm,
-            )
+            safe_errors = []
+            for safe_target in safe_targets:
+                if safe_target is None:
+                    print("error: no tasks defined in Promptfile", file=sys.stderr)
+                    return 1
+                if safe_target not in pf.tasks:
+                    print(f"error: unknown task: {safe_target!r}", file=sys.stderr)
+                    return 1
+                safe_errors.extend(
+                    _validate_safe_mode(
+                        pf,
+                        safe_target,
+                        allow_shell=args.allow_shell,
+                        allow_ssh=args.allow_ssh,
+                        allow_docker=args.allow_docker,
+                        allow_llm=args.allow_llm,
+                        allow_secrets=args.allow_secrets,
+                        allow_webhook=args.allow_webhook,
+                        task_args=task_args if safe_target == target else None,
+                        dispatcher=configured_dispatcher,
+                    )
+                )
         except CycleError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -1353,13 +1844,24 @@ def main(argv: list[str] | None = None) -> int:
         pf,
         dispatcher,
         quiet=args.quiet,
-        verbose=not args.dry_run and not args.json_output,
+        verbose=args.verbose and not args.dry_run and not args.json_output,
         promptfile_path=str(pf_path),
         dry_run=args.dry_run,
     )
     try:
         started = time.monotonic()
-        if args.parallel:
+        if multi_targets:
+            result = RunResult(target=" ".join(multi_targets))
+            for multi_target in multi_targets:
+                part = (
+                    runner.run_parallel(multi_target, jobs=args.jobs)
+                    if args.parallel
+                    else runner.run(multi_target)
+                )
+                result.task_results.extend(part.task_results)
+                if not part.success:
+                    break
+        elif args.parallel:
             result = runner.run_parallel(target, args=task_args, jobs=args.jobs)
         else:
             result = runner.run(target, args=task_args)
@@ -1379,18 +1881,25 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = None
     if not args.dry_run and not args.no_history:
-        run_id = record_run(result, duration_ms=duration_ms, promptfile_path=str(pf_path))
-
-    if args.json_output:
-        _print_json(_run_result_payload(
+        run_id = record_run(
             result,
             duration_ms=duration_ms,
             promptfile_path=str(pf_path),
-            dry_run=args.dry_run,
-            parallel=args.parallel,
-            jobs=args.jobs,
-            run_id=run_id,
-        ))
+            redact=runner._redact,
+        )
+
+    if args.json_output:
+        _print_json(
+            _run_result_payload(
+                result,
+                duration_ms=duration_ms,
+                promptfile_path=str(pf_path),
+                dry_run=args.dry_run,
+                parallel=args.parallel,
+                jobs=args.jobs,
+                run_id=run_id,
+            )
+        )
         return 0 if result.success else 1
 
     # Print results

@@ -1,0 +1,34 @@
+# Kubernetes/kubectl workflow
+
+namespace := "default"
+app := "myapp"
+manifest_dir := "k8s"
+
+task context:
+    !kubectl config current-context
+    !kubectl get ns {{quote(namespace)}}
+
+task diff: context:
+    !kubectl diff -n {{quote(namespace)}} -f {{quote(manifest_dir)}} || true |>
+    summarize the Kubernetes changes and highlight destructive operations
+
+task server-dry-run: context:
+    !kubectl apply -n {{quote(namespace)}} -f {{quote(manifest_dir)}} --dry-run=server -o yaml |>
+    inspect the rendered manifests for invalid fields, risky security contexts, and rollout hazards
+
+task apply: context diff [confirm("Apply Kubernetes manifests?")]:
+    !kubectl apply -n {{quote(namespace)}} -f {{quote(manifest_dir)}}
+    !kubectl rollout status -n {{quote(namespace)}} deploy/{{quote(app)}} --timeout=120s
+
+task undo [confirm("Undo the last deployment rollout?")]:
+    !kubectl rollout undo -n {{quote(namespace)}} deploy/{{quote(app)}}
+    !kubectl rollout status -n {{quote(namespace)}} deploy/{{quote(app)}} --timeout=120s
+
+task diagnose:
+    !kubectl get pods -n {{quote(namespace)}} -l app={{quote(app)}} -o wide
+    !kubectl describe deploy/{{quote(app)}} -n {{quote(namespace)}} |>
+    diagnose rollout or scheduling issues
+
+task logs:
+    !kubectl logs -n {{quote(namespace)}} deploy/{{quote(app)}} --tail=100 |>
+    explain application errors and likely fixes

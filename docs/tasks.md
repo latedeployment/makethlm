@@ -119,7 +119,7 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 |--------|------|-------------|
 | `model` | string | LLM model to use for this task |
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
-| `max_tokens` | int | Maximum tokens in the LLM response |
+| `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
 | `llm` | string | Name of the LLM provider to use (must be declared globally) |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
@@ -128,6 +128,8 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `confirm` | flag/string | Prompt for confirmation before running. Use `confirm`, `confirm="Are you sure?"`, or Just-style `confirm("Are you sure?")` |
 | `default` | flag | Make this task the default target |
 | `env(NAME, VALUE)` | attribute | Set an environment variable for this task's shell steps |
+| `script` | flag/string | Run the task body as one temporary script; use `script("python3")` to choose an interpreter |
+| `extension("ext")` | attribute | File extension for script recipes, e.g. `extension("py")` |
 | `os` | string | Only run this task on the specified OS (e.g., `os=linux`) |
 | `linux` | flag | Shorthand for `os=linux` |
 | `macos` | flag | Shorthand for `os=macos` |
@@ -141,6 +143,19 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
+| `postmortem` | string | Diagnostic task to run after failure and before rollback |
+| `fallback-llm` | string | Up to four `|`-separated providers to try after the primary provider; duplicates are removed |
+| `retries` | integer | LLM retries per provider, from 0 through 10 |
+| `requires` | string | `|`-separated `artifact.field[:type]` input contracts |
+| `produces` | string | Aggregate output type: `text`, `nonempty`, `json`, `object`, `array`, `integer`, `number`, or `boolean` |
 | `ssh-key` | string | SSH identity file for this task's remote shell steps |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
+| `sandbox` | string | Wrap shell steps with `docker`, `systemd`, `bwrap`, or `none` |
+| `sandbox-image` | string | Docker sandbox image, defaulting to `ubuntu:latest` |
+| `sandbox-mount` | string | Extra Docker mount in `source:target[:mode]` form |
+| `sandbox-net` | string | Sandbox network mode: `none` (default) or `host` |
+| `sandbox-read-only` | flag | Mount the workspace read-only where the sandbox backend supports it |
+
+See [Reliable Workflows](reliability.md) for postmortems, contracts, provider
+fallbacks, deterministic cache inputs, and run replay.

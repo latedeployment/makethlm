@@ -73,6 +73,8 @@ fi
 # --- Tests ---
 if ! $SKIP_TESTS; then
     echo "==> Running tests..."
+    uv run ruff check .
+    uv run ruff format --check .
     uv run pytest tests/ -q --no-docker
     echo "    Tests passed."
 else

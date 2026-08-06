@@ -1,0 +1,24 @@
+# Docker Compose deployment workflow
+
+project := "myapp"
+compose_file := "compose.yaml"
+
+task validate:
+    !docker compose -f {{quote(compose_file)}} config --quiet
+
+task plan: validate:
+    !docker compose -f {{quote(compose_file)}} ps |>
+    summarize the current compose service state and flag risky changes
+
+task deploy: validate:
+    !docker compose -f {{quote(compose_file)}} pull
+    !docker compose -f {{quote(compose_file)}} up -d --remove-orphans
+    !docker compose -f {{quote(compose_file)}} ps |>
+    verify {{project}} appears healthy
+
+task logs service="web":
+    !docker compose -f {{quote(compose_file)}} logs --tail=100 {{quote(service)}} |>
+    explain recent errors and likely remediation steps
+
+task rollback:
+    !docker compose -f {{quote(compose_file)}} up -d

@@ -1,0 +1,20 @@
+# Ansible inventory and remote deploy workflow
+
+inventory "inventory.ini"
+
+task ping [on=web]:
+    !hostname
+    !uptime
+
+task deploy [on=web, ssh-parallel, timeout=60s, rollback=rollback]:
+    !sudo systemctl stop myapp
+    !sudo install -m 0755 /tmp/myapp /opt/myapp/myapp
+    !sudo systemctl start myapp
+    !sudo systemctl is-active myapp
+
+task inspect [on=web]:
+    !sudo journalctl -u myapp -n 80 --no-pager |>
+    summarize host-specific service failures
+
+task rollback [on=web, ssh-parallel]:
+    !sudo systemctl restart myapp

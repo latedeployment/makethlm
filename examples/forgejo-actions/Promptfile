@@ -1,0 +1,14 @@
+# Forgejo Actions workflow helpers
+
+task check:
+    !uv run ruff check .
+    !uv run pytest -q
+
+task changed-security:
+    !git diff --name-only |>
+    review the changed files for command injection, secret exposure, and unsafe defaults
+
+task package:
+    !uv build
+    !ls -lah dist |>
+    verify the package artifacts look ready to publish

@@ -56,7 +56,7 @@ web2.example.com
 """)
         try:
             groups = parse_ansible_inventory(path)
-            assert groups["webservers"].user == "deploy"
+            assert groups["webservers"].connections["web1.example.com"].user == "deploy"
         finally:
             os.unlink(path)
 
@@ -67,7 +67,7 @@ web1.example.com ansible_port=2222
 """)
         try:
             groups = parse_ansible_inventory(path)
-            assert groups["webservers"].port == 2222
+            assert groups["webservers"].connections["web1.example.com"].port == 2222
         finally:
             os.unlink(path)
 
@@ -80,8 +80,8 @@ db1.example.com ansible_user=postgres ansible_port=5432
             groups = parse_ansible_inventory(path)
             grp = groups["databases"]
             assert grp.hosts == ["db1.example.com"]
-            assert grp.user == "postgres"
-            assert grp.port == 5432
+            assert grp.connections["db1.example.com"].user == "postgres"
+            assert grp.connections["db1.example.com"].port == 5432
         finally:
             os.unlink(path)
 
@@ -176,5 +176,24 @@ web1.example.com
             # ungrouped_host should be ignored (no current group)
             assert "webservers" in groups
             assert groups["webservers"].hosts == ["web1.example.com"]
+        finally:
+            os.unlink(path)
+
+    def test_per_host_connection_values_do_not_leak_between_hosts(self):
+        path = self._write_inventory("""\
+[webservers]
+web1.example.com ansible_user=alice ansible_port=2201
+web2.example.com ansible_user=bob ansible_port=2202
+web3.example.com
+""")
+        try:
+            group = parse_ansible_inventory(path)["webservers"]
+            assert group.user is None
+            assert group.port is None
+            assert group.connections["web1.example.com"].user == "alice"
+            assert group.connections["web1.example.com"].port == 2201
+            assert group.connections["web2.example.com"].user == "bob"
+            assert group.connections["web2.example.com"].port == 2202
+            assert "web3.example.com" not in group.connections
         finally:
             os.unlink(path)

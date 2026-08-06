@@ -5,9 +5,9 @@
 # realistic Promptfiles you can copy and adapt.
 #
 # Usage:
-#   justprompt --list                   # list tasks, functions, hosts, llms
-#   justprompt --dry-run build          # preview what would run
-#   justprompt deploy staging           # deploy with args
+#   makethlm --list                     # list tasks, functions, hosts, llms
+#   makethlm --dry-run build            # preview what would run
+#   makethlm deploy staging             # deploy with args
 # ==========================================================================
 
 # --------------------------------------------------------------------------

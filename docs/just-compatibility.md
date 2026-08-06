@@ -24,6 +24,12 @@ keeping makethlm's LLM-oriented task model.
 | Default attribute | Supported with `[default]` |
 | Confirmation attributes | Supported with `[confirm]`, `[confirm="message"]`, and `[confirm("message")]` |
 | Env attributes | Supported with `[env(NAME, VALUE)]` for task shell steps |
+| Script recipes | Supported with shebang recipes, `[script]`, and `[script("COMMAND")]` |
+| Subsequent dependencies | Supported with `&&` |
+| Module recipes | Supported with `mod name "path"` and `name::recipe` task names; variables, functions, providers, agents, hosts, guidance, aliases, and hooks stay namespaced |
+| Multiple recipe invocation | Supported with `makethlm task1 task2` when tasks have no args |
+| Shell array setting | Supported with `set shell := ["bash", "-cu"]` |
+| Fallback/global search | Searches parent directories and `$XDG_CONFIG_HOME/makethlm/Promptfile` |
 | Listing and summaries | Supported with `--list` and `--summary` |
 | Shell completions | Supported with `makethlm completions bash|zsh|fish` |
 
@@ -49,18 +55,13 @@ extensions, not Just syntax.
 
 These are the largest gaps to close for stronger Just compatibility:
 
-- `mod` submodules and `module::recipe` invocation.
-- Just's full attribute syntax, including `[script]`, `[extension]`,
-  `[metadata]`, and `[env]`.
-- Shebang/script recipes.
-- Subsequent dependencies with `&&`.
-- Multiple recipe invocation in one command.
-- Fallback/global justfile search.
-- Shell setting array syntax, such as `set shell := ["bash", "-cu"]`.
-- More built-in functions, especially path and environment helpers.
+- Unqualified module imports and the remaining edge cases of full Just module parity.
+- Full Just attribute parity for `[metadata]` output shape and advanced `[env]`
+  behavior.
+- More built-in functions, especially edge-case path helpers.
 
 ## Implementation Priority
 
-1. Add shebang/script recipe support.
-2. Add `mod` parsing and `module::recipe` execution.
-3. Add richer `--list` output.
+1. Add richer `--list` output.
+2. Expand module compatibility.
+3. Expand built-in function parity.
