@@ -49,6 +49,12 @@ $ makethlm deploy staging
 - **Reusable functions** -- `fn`/`@use` for shared prompt templates
 - **Docker generation** -- describe Docker images in prose, makethlm builds them
 - **SSH host inventory** -- run shell commands on remote hosts via SSH
+- **Reliable workflows** -- postmortems, rollback, typed artifact contracts,
+  bounded provider fallback, reproducible cache keys, and redacted replay
+- **Capability-first safety** -- inspect transitive shell, SSH, Docker, LLM,
+  secret, and webhook requirements before execution
+- **Namespaced modules** -- reuse tasks and their variables, providers, agents,
+  hosts, guidance, aliases, and failure hooks without name collisions
 - **Variable system** -- `{{var}}` interpolation, backtick execution, string functions, conditionals
 - **Justfile-compatible** -- familiar syntax for Just users (`set` directives, `if/else`, built-in functions)
 

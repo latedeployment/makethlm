@@ -146,6 +146,23 @@ task greet:
     Deploy to {{env}}     # resolves to "production"
 ```
 
+## Modules
+
+Modules keep imported definitions in a namespace instead of merging them into
+the parent Promptfile:
+
+```make
+mod ops "ops.pf"
+
+task release: ops::deploy:
+    @echo release complete
+```
+
+The imported task is addressed as `ops::deploy`. Module variables, functions,
+providers, agents, host groups, guidance, aliases, rollback hooks,
+postmortems, and nested modules stay under `ops::`. The module path defaults
+to `ops.pf` when only `mod ops` is written.
+
 ## Aliases
 
 Create short aliases for tasks:

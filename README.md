@@ -12,9 +12,9 @@ by LLMs. Define your build, deploy, review, and maintenance workflows as
 prose, interleave them with shell commands, and let your LLM of choice do the
 heavy lifting.
 
-Recent additions include Codex support, execution previews, local history,
-stricter safety controls, and ready-made workflow examples for C, CMake, and
-Python projects.
+Recent additions include failure postmortems, typed artifact contracts,
+provider retries and fallbacks, capability inspection, reproducible caching,
+redacted run replay, stricter safety controls, and deployment-ready examples.
 
 ```
 # Promptfile
@@ -68,8 +68,10 @@ $ makethlm deploy staging
   - [Environment Variables](#environment-variables)
   - [Task Metadata Options](#task-metadata-options)
   - [Reliable Workflows](#reliable-workflows)
+  - [Modules](#modules)
   - [Set Directives](#set-directives)
   - [Aliases](#aliases)
+- [Safety and Capability Inspection](#safety-and-capability-inspection)
 - [CLI Reference](#cli-reference)
 - [Comparison with Make and Just](#comparison-with-make-and-just)
 
@@ -555,6 +557,11 @@ task deploy [on=web]:
 
 SSH connections use `BatchMode=yes` for non-interactive operation.
 
+Ansible INI inventories are also supported. Per-host `ansible_user` and
+`ansible_port` values remain attached to the host that declared them rather
+than leaking into group defaults. See
+[SSH and host inventory](docs/ssh.md) for an example.
+
 Task-level SSH options can override host group settings:
 
 ```
@@ -638,11 +645,13 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
 | `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
 | `llm` | string | Name of the LLM provider to use (must be declared globally) |
+| `agent` | string | Named agent whose instructions/provider apply to this task |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
 | `group` | string | Group heading for `--list` (e.g., `group="deploy"`) |
 | `doc` | string | Description shown in `--list` output |
 | `confirm` | flag/string | Prompt for confirmation before running. Use `confirm` for the default message or `confirm="Are you sure?"` for a custom one |
+| `default` | flag | Make this task the default target |
 | `os` | string | Only run this task on the specified OS (e.g., `os=linux`) |
 | `linux` | flag | Shorthand for `os=linux` (Justfile-compatible) |
 | `macos` | flag | Shorthand for `os=macos` (Justfile-compatible) |
@@ -653,6 +662,12 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `no-exit-message` | flag | Suppress error message on failure |
 | `no-quiet` | flag | Override global `set quiet` for this task |
 | `positional-arguments` | flag | Per-task override for positional argument passing |
+| `register` | string | Store the task result under a custom artifact name |
+| `webhook` | string | Deliver the task result to an HTTP(S) webhook |
+| `webhook-on` | string | Deliver on `always`, `success`, or `failure` |
+| `secrets` | string | Override the configured secret backend for this task |
+| `when` | expression | Run only when the condition is true; repeat for multiple conditions |
+| `cache` | duration | Reuse successful results for a duration such as `30m`, `1h`, or `1d` |
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
@@ -664,8 +679,14 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `ssh-key` | string | SSH identity file for this task's remote shell steps |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
+| `sandbox` | string | Wrap shell steps with `docker`, `systemd`, `bwrap`, or `none` |
+| `sandbox-image` | string | Docker sandbox image, defaulting to `ubuntu:latest` |
+| `sandbox-mount` | string | Extra Docker mount in `source:target[:mode]` form |
+| `sandbox-net` | string | Sandbox network mode: `none` (default) or `host` |
+| `sandbox-read-only` | flag | Mount the workspace read-only where supported |
 | `script` | flag/string | Run the task body as one temporary script; use `script("python3")` to choose an interpreter |
 | `extension("ext")` | string | File extension for script recipes, e.g. `extension("py")` |
+| `metadata` | flag | Mark the task for Just-compatible metadata output |
 | `env(NAME, VALUE)` | string | Set an environment variable for task shell steps |
 
 Options can be combined with dependencies:
@@ -712,10 +733,47 @@ task review [llm=cloud, retries=1, fallback-llm=local]:
     review the release diff
 ```
 
+Enable caching with a duration:
+
+```
+task inspect [cache=1h, produces=object]:
+    !./scripts/inspect --json
+```
+
 Cache keys include resolved execution inputs such as arguments, variables,
-upstream artifacts, provider and agent configuration, task options, and
-referenced environment variables. Failed or secret-resolving tasks are not
-cached.
+expanded `@use` functions, upstream artifacts, provider and agent
+configuration, task options, and referenced environment variables. Failed
+tasks and tasks that read sensitive inputs are not cached. Cached step results
+are restored so downstream artifacts behave the same as a fresh run.
+
+Successful and failed non-dry runs are stored as redacted local bundles:
+
+```bash
+makethlm history
+makethlm replay 42
+makethlm --json replay 42
+```
+
+Replay only displays the recorded run; it never executes the task again. See
+[Reliable Workflows](docs/reliability.md) for the full behavior of
+postmortems, contracts, retries, caching, and replay.
+
+### Modules
+
+Use modules to reuse a Promptfile without merging its names into the parent:
+
+```make
+# Promptfile
+mod ops "ops.pf"
+
+task release: ops::deploy:
+    @echo release complete
+```
+
+Tasks are invoked as `ops::deploy`. Variables, functions, providers, agents,
+host groups, guidance, aliases, rollback hooks, postmortems, and nested modules
+remain under the same `ops::` namespace. `makethlm --list` shows module tasks
+and aliases explicitly.
 
 ### Set Directives
 
@@ -935,6 +993,30 @@ alias r := review
 ```
 
 After defining an alias, `makethlm d` is equivalent to `makethlm deploy`.
+
+---
+
+## Safety and Capability Inspection
+
+Before running an unfamiliar task, inspect its complete dependency,
+postmortem, and rollback closure:
+
+```bash
+makethlm --capabilities deploy
+makethlm --capabilities --json deploy
+makethlm --plan deploy
+```
+
+`--safe` blocks capabilities unless their corresponding flags are passed.
+Shell, SSH, Docker, LLM, secret/environment reads, and webhooks have separate
+permissions. Claude CLI, Codex CLI, and shell-template providers can execute
+locally, so they require both `--allow-llm` and `--allow-shell`; native OpenAI
+and Ollama HTTP providers do not add the local-shell capability.
+
+Inspection commands disable parse-time backticks unless
+`--allow-backticks` is explicitly supplied. Plans, output, history, replay
+bundles, artifacts, and webhook bodies redact known secret values. See
+[Security](docs/security.md) for the full threat model and redaction rules.
 
 ---
 

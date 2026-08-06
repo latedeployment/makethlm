@@ -121,6 +121,7 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
 | `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
 | `llm` | string | Name of the LLM provider to use (must be declared globally) |
+| `agent` | string | Named agent whose instructions/provider apply to this task |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
 | `group` | string | Group heading for `--list` (e.g., `group="deploy"`) |
@@ -140,6 +141,12 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `no-exit-message` | flag | Suppress error message on failure |
 | `no-quiet` | flag | Override global `set quiet` for this task |
 | `positional-arguments` | flag | Per-task override for positional argument passing |
+| `register` | string | Store the task result under a custom artifact name |
+| `webhook` | string | Deliver the task result to an HTTP(S) webhook |
+| `webhook-on` | string | Deliver on `always`, `success`, or `failure` |
+| `secrets` | string | Override the configured secret backend for this task |
+| `when` | expression | Run only when the condition is true; repeat for multiple conditions |
+| `cache` | duration | Reuse successful results for a duration such as `30m`, `1h`, or `1d` |
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
@@ -156,6 +163,7 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `sandbox-mount` | string | Extra Docker mount in `source:target[:mode]` form |
 | `sandbox-net` | string | Sandbox network mode: `none` (default) or `host` |
 | `sandbox-read-only` | flag | Mount the workspace read-only where the sandbox backend supports it |
+| `metadata` | flag | Mark the task for Just-compatible metadata output |
 
 See [Reliable Workflows](reliability.md) for postmortems, contracts, provider
 fallbacks, deterministic cache inputs, and run replay.

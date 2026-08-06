@@ -72,12 +72,22 @@ four distinct providers.
 
 ## Reproducible Caching
 
+Enable caching by setting a duration on the task:
+
+```make
+task inspect [cache=1h, produces=object]:
+    !./scripts/inspect --json
+```
+
+Durations support seconds, minutes, hours, and days, such as `30s`, `15m`,
+`1h`, and `1d`.
+
 Task cache keys are content-addressed. They include task steps and options,
-arguments, Promptfile variables, upstream artifacts, provider and agent
-configuration, guidance, Docker configuration, and referenced environment
-variables. Failed tasks and tasks with explicit secret resolution are not
-cached. Cached step results are restored so downstream artifacts remain
-equivalent to an uncached run.
+expanded `@use` function bodies, arguments, Promptfile variables, upstream
+artifacts, provider and agent configuration, guidance, Docker configuration,
+and referenced environment variables. Failed tasks and tasks that read
+sensitive inputs are not cached. Cached step results are restored so
+downstream artifacts remain equivalent to an uncached run.
 
 ## Run Replay
 
