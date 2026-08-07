@@ -147,8 +147,10 @@ See also [`examples/cmake-project/`](examples/cmake-project/),
 
 ## Promptfile Syntax Reference
 
-Promptfile looks for a file named `Promptfile`, `promptfile`, `Promptfile.pf`,
-or `promptfile.pf` in the current directory (or specify one with `-f`).
+makethlm looks for a file named `Promptfile`, `promptfile`, `Promptfile.pf`, `promptfile.pf`, `.promptfile`,
+`.Promptfile`, `.promptfile.pf`, `.Promptfile.pf`, `PROMPTFILE`, or `PROMPTFILE.pf` in the current directory,
+then in each parent directory, then at
+`$XDG_CONFIG_HOME/makethlm/Promptfile`. `-f` overrides discovery.
 
 ### Comments
 
@@ -644,7 +646,8 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `model` | string | LLM model to use for this task |
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
 | `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
-| `llm` | string | Name of the LLM provider to use (must be declared globally) |
+| `llm` | string | Provider name; `"a\|b"` fans out to several at once |
+| `judge` | string | Provider that merges fan-out answers into one response |
 | `agent` | string | Named agent whose instructions/provider apply to this task |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
@@ -668,6 +671,8 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `secrets` | string | Override the configured secret backend for this task |
 | `when` | expression | Run only when the condition is true; repeat for multiple conditions |
 | `cache` | duration | Reuse successful results for a duration such as `30m`, `1h`, or `1d` |
+| `sources` | string | Input file patterns; skip the task when outputs are newer |
+| `outputs` | string | Output file patterns compared against `sources` |
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
@@ -676,6 +681,8 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 | `retries` | integer | LLM retries per provider, from 0 through 10 |
 | `requires` | string | `|`-separated `artifact.field[:type]` input contracts |
 | `produces` | string | Output contract: `text`, `nonempty`, `json`, `object`, `array`, `integer`, `number`, or `boolean` |
+| `repair` | int | Re-prompt up to N times (max 3) when `produces` is violated |
+| `max-cost` | string | Stop the run when LLM spend reaches this many US dollars |
 | `ssh-key` | string | SSH identity file for this task's remote shell steps |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
@@ -733,6 +740,19 @@ task review [llm=cloud, retries=1, fallback-llm=local]:
     review the release diff
 ```
 
+Skip a task whose outputs are already newer than its inputs, the way `make`
+does:
+
+```
+task build [sources="src/*.c, include/*.h", outputs="build/app"]:
+    !mkdir -p build
+    !cc -o build/app src/*.c
+```
+
+Patterns are comma-separated and support `*`, `?`, `[...]`, and recursive `**`.
+The task runs whenever an output is missing, no source matched, or any source
+is newer than the oldest output. `--always-make` (`-B`) forces a run.
+
 Enable caching with a duration:
 
 ```
@@ -740,7 +760,8 @@ task inspect [cache=1h, produces=object]:
     !./scripts/inspect --json
 ```
 
-Cache keys include resolved execution inputs such as arguments, variables,
+Cache keys include resolved execution inputs such as `sources` file contents,
+arguments, variables,
 expanded `@use` functions, upstream artifacts, provider and agent
 configuration, task options, and referenced environment variables. Failed
 tasks and tasks that read sensitive inputs are not cached. Cached step results
@@ -1052,6 +1073,13 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--dry-run` | | Print prompts and commands without executing them |
 | `--json` | | Emit machine-readable JSON output |
 | `--parallel` | | Run independent dependency tasks in parallel |
+| `--always-make` | `-B` | Run tasks even when sources are unchanged or results are cached |
+| `--since REF` | | Git ref that `changed()`/`changed_files()` compare against |
+| `--watch` | | Re-run the target whenever a watched source file changes |
+| `--watch-interval SECONDS` | | Polling interval for `--watch` (default: 1.0) |
+| `--max-cost USD` | | Stop the run once LLM spend reaches this many US dollars |
+| `--fixtures DIR` | | Serve LLM responses from recorded fixtures in DIR |
+| `--record-fixtures` | | Call providers normally and record responses into `--fixtures DIR` |
 | `--jobs N` | | Limit parallel task workers; implies `--parallel` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
@@ -1088,6 +1116,10 @@ makethlm deploy -V env=production
 # Preview what would happen
 makethlm --dry-run deploy staging
 
+# Format Promptfiles
+makethlm fmt
+makethlm fmt --check
+
 # Validate without executing
 makethlm --check
 makethlm --check --json
@@ -1116,6 +1148,10 @@ makethlm history
 makethlm --history 50
 makethlm replay 42
 makethlm --json replay 42
+
+# Record LLM responses once, then re-run offline in CI
+makethlm --fixtures tests/fixtures --record-fixtures review
+makethlm --fixtures tests/fixtures review
 
 # Run with explicit safety permissions
 makethlm --safe --allow-shell --allow-llm --allow-secrets test

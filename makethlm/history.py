@@ -46,6 +46,16 @@ def init_history(path: Path | None = None) -> Path:
             )
             """
         )
+        # Older databases predate cost accounting; add the columns in place.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        for column, ddl in (
+            ("tokens_in", "INTEGER NOT NULL DEFAULT 0"),
+            ("tokens_out", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_usd", "REAL NOT NULL DEFAULT 0"),
+            ("llm_calls", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")
     os.chmod(db_path, 0o600)
     return db_path
 
@@ -57,6 +67,7 @@ def record_run(
     promptfile_path: str | None,
     path: Path | None = None,
     redact: Callable[[str], str] | None = None,
+    costs: dict[str, Any] | None = None,
 ) -> int:
     """Store a run result and return the inserted run id."""
     db_path = init_history(path)
@@ -92,8 +103,9 @@ def record_run(
         cur = conn.execute(
             """
             INSERT INTO runs (
-                started_at, target, success, duration_ms, promptfile, task_count, tasks_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                started_at, target, success, duration_ms, promptfile, task_count,
+                tasks_json, tokens_in, tokens_out, cost_usd, llm_calls
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -103,9 +115,13 @@ def record_run(
                 promptfile_path,
                 len(result.task_results),
                 json.dumps(tasks),
+                int((costs or {}).get("tokens_in", 0)),
+                int((costs or {}).get("tokens_out", 0)),
+                float((costs or {}).get("cost_usd", 0.0)),
+                int((costs or {}).get("calls", 0)),
             ),
         )
-        return int(cur.lastrowid)
+        return int(cur.lastrowid or 0)
 
 
 def list_runs(limit: int = 20, *, path: Path | None = None) -> list[dict[str, Any]]:
@@ -115,7 +131,8 @@ def list_runs(limit: int = 20, *, path: Path | None = None) -> list[dict[str, An
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT id, started_at, target, success, duration_ms, promptfile, task_count, tasks_json
+            SELECT id, started_at, target, success, duration_ms, promptfile, task_count,
+                   tasks_json, tokens_in, tokens_out, cost_usd, llm_calls
             FROM runs
             ORDER BY id DESC
             LIMIT ?
@@ -133,7 +150,7 @@ def get_run(run_id: int, *, path: Path | None = None) -> dict[str, Any] | None:
         row = conn.execute(
             """
             SELECT id, started_at, target, success, duration_ms, promptfile,
-                   task_count, tasks_json
+                   task_count, tasks_json, tokens_in, tokens_out, cost_usd, llm_calls
             FROM runs
             WHERE id = ?
             """,

@@ -31,6 +31,13 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--json` | | Emit machine-readable JSON output |
 | `--parallel` | | Run independent dependency tasks in parallel |
 | `--jobs N` | | Limit parallel task workers; implies `--parallel` |
+| `--always-make` | `-B` | Run tasks even when sources are unchanged or results are cached |
+| `--since REF` | | Git ref that `changed()`/`changed_files()` compare against |
+| `--watch` | | Re-run the target whenever a watched source file changes |
+| `--watch-interval SECONDS` | | Polling interval for `--watch` (default: 1.0) |
+| `--max-cost USD` | | Stop the run once LLM spend reaches this many US dollars |
+| `--fixtures DIR` | | Serve LLM responses from recorded fixtures in DIR |
+| `--record-fixtures` | | Call providers normally and record responses into `--fixtures DIR` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
 | `--var NAME=VALUE` | `-V` | Override a variable (can be repeated) |
 | `--shell TEMPLATE` | | Use an LLM CLI argv template (e.g., `'ollama run llama3 "{prompt}"'`) |
@@ -151,3 +158,31 @@ $ makethlm --list
     web user=deploy: web1.prod.internal, web2.prod.internal
     db user=postgres port=5433: db-primary.prod.internal
 ```
+
+## Formatting
+
+`makethlm fmt` rewrites Promptfiles into a canonical layout:
+
+```bash
+makethlm fmt                 # format the discovered Promptfile
+makethlm fmt ops/deploy.pf   # format specific files
+makethlm fmt --check         # exit 1 if anything would change (for CI)
+```
+
+The formatter only touches layout: body indentation becomes four spaces,
+relative indentation inside script recipes is preserved, trailing whitespace is
+removed, runs of blank lines collapse to one, option brackets become
+`[a=1, b=2]`, and the file ends with a single newline. Prompt prose, shell
+commands, and the blank-line grouping you chose between declarations are left
+alone.
+
+## Promptfile Discovery
+
+Resolution order:
+
+1. `-f PATH`.
+2. The first matching name in the current directory, then each parent:
+   `Promptfile`, `promptfile`, `Promptfile.pf`, `promptfile.pf`, `.promptfile`,
+   `.Promptfile`, `.promptfile.pf`, `.Promptfile.pf`, `PROMPTFILE`,
+   `PROMPTFILE.pf`.
+3. The same names under `$XDG_CONFIG_HOME/makethlm/`.

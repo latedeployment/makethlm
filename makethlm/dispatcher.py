@@ -19,10 +19,26 @@ from .subprocess_util import run_subprocess
 
 @dataclass
 class DispatchResult:
-    """Result from dispatching a prompt to an LLM."""
+    """Result from dispatching a prompt to an LLM.
+
+    Providers that report usage fill in the token counts; ``cost_usd`` is set
+    only by providers that report spend directly. Otherwise the runner derives
+    cost from the provider's declared prices.
+    """
 
     response: str
     success: bool
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: float | None = None
+
+
+def _int_or_none(value: object) -> int | None:
+    """Return a non-negative int from provider usage data, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = int(value)
+    return number if number >= 0 else None
 
 
 def _extract_tool_name(template: str) -> str | None:
@@ -76,6 +92,41 @@ def _llm_timeout(task: Task, default: float = 300) -> float:
     return default
 
 
+def _is_unknown_option_error(stderr: str) -> bool:
+    """Return True when a CLI rejected a flag it does not know about."""
+    lowered = (stderr or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "unknown option",
+            "unrecognized option",
+            "unknown argument",
+            "no such option",
+        )
+    )
+
+
+def _claude_dispatch_result(stdout: str, success: bool) -> DispatchResult:
+    """Parse Claude CLI output, using the JSON envelope when present."""
+    text = (stdout or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and "result" in data:
+            usage = data.get("usage") or {}
+            cost = data.get("total_cost_usd")
+            return DispatchResult(
+                response=str(data.get("result", "")),
+                success=success and not data.get("is_error", False),
+                tokens_in=_int_or_none(usage.get("input_tokens")),
+                tokens_out=_int_or_none(usage.get("output_tokens")),
+                cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+            )
+    return DispatchResult(response=stdout, success=success)
+
+
 class ClaudeDispatcher(Dispatcher):
     """Dispatches prompts to the Claude CLI (`claude -p`)."""
 
@@ -97,6 +148,9 @@ class ClaudeDispatcher(Dispatcher):
             f"[makethlm-{task.name}] You are a makethlm sub-agent executing task '{task.name}'."
         )
         cmd.extend(["--system-prompt", system_prompt])
+        # Ask for the JSON envelope so usage and cost are reported. Older CLIs
+        # that reject the flag fall back to plain text below.
+        cmd.extend(["--output-format", "json"])
 
         try:
             result = run_subprocess(
@@ -105,10 +159,14 @@ class ClaudeDispatcher(Dispatcher):
                 text=True,
                 timeout=_llm_timeout(task),
             )
-            return DispatchResult(
-                response=result.stdout,
-                success=result.returncode == 0,
-            )
+            if result.returncode != 0 and _is_unknown_option_error(result.stderr):
+                result = run_subprocess(
+                    cmd[:-2],
+                    capture_output=True,
+                    text=True,
+                    timeout=_llm_timeout(task),
+                )
+            return _claude_dispatch_result(result.stdout, result.returncode == 0)
         except FileNotFoundError:
             return DispatchResult(
                 response="error: 'claude' CLI not found on PATH",
@@ -203,7 +261,7 @@ class OpenAIDispatcher(Dispatcher):
             return DispatchResult(response="error: OPENAI_API_KEY is not set", success=False)
 
         model = task.options.model or self.default_model or "gpt-4o-mini"
-        payload = {
+        payload: dict[str, object] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -225,7 +283,13 @@ class OpenAIDispatcher(Dispatcher):
             with urllib.request.urlopen(request, timeout=_llm_timeout(task)) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return DispatchResult(response=content, success=bool(content))
+            usage = data.get("usage") or {}
+            return DispatchResult(
+                response=content,
+                success=bool(content),
+                tokens_in=_int_or_none(usage.get("prompt_tokens")),
+                tokens_out=_int_or_none(usage.get("completion_tokens")),
+            )
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             return DispatchResult(
@@ -255,7 +319,14 @@ class OllamaDispatcher(Dispatcher):
             with urllib.request.urlopen(request, timeout=_llm_timeout(task)) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = data.get("response", "")
-            return DispatchResult(response=content, success=not data.get("error") and bool(content))
+            return DispatchResult(
+                response=content,
+                success=not data.get("error") and bool(content),
+                tokens_in=_int_or_none(data.get("prompt_eval_count")),
+                tokens_out=_int_or_none(data.get("eval_count")),
+                # A local Ollama server has no per-token price.
+                cost_usd=0.0,
+            )
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")
             return DispatchResult(

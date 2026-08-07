@@ -9,6 +9,8 @@ This repository contains the `makethlm` Python CLI package. Code lives in `maket
 - `models.py` defines the Promptfile AST plus interpolation, functions, and conditions.
 - `runner.py` executes tasks, dependencies, shell steps, SSH, Docker, caching, and webhooks.
 - `dispatcher.py` routes prompt steps to dry-run, Claude CLI, or shell-template providers.
+- `contracts.py`, `cost.py`, `staleness.py`, `fixtures.py`, `gitinfo.py`, `ratelimit.py`,
+  `formatter.py`, and `progress.py` hold focused logic split out of the larger modules.
 
 Tests live in `tests/`. Examples are under `examples/`, documentation under `docs/`, and MkDocs configuration is in `mkdocs.yml`. Treat `dist/`, `site/`, `*.egg-info`, `__pycache__/`, and compiled example outputs as generated.
 
@@ -16,6 +18,7 @@ Tests live in `tests/`. Examples are under `examples/`, documentation under `doc
 
 - `uv run pytest tests/ -q --no-docker`: run the standard test suite without Docker-backed SSH integration tests.
 - `uv run ruff check .`: run the local lint gate.
+- `uv run mypy`: run the type gate; it must stay clean.
 - `uv run pytest tests/test_parser.py -q`: run a focused parser test file.
 - `uv run makethlm --help`: exercise the CLI entry point locally.
 - `uv build --wheel`: build the package wheel.

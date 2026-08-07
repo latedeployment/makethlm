@@ -54,6 +54,27 @@ task publish [requires="build.stdout:nonempty|metadata.stdout:object"]: build me
 Contracts fail closed with exit code 2 and appear as `contract` steps in JSON
 and replay bundles.
 
+## Contract Repair
+
+An LLM that answers with prose around its JSON has not failed in a way a retry
+against the same prompt will fix. `repair` re-prompts with the violation
+attached instead:
+
+```make
+task inspect [produces=object, repair=1]:
+    return the deployment report as a JSON object
+```
+
+The repair prompt restates the original prompt, names the contract, echoes the
+rejected response (truncated at 2000 characters), and asks for corrected output
+only. Repairs run up to 3 times and are off by default, so no task starts
+spending extra LLM calls without opting in.
+
+Only the task's final prompt step is repaired, and only that step is
+re-dispatched: shell, SSH, and Docker steps never run twice because of a
+repair. Repair attempts increment the prompt step's `attempt` counter. When the
+budget is exhausted the task still fails closed on the contract.
+
 ## Provider Retry and Fallback
 
 `retries` repeats each provider before advancing through `fallback-llm`:
@@ -69,6 +90,57 @@ task review [llm=cloud, retries=1, fallback-llm=local]:
 The successful provider and total attempt number are recorded on the prompt
 step. Retries are limited to 10 per provider, and fallback chains accept up to
 four distinct providers.
+
+## File Staleness
+
+`sources` and `outputs` give tasks make-style incremental behavior. When every
+output exists and is at least as new as every matched source, the task is
+skipped:
+
+```make
+task build [sources="src/*.c, include/*.h", outputs="build/app"]:
+    !mkdir -p build
+    !cc -o build/app src/*.c
+```
+
+Patterns are separated by commas or pipes, support `*`, `?`, `[...]`, and
+recursive `**`, and resolve against the task's working directory. Only regular
+files participate; directories are ignored.
+
+A task runs rather than skips when any of these hold, so an unclear state never
+silently reuses stale output:
+
+- Only one of `sources` and `outputs` is set.
+- No source file matched the patterns.
+- A literal (non-glob) output path does not exist.
+- The newest source is newer than the oldest output.
+
+Skipped tasks still record an artifact, with `success` set to `skipped`, so
+dependents and `when` conditions can observe them.
+
+`sources` also contributes a content digest to the task's cache key, so a
+`cache` duration expires as soon as an input file changes on disk:
+
+```make
+task audit [sources="src/**/*.py", cache="1h"]:
+    review the source tree for unsafe subprocess usage
+```
+
+Use `--always-make` (`-B`) to ignore both staleness and cache skips for a run.
+`--dry-run` never skips, and `--plan` reports which tasks would be skipped.
+
+`--watch` re-runs a target whenever a watched file changes:
+
+```bash
+makethlm --watch build
+makethlm --watch --watch-interval 0.5 build
+```
+
+The watch set is the union of `sources` patterns across the target's dependency
+closure, plus the Promptfile itself, so editing the Promptfile also triggers a
+run. Watching a target whose closure declares no `sources` is an error rather
+than a silent no-op. Normal staleness still applies between runs, so only the
+tasks whose inputs actually changed do work.
 
 ## Reproducible Caching
 
@@ -103,3 +175,74 @@ makethlm --json replay 42
 
 Replay is read-only: it displays the recorded bundle and never executes the
 task again.
+
+## Cost and Budgets
+
+Every LLM call records what it used. Native OpenAI and Ollama providers report
+token counts, and the Claude CLI reports usage and spend directly. Declare
+prices on any other provider to have spend derived from its token counts:
+
+```make
+llm openai [model=gpt-4o, price-in=2.50, price-out=10.00]
+```
+
+Prices are US dollars per million tokens. A run prints a usage line on stderr
+when anything was recorded:
+
+```
+usage: 3 LLM calls, 12,400 in / 2,100 out tokens, $0.0521
+```
+
+Calls whose spend cannot be determined are counted as `unpriced` rather than
+silently treated as free.
+
+Stop a run before it spends more than you intend:
+
+```bash
+makethlm --max-cost 2.50 review
+```
+
+```make
+task review [max-cost="0.50"]:
+    review the release diff
+```
+
+The budget is a stop-loss, not a pre-authorization: spend is known only after a
+call returns, so makethlm checks the running total before each dispatch and
+fails the task closed once the limit is reached. The per-task `max-cost` and the
+run-wide `--max-cost` both apply, and the lower one wins.
+
+Token counts, spend, and call counts are stored in run history and included in
+`--json` output. Replayed fixtures cost nothing and are recorded as such.
+
+## Recorded Fixtures
+
+Run history explains what happened. Fixtures let a Promptfile be *re-run*
+without a provider, so prompt-driven workflows can be tested in CI with no
+credentials, no network, and no spend.
+
+Record once against a real provider:
+
+```bash
+makethlm --fixtures tests/fixtures --record-fixtures review
+```
+
+Then replay anywhere:
+
+```bash
+makethlm --fixtures tests/fixtures review
+```
+
+During replay no provider is called. Each fixture is keyed by task name and
+redacted prompt text, so a changed prompt intentionally misses its fixture.
+A miss fails the task closed with an explanation rather than silently falling
+back to a live call, which keeps a CI run from quietly spending money.
+
+Prompts and responses are redacted before they are written, and fixture files
+are created atomically with owner-only permissions. Recorded failures replay as
+failures, so error handling stays testable. Repair prompts are recorded as
+their own fixtures, so a `produces`/`repair` sequence replays exactly as it
+first ran.
+
+Shell, SSH, and Docker steps still execute during replay; only LLM calls are
+served from fixtures.

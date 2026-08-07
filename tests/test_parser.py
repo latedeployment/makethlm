@@ -3780,3 +3780,33 @@ task publish [requires=missing]:
 task publish [requires=build.stdout:yaml]:
     publish
 """)
+
+
+class TestRepairOption:
+    def test_parses_repair_count(self):
+        pf = parse("""\
+task inspect [produces=object, repair=2]:
+    inspect it
+""")
+        assert pf.tasks["inspect"].options.repair == 2
+
+    def test_defaults_to_zero(self):
+        pf = parse("""\
+task inspect [produces=object]:
+    inspect it
+""")
+        assert pf.tasks["inspect"].options.repair == 0
+
+    def test_rejects_non_integer(self):
+        with pytest.raises(ParseError, match="repair must be an integer"):
+            parse("""\
+task inspect [repair=lots]:
+    inspect it
+""")
+
+    def test_rejects_out_of_range(self):
+        with pytest.raises(ParseError, match="repair must be between"):
+            parse("""\
+task inspect [repair=9]:
+    inspect it
+""")

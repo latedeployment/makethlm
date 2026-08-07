@@ -55,13 +55,16 @@ import re
 import subprocess
 from copy import deepcopy
 
+from .cost import parse_cost
 from .interpolation import split_unquoted
 from .inventory import parse_ansible_inventory
 from .models import (
     ARTIFACT_CONTRACT_TYPES,
     MAX_FALLBACK_LLMS,
+    MAX_FANOUT_LLMS,
     MAX_LLM_RETRIES,
     MAX_LLM_TOKENS,
+    MAX_REPAIR_ATTEMPTS,
     Agent,
     DockerConfig,
     Function,
@@ -75,6 +78,7 @@ from .models import (
     _evaluate_expression,
     parse_duration_seconds,
 )
+from .staleness import split_patterns
 
 
 class ParseError(Exception):
@@ -232,6 +236,40 @@ def _parse_kv_pairs(raw: str) -> dict[str, str]:
     return result
 
 
+def _parse_max_concurrency(opts: dict[str, str], lineno: int | None = None) -> int | None:
+    """Parse a provider's concurrency cap."""
+    for key in ("max-concurrency", "max_concurrency"):
+        if key not in opts:
+            continue
+        try:
+            limit = int(_strip_quotes(opts[key]))
+        except ValueError:
+            raise ParseError(f"{key} must be an integer, got {opts[key]!r}", lineno)
+        if limit < 1:
+            raise ParseError(f"{key} must be at least 1", lineno)
+        return limit
+    return None
+
+
+def _parse_price(
+    opts: dict[str, str],
+    keys: tuple[str, ...],
+    lineno: int | None = None,
+) -> float | None:
+    """Parse a provider price in USD per million tokens."""
+    for key in keys:
+        if key not in opts:
+            continue
+        try:
+            price = float(_strip_quotes(opts[key]))
+        except ValueError:
+            raise ParseError(f"{key} must be a number, got {opts[key]!r}", lineno)
+        if price < 0:
+            raise ParseError(f"{key} must not be negative", lineno)
+        return price
+    return None
+
+
 def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
     """Convert a key-value dict into TaskOptions."""
     opts = TaskOptions()
@@ -251,7 +289,15 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             if not 1 <= opts.max_tokens <= MAX_LLM_TOKENS:
                 raise ParseError(f"max_tokens must be between 1 and {MAX_LLM_TOKENS}")
         elif key == "llm":
-            opts.llm = value
+            providers = [name.strip() for name in _strip_quotes(value).split("|") if name.strip()]
+            if not providers:
+                raise ParseError("llm requires at least one provider name")
+            if len(providers) > MAX_FANOUT_LLMS:
+                raise ParseError(f"llm accepts at most {MAX_FANOUT_LLMS} fan-out providers")
+            opts.llm = providers[0]
+            opts.llms = providers
+        elif key == "judge":
+            opts.judge = _strip_quotes(value)
         elif key == "agent":
             opts.agent = value
         elif key == "on":
@@ -293,6 +339,14 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.webhook_on = value
         elif key == "cache":
             opts.cache = value
+        elif key in ("sources", "source"):
+            opts.sources.extend(split_patterns(_strip_quotes(value)))
+            if not opts.sources:
+                raise ParseError("sources requires at least one file pattern")
+        elif key in ("outputs", "output"):
+            opts.outputs.extend(split_patterns(_strip_quotes(value)))
+            if not opts.outputs:
+                raise ParseError("outputs requires at least one file pattern")
         elif key == "timeout":
             try:
                 parse_duration_seconds(value)
@@ -349,6 +403,19 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             if output_type not in ARTIFACT_CONTRACT_TYPES:
                 raise ParseError(f"unknown produces type: {output_type!r}")
             opts.produces = output_type
+        elif key == "repair":
+            try:
+                opts.repair = int(value)
+            except ValueError:
+                raise ParseError(f"repair must be an integer, got {value!r}")
+            if not 0 <= opts.repair <= MAX_REPAIR_ATTEMPTS:
+                raise ParseError(f"repair must be between 0 and {MAX_REPAIR_ATTEMPTS}")
+        elif key in ("max-cost", "max_cost", "budget"):
+            try:
+                parse_cost(_strip_quotes(value))
+            except ValueError as e:
+                raise ParseError(str(e))
+            opts.max_cost = _strip_quotes(value)
         elif key == "secrets":
             opts.secrets = value
         elif key in ("ssh-key", "ssh_key", "identity-file", "identity_file"):
@@ -428,24 +495,24 @@ def _split_dependencies(raw: str) -> tuple[list[str], list[str]]:
 
 def _merge_promptfile(target: Promptfile, included: Promptfile) -> None:
     """Merge included Promptfile definitions into target without overriding local state."""
-    for k, v in included.variables.items():
-        if k not in target.variables:
-            target.variables[k] = v
-            target.included_variables.add(k)
-    for k, v in included.functions.items():
-        target.functions.setdefault(k, v)
+    for var_name, var_value in included.variables.items():
+        if var_name not in target.variables:
+            target.variables[var_name] = var_value
+            target.included_variables.add(var_name)
+    for fn_name, fn in included.functions.items():
+        target.functions.setdefault(fn_name, fn)
     for name in included.task_order:
         if name not in target.tasks:
             target.tasks[name] = included.tasks[name]
             target.task_order.append(name)
-    for k, v in included.llm_providers.items():
-        target.llm_providers.setdefault(k, v)
+    for provider_name, provider in included.llm_providers.items():
+        target.llm_providers.setdefault(provider_name, provider)
     if included.default_llm and not target.default_llm:
         target.default_llm = included.default_llm
-    for k, v in included.host_groups.items():
-        target.host_groups.setdefault(k, v)
-    for k, v in included.agents.items():
-        target.agents.setdefault(k, v)
+    for group_name, group in included.host_groups.items():
+        target.host_groups.setdefault(group_name, group)
+    for agent_name, agent in included.agents.items():
+        target.agents.setdefault(agent_name, agent)
     if included.guidance and not target.guidance:
         target.guidance = included.guidance
     target.exported_vars.update(included.exported_vars)
@@ -483,6 +550,9 @@ def _merge_module(target: Promptfile, module_name: str, included: Promptfile) ->
             )
         if task.options.llm:
             task.options.llm = provider_map.get(task.options.llm, task.options.llm)
+        task.options.llms = [provider_map.get(name, name) for name in task.options.llms]
+        if task.options.judge:
+            task.options.judge = provider_map.get(task.options.judge, task.options.judge)
         elif included.default_llm:
             task.options.llm = provider_map[included.default_llm]
         task.options.fallback_llms = [
@@ -509,22 +579,22 @@ def _merge_module(target: Promptfile, module_name: str, included: Promptfile) ->
         target.tasks[new_name] = task
         target.task_order.append(new_name)
 
-    for k, v in included.functions.items():
-        function = deepcopy(v)
-        function.name = function_map[k]
-        target.functions.setdefault(function_map[k], function)
-    for k, v in included.llm_providers.items():
-        target.llm_providers.setdefault(provider_map[k], deepcopy(v))
-    for k, v in included.host_groups.items():
-        group = deepcopy(v)
-        group.name = host_map[k]
-        target.host_groups.setdefault(host_map[k], group)
-    for k, v in included.agents.items():
-        agent = deepcopy(v)
-        agent.name = agent_map[k]
+    for fn_name, fn in included.functions.items():
+        function = deepcopy(fn)
+        function.name = function_map[fn_name]
+        target.functions.setdefault(function_map[fn_name], function)
+    for provider_name, provider in included.llm_providers.items():
+        target.llm_providers.setdefault(provider_map[provider_name], deepcopy(provider))
+    for group_name, host_group in included.host_groups.items():
+        group = deepcopy(host_group)
+        group.name = host_map[group_name]
+        target.host_groups.setdefault(host_map[group_name], group)
+    for agent_name, source_agent in included.agents.items():
+        agent = deepcopy(source_agent)
+        agent.name = agent_map[agent_name]
         if agent.llm:
             agent.llm = provider_map.get(agent.llm, agent.llm)
-        target.agents.setdefault(agent_map[k], agent)
+        target.agents.setdefault(agent_map[agent_name], agent)
     for alias_name, alias_target in included.aliases.items():
         target.aliases.setdefault(
             f"{module_name}::{alias_name}",
@@ -646,16 +716,39 @@ def _parse_body_steps(raw_lines: list[str]) -> list[TaskStep]:
     """
     steps: list[TaskStep] = []
     prompt_accum: list[str] = []
+    # Set by an "@llm <name>" line; applies to the prompt steps that follow it.
+    step_llm: str | None = None
+    pipe_next = False
 
     def flush_prompt() -> None:
+        nonlocal pipe_next
         if prompt_accum:
             text = "\n".join(prompt_accum).strip()
             if text:
-                steps.append(TaskStep(kind="prompt", content=text))
+                steps.append(
+                    TaskStep(
+                        kind="prompt",
+                        content=text,
+                        llm=step_llm,
+                        pipe_output=pipe_next,
+                    )
+                )
             prompt_accum.clear()
+        pipe_next = False
 
     for raw in raw_lines:
         stripped = raw.strip()
+        if stripped.startswith("@llm ") or stripped == "@llm":
+            flush_prompt()
+            name = stripped[5:].strip() if stripped.startswith("@llm ") else ""
+            step_llm = _strip_quotes(name) or None
+            continue
+        if stripped.endswith("|>") and not stripped.startswith("!"):
+            # A prompt line ending in |> pipes this prompt's answer into the next.
+            prompt_accum.append(stripped[:-2].rstrip())
+            pipe_next = True
+            flush_prompt()
+            continue
         if stripped.startswith("@echo "):
             flush_prompt()
             msg = stripped[6:].strip()
@@ -953,7 +1046,7 @@ def _parse_set_directive(
                 matched_field = field_name
                 break
 
-    if matched_key is None:
+    if matched_key is None or matched_field is None:
         raise ParseError(f"unknown set directive: {rest!r}", lineno)
 
     raw_val = rest[len(matched_key) :].strip()
@@ -1215,6 +1308,9 @@ def parse(
                 api_key=api_key,
                 base_url=llm_opts.get("base_url"),
                 shell_template=llm_opts.get("template"),
+                price_in=_parse_price(llm_opts, ("price-in", "price_in"), lineno),
+                price_out=_parse_price(llm_opts, ("price-out", "price_out"), lineno),
+                max_concurrency=_parse_max_concurrency(llm_opts, lineno),
             )
             pf.llm_providers[llm_name] = provider
             if pf.default_llm is None:
@@ -1581,10 +1677,19 @@ def parse(
                 f"task {task.name!r} postmortem targets unknown task {task.options.postmortem!r}",
                 task.line_number,
             )
-        for provider in task.options.fallback_llms:
-            if provider not in pf.llm_providers:
+        # Provider names stay lenient at parse time, like [llm=...] always has;
+        # --check reports the ones that do not resolve.
+        if task.options.judge and len(task.options.llms) < 2:
+            raise ParseError(
+                f"task {task.name!r} sets judge without a fan-out; "
+                'use llm="a|b" to give the judge answers to merge',
+                task.line_number,
+            )
+        for fallback_name in task.options.fallback_llms:
+            if fallback_name not in pf.llm_providers:
                 raise ParseError(
-                    f"task {task.name!r} references unknown fallback LLM provider {provider!r}",
+                    f"task {task.name!r} references unknown fallback LLM provider "
+                    f"{fallback_name!r}",
                     task.line_number,
                 )
 

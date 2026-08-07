@@ -27,6 +27,31 @@
 - Cache keys that include task arguments, variables, providers, agents, options, artifacts, and referenced environment inputs.
 - Module-scoped variables, functions, providers, agents, host groups, guidance, rollback hooks, and nested namespaces.
 - Per-host Ansible inventory connection settings.
+- Make-style file staleness with `sources` and `outputs`, source content digests
+  in cache keys, and `--always-make`/`-B` to force a run.
+- Output contract repair with `repair=N`, re-prompting the final prompt step when
+  a response violates `produces`.
+- Recorded LLM fixtures with `--fixtures DIR` and `--record-fixtures` for
+  deterministic, offline, zero-spend runs that fail closed on a missing fixture.
+- Token, cost, and call accounting per run with provider `price-in`/`price-out`
+  declarations, a usage summary, history columns, and `--max-cost`/`max-cost`
+  budgets that stop a run once spend reaches the limit.
+- `--watch` and `--watch-interval` to re-run a target when its `sources` or the
+  Promptfile change.
+- Git-aware inputs: `changed()`, `changed_files()`, `git_branch()`, `git_sha()`,
+  and `--since REF` to scope tasks to a diff.
+- Per-provider `max-concurrency` caps and exponential backoff between retries of
+  a rate-limited provider.
+- Live elapsed-time indicator on a TTY while waiting for an LLM response.
+- `makethlm fmt` with `--check` for canonical Promptfile formatting.
+- A clean `mypy` gate across the package, with strict checking on the focused
+  modules, and contract checking extracted into `makethlm/contracts.py`.
+- Hidden and all-caps Promptfile names (`.promptfile`, `.Promptfile`, `PROMPTFILE`,
+  and their `.pf` forms).
+- Multi-model tasks: `llm="a|b"` fans one prompt out to several providers
+  concurrently and keeps every answer as `{{task.provider.response}}`, `judge`
+  merges them into one response, and `@llm <name>` plus a prompt-line `|>` chains
+  one model's answer into the next.
 
 ## 0.1.0 - 2026-05-24
 

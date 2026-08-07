@@ -8,8 +8,11 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+from .cost import parse_cost
 from .dispatcher import (
     ClaudeDispatcher,
     CodexDispatcher,
@@ -19,6 +22,8 @@ from .dispatcher import (
     OpenAIDispatcher,
     ShellDispatcher,
 )
+from .formatter import format_text
+from .gitinfo import SINCE_ENV_VAR
 from .history import get_run, list_runs, record_run
 from .models import (
     Promptfile,
@@ -43,8 +48,24 @@ from .secrets import (
     redact_text,
     secret_values_from_mapping,
 )
+from .staleness import digest_sources, up_to_date_reason
 
-PROMPTFILE_NAMES = ["Promptfile", "promptfile", "Promptfile.pf", "promptfile.pf"]
+# Discovery order within a directory. The first four names came first and stay
+# first so existing projects keep resolving the same file; the rest follow the
+# hidden/all-caps conventions that make and just users expect.
+PROMPTFILE_NAMES = [
+    "Promptfile",
+    "promptfile",
+    "Promptfile.pf",
+    "promptfile.pf",
+    ".promptfile",
+    ".Promptfile",
+    ".promptfile.pf",
+    ".Promptfile.pf",
+    "PROMPTFILE",
+    "PROMPTFILE.pf",
+]
+
 
 _KNOWN_NATIVE_PROVIDERS = {"claude", "codex", "openai", "ollama"}
 _SECRETS_BACKEND_TOOLS = {
@@ -60,7 +81,11 @@ _SANDBOX_TOOLS = {
 
 
 def find_promptfile(directory: Path | None = None) -> Path | None:
-    """Search current/parent directories, then a global config Promptfile."""
+    """Locate a Promptfile.
+
+    Searches each known name in the current directory and its parents, then a
+    global Promptfile under the XDG config directory.
+    """
     d = directory or Path.cwd()
     for search_dir in (d, *d.parents):
         for name in PROMPTFILE_NAMES:
@@ -116,10 +141,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run independent dependency tasks in parallel",
     )
     ap.add_argument(
+        "--always-make",
+        "-B",
+        action="store_true",
+        dest="always_make",
+        help="Run tasks even when sources are unchanged or results are cached",
+    )
+    ap.add_argument(
         "--jobs",
         type=int,
         default=None,
         help="Maximum number of parallel task workers",
+    )
+    ap.add_argument(
+        "--since",
+        metavar="REF",
+        default=None,
+        help="Git ref that changed()/changed_files() compare against (default: HEAD)",
+    )
+    ap.add_argument(
+        "--watch",
+        action="store_true",
+        help="Re-run the task whenever a watched source file changes",
+    )
+    ap.add_argument(
+        "--watch-interval",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Polling interval for --watch (default: 1.0)",
+    )
+    ap.add_argument(
+        "--max-cost",
+        metavar="USD",
+        dest="max_cost",
+        default=None,
+        help="Stop the run once LLM spend reaches this many US dollars",
+    )
+    ap.add_argument(
+        "--fixtures",
+        metavar="DIR",
+        default=None,
+        help="Serve LLM responses from recorded fixtures in DIR",
+    )
+    ap.add_argument(
+        "--record-fixtures",
+        action="store_true",
+        dest="record_fixtures",
+        help="Call providers normally and record their responses into --fixtures DIR",
     )
     ap.add_argument(
         "--list",
@@ -504,6 +573,18 @@ def _task_plan_options(task) -> list[str]:
         options.append(f"requires={'|'.join(task.options.requires)}")
     if task.options.produces:
         options.append(f"produces={task.options.produces}")
+    if task.options.repair:
+        options.append(f"repair={task.options.repair}")
+    if len(task.options.llms) > 1:
+        options.append(f"llm={'|'.join(task.options.llms)}")
+    if task.options.judge:
+        options.append(f"judge={task.options.judge}")
+    if task.options.max_cost:
+        options.append(f"max-cost={task.options.max_cost}")
+    if task.options.sources:
+        options.append(f"sources={','.join(task.options.sources)}")
+    if task.options.outputs:
+        options.append(f"outputs={','.join(task.options.outputs)}")
     if task.options.when:
         options.append(f"when={'; '.join(task.options.when)}")
     if task.options.ssh_identity:
@@ -592,6 +673,12 @@ def _plan_payload(
                 "dependencies": list(task.dependencies),
                 "subsequent_dependencies": list(task.subsequent_dependencies),
                 "options": _task_plan_options(task),
+                "up_to_date": up_to_date_reason(
+                    task.options.sources,
+                    task.options.outputs,
+                    task.options.working_dir or pf.settings.working_dir,
+                )
+                is not None,
                 "steps": steps,
             }
         )
@@ -612,8 +699,7 @@ def _print_plan(
     pf: Promptfile, target: str, task_args: dict[str, str] | None, promptfile_path: str
 ) -> None:
     """Print an execution plan without running tasks."""
-    payload = _plan_payload(pf, target, task_args, promptfile_path)
-    order = payload["execution_order"]
+    order: list[str] = topological_sort(pf, target)
     secret_values = _promptfile_secret_values(pf, task_args)
     display_variables = redact_named_values(pf.variables)
     print(f"Plan for {target}")
@@ -646,6 +732,12 @@ def _print_plan(
             print(f"     after: {', '.join(task.subsequent_dependencies)}")
         if options:
             print(f"     options: {', '.join(options)}")
+        if up_to_date_reason(
+            task.options.sources,
+            task.options.outputs,
+            task.options.working_dir or pf.settings.working_dir,
+        ):
+            print("     status: up to date (would be skipped)")
         print("     steps:")
         for step in pf.resolve_steps(
             task_name,
@@ -924,7 +1016,7 @@ def _capability_payload(
     }
 
 
-def _print_capabilities(payload: dict[str, object]) -> None:
+def _print_capabilities(payload: dict[str, Any]) -> None:
     """Print an execution capability manifest."""
     print(f"Capabilities for {payload['target']}")
     capabilities = payload["capabilities"]
@@ -1005,10 +1097,17 @@ def _check_promptfile(
         has_prompt = any(step.kind == "prompt" for step in task.steps)
         needs_llm = has_prompt or task.docker is not None
 
-        if task.options.llm and task.options.llm not in pf.llm_providers:
+        for provider_name in task.options.llms or ([task.options.llm] if task.options.llm else []):
+            if provider_name not in pf.llm_providers:
+                error(
+                    "unknown-provider",
+                    f"task {task_name!r} references unknown LLM provider {provider_name!r}",
+                    task=task_name,
+                )
+        if task.options.judge and task.options.judge not in pf.llm_providers:
             error(
                 "unknown-provider",
-                f"task {task_name!r} references unknown LLM provider {task.options.llm!r}",
+                f"task {task_name!r} references unknown judge provider {task.options.judge!r}",
                 task=task_name,
             )
 
@@ -1021,10 +1120,10 @@ def _check_promptfile(
             )
 
         if needs_llm:
-            provider_name = _provider_for_check(pf, task_name)
-            if provider_name and provider_name in pf.llm_providers:
-                used_providers.add(provider_name)
-            elif not provider_name:
+            resolved_provider = _provider_for_check(pf, task_name)
+            if resolved_provider and resolved_provider in pf.llm_providers:
+                used_providers.add(resolved_provider)
+            elif not resolved_provider:
                 fallback_claude_needed = True
             used_providers.update(task.options.fallback_llms)
 
@@ -1130,7 +1229,7 @@ def _check_promptfile(
     }
 
 
-def _print_check_result(payload: dict[str, object]) -> None:
+def _print_check_result(payload: dict[str, Any]) -> None:
     """Print check results in a concise human-readable format."""
     for issue in payload["errors"]:
         print(f"error[{issue['code']}]: {issue['message']}")
@@ -1143,7 +1242,7 @@ def _print_check_result(payload: dict[str, object]) -> None:
         print(f"FAILED: {summary['errors']} error(s), {summary['warnings']} warning(s)")
 
 
-def _history_payload(limit_raw: str | None = None) -> dict[str, object]:
+def _history_payload(limit_raw: str | None = None) -> dict[str, Any]:
     """Return recent local run history."""
     try:
         limit = int(limit_raw or "20")
@@ -1170,13 +1269,15 @@ def _print_history(limit_raw: str | None = None) -> None:
         return
     for row in rows:
         status = "ok" if row["success"] else "FAILED"
+        cost = row.get("cost_usd") or 0.0
+        spend = f"  ${cost:.4f}" if cost else ""
         print(
             f"{row['id']:>4}  {status:<6}  {row['target']:<20} "
-            f"{row['duration_ms']}ms  {row['started_at']}"
+            f"{row['duration_ms']}ms{spend}  {row['started_at']}"
         )
 
 
-def _print_replay(bundle: dict[str, object]) -> None:
+def _print_replay(bundle: dict[str, Any]) -> None:
     """Print a recorded run bundle without re-executing any task."""
     status = "ok" if bundle["success"] else "FAILED"
     print(f"Run {bundle['id']}  {status}  {bundle['target']}  {bundle['duration_ms']}ms")
@@ -1229,6 +1330,10 @@ def _task_attributes(task) -> list[str]:
         attrs.append("env")
     if options.cache:
         attrs.append(f"cache={options.cache}")
+    if options.sources:
+        attrs.append(f"sources={','.join(options.sources)}")
+    if options.outputs:
+        attrs.append(f"outputs={','.join(options.outputs)}")
     if options.timeout:
         attrs.append(f"timeout={options.timeout}")
     if options.llm_timeout:
@@ -1245,6 +1350,10 @@ def _task_attributes(task) -> list[str]:
         attrs.append(f"webhook-on={options.webhook_on}")
     if options.when:
         attrs.append("when")
+    if options.produces:
+        attrs.append(f"produces={options.produces}")
+    if options.repair:
+        attrs.append(f"repair={options.repair}")
     return attrs
 
 
@@ -1499,6 +1608,7 @@ def _run_result_payload(
     parallel: bool,
     jobs: int | None,
     run_id: int | None = None,
+    costs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Return a JSON-safe run result payload."""
     payload: dict[str, object] = {
@@ -1512,9 +1622,100 @@ def _run_result_payload(
         "jobs": jobs,
         "tasks": [_task_result_payload(task) for task in result.task_results],
     }
+    if costs is not None:
+        payload["costs"] = costs
     if run_id is not None:
         payload["run_id"] = run_id
     return payload
+
+
+def _run_fmt(args: argparse.Namespace) -> int:
+    """Format Promptfiles in place, or check them without writing."""
+    paths: list[Path] = [Path(item) for item in args.task_args]
+    if not paths:
+        discovered = args.file or find_promptfile()
+        if discovered is None:
+            print("error: no Promptfile found", file=sys.stderr)
+            return 1
+        paths = [discovered]
+
+    unformatted: list[Path] = []
+    for path in paths:
+        if not path.is_file():
+            print(f"error: {path} is not a file", file=sys.stderr)
+            return 1
+        original = path.read_text()
+        formatted = format_text(original)
+        if formatted == original:
+            continue
+        unformatted.append(path)
+        if not args.check:
+            path.write_text(formatted)
+
+    if args.check:
+        for path in unformatted:
+            print(f"would reformat: {path}")
+        if unformatted:
+            count = len(unformatted)
+            print(f"{count} file{'s' if count != 1 else ''} would be reformatted")
+            return 1
+        print("all files are formatted")
+        return 0
+
+    for path in unformatted:
+        print(f"reformatted: {path}")
+    if not unformatted:
+        print("all files are already formatted")
+    return 0
+
+
+def _watched_patterns(pf: Promptfile, target: str) -> list[str]:
+    """Return the source patterns to watch for a target and its dependencies."""
+    patterns: list[str] = []
+    try:
+        order = topological_sort(pf, target)
+    except (KeyError, CycleError):
+        order = [target] if target in pf.tasks else []
+    for task_name in order:
+        for pattern in pf.tasks[task_name].options.sources:
+            if pattern not in patterns:
+                patterns.append(pattern)
+    return patterns
+
+
+def _watch_loop(
+    run_once: Callable[[], int],
+    patterns: list[str],
+    promptfile_path: str,
+    interval: float,
+) -> int:
+    """Run a target, then re-run it whenever a watched file changes."""
+    watched = [*patterns, promptfile_path]
+
+    def snapshot() -> str | None:
+        return digest_sources(watched)
+
+    exit_code = run_once()
+    # Watch output is usually piped or scrolled; keep it readable as it happens.
+    sys.stdout.flush()
+    last = snapshot()
+    print(
+        f"watching {len(patterns)} source pattern(s); press Ctrl-C to stop",
+        file=sys.stderr,
+    )
+    try:
+        while True:
+            time.sleep(max(interval, 0.05))
+            current = snapshot()
+            if current == last:
+                continue
+            last = current
+            print("change detected; re-running", file=sys.stderr)
+            exit_code = run_once()
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1526,6 +1727,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.jobs is not None:
         args.parallel = True
+
+    if args.since:
+        os.environ[SINCE_ENV_VAR] = args.since
+
+    if args.record_fixtures and not args.fixtures:
+        print("error: --record-fixtures requires --fixtures DIR", file=sys.stderr)
+        return 1
+
+    max_cost: float | None = None
+    if args.max_cost is not None:
+        try:
+            max_cost = parse_cost(args.max_cost)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     if args.history is not None:
         if args.json_output:
@@ -1560,6 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _print_replay(bundle)
         return 0
+
+    if args.task == "fmt":
+        return _run_fmt(args)
 
     if args.task in ("completions", "completion"):
         if not args.task_args:
@@ -1804,7 +2023,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.safe and not args.dry_run:
-        safe_targets = multi_targets or [target]
+        safe_targets: list[str | None] = list(multi_targets) if multi_targets else [target]
         if any(safe_target is None for safe_target in safe_targets):
             print("error: no tasks defined in Promptfile", file=sys.stderr)
             return 1
@@ -1839,84 +2058,111 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: safe mode blocked execution: {err}", file=sys.stderr)
             return 1
 
-    # Run
-    runner = Runner(
-        pf,
-        dispatcher,
-        quiet=args.quiet,
-        verbose=args.verbose and not args.dry_run and not args.json_output,
-        promptfile_path=str(pf_path),
-        dry_run=args.dry_run,
-    )
-    try:
-        started = time.monotonic()
-        if multi_targets:
-            result = RunResult(target=" ".join(multi_targets))
-            for multi_target in multi_targets:
-                part = (
-                    runner.run_parallel(multi_target, jobs=args.jobs)
-                    if args.parallel
-                    else runner.run(multi_target)
-                )
-                result.task_results.extend(part.task_results)
-                if not part.success:
-                    break
-        elif args.parallel:
-            result = runner.run_parallel(target, args=task_args, jobs=args.jobs)
-        else:
-            result = runner.run(target, args=task_args)
-        duration_ms = int((time.monotonic() - started) * 1000)
-    except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
-        return 130
-    except SecretError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    except KeyError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    except CycleError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-
-    run_id = None
-    if not args.dry_run and not args.no_history:
-        run_id = record_run(
-            result,
-            duration_ms=duration_ms,
+    def _execute_once() -> int:
+        """Build a runner, execute the target, and report the outcome."""
+        runner = Runner(
+            pf,
+            dispatcher,
+            quiet=args.quiet,
+            verbose=args.verbose and not args.dry_run and not args.json_output,
             promptfile_path=str(pf_path),
-            redact=runner._redact,
+            dry_run=args.dry_run,
+            always_make=args.always_make,
+            fixtures_dir=args.fixtures,
+            record_fixtures=args.record_fixtures,
+            max_cost=max_cost,
         )
+        try:
+            started = time.monotonic()
+            if multi_targets:
+                result = RunResult(target=" ".join(multi_targets))
+                for multi_target in multi_targets:
+                    part = (
+                        runner.run_parallel(multi_target, jobs=args.jobs)
+                        if args.parallel
+                        else runner.run(multi_target)
+                    )
+                    result.task_results.extend(part.task_results)
+                    if not part.success:
+                        break
+            elif args.parallel:
+                result = runner.run_parallel(target, args=task_args, jobs=args.jobs)
+            else:
+                result = runner.run(target, args=task_args)
+            duration_ms = int((time.monotonic() - started) * 1000)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            return 130
+        except SecretError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        except KeyError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        except CycleError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
-    if args.json_output:
-        _print_json(
-            _run_result_payload(
+        run_id = None
+        if not args.dry_run and not args.no_history:
+            run_id = record_run(
                 result,
                 duration_ms=duration_ms,
                 promptfile_path=str(pf_path),
-                dry_run=args.dry_run,
-                parallel=args.parallel,
-                jobs=args.jobs,
-                run_id=run_id,
+                redact=runner._redact,
+                costs=runner.costs.as_dict(),
             )
-        )
+
+        if args.json_output:
+            _print_json(
+                _run_result_payload(
+                    result,
+                    duration_ms=duration_ms,
+                    promptfile_path=str(pf_path),
+                    dry_run=args.dry_run,
+                    parallel=args.parallel,
+                    jobs=args.jobs,
+                    run_id=run_id,
+                    costs=runner.costs.as_dict(),
+                )
+            )
+            return 0 if result.success else 1
+
+        # Print results
+        for tr in result.task_results:
+            status = "ok" if tr.success else "FAILED"
+            print(f"[{status}] {tr.task_name}")
+            if args.dry_run:
+                for sr in tr.step_results:
+                    prefix = "!" if sr.kind == "shell" else ">"
+                    print(f"  {prefix} {sr.content}")
+            else:
+                for line in tr.response.strip().split("\n"):
+                    if line:
+                        print(f"  {line}")
+            print()
+
+        if runner.costs.has_data and not args.quiet:
+            print(f"usage: {runner.costs.summary()}", file=sys.stderr)
+
         return 0 if result.success else 1
 
-    # Print results
-    for tr in result.task_results:
-        status = "ok" if tr.success else "FAILED"
-        print(f"[{status}] {tr.task_name}")
-        if args.dry_run:
-            for sr in tr.step_results:
-                prefix = "!" if sr.kind == "shell" else ">"
-                print(f"  {prefix} {sr.content}")
-        else:
-            for line in tr.response.strip().split("\n"):
-                if line:
-                    print(f"  {line}")
-        print()
+    if not args.watch:
+        return _execute_once()
 
-    return 0 if result.success else 1
+    watch_target = multi_targets[0] if multi_targets else target
+    if watch_target is None:
+        print("error: no task to watch", file=sys.stderr)
+        return 1
+    watched = _watched_patterns(pf, watch_target)
+    if not watched:
+        print(
+            "error: --watch needs at least one task with sources= in the target's "
+            "dependency closure",
+            file=sys.stderr,
+        )
+        return 1
+    return _watch_loop(_execute_once, watched, str(pf_path), args.watch_interval)
 
 
 if __name__ == "__main__":

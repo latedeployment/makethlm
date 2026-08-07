@@ -5,7 +5,15 @@ import sqlite3
 import stat
 from unittest.mock import patch
 
-from makethlm.cli import _capability_payload, _validate_safe_mode, _validate_tools, main
+import pytest
+
+from makethlm.cli import (
+    _capability_payload,
+    _validate_safe_mode,
+    _validate_tools,
+    find_promptfile,
+    main,
+)
 from makethlm.dispatcher import ClaudeDispatcher, OpenAIDispatcher
 from makethlm.history import get_run, record_run
 from makethlm.parser import parse
@@ -964,3 +972,55 @@ task show(value):
 
     assert code == 1
     assert "unexpected arguments" in error
+
+
+class TestPromptfileDiscovery:
+    """Filename variants, parent search, and the environment override."""
+
+    def _write(self, directory, name, body="task a:\n    !echo hi\n"):
+        path = directory / name
+        path.write_text(body)
+        return path
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Promptfile",
+            "promptfile",
+            "Promptfile.pf",
+            "promptfile.pf",
+            ".promptfile",
+            ".Promptfile",
+            ".promptfile.pf",
+            ".Promptfile.pf",
+            "PROMPTFILE",
+            "PROMPTFILE.pf",
+        ],
+    )
+    def test_each_supported_name_is_found(self, tmp_path, name):
+        expected = self._write(tmp_path, name)
+        assert find_promptfile(tmp_path) == expected
+
+    def test_canonical_name_wins_over_variants(self, tmp_path):
+        self._write(tmp_path, ".promptfile")
+        self._write(tmp_path, "PROMPTFILE")
+        expected = self._write(tmp_path, "Promptfile")
+        assert find_promptfile(tmp_path) == expected
+
+    def test_searches_parent_directories(self, tmp_path):
+        expected = self._write(tmp_path, "Promptfile")
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        assert find_promptfile(nested) == expected
+
+    def test_nearest_directory_wins(self, tmp_path):
+        self._write(tmp_path, "Promptfile")
+        nested = tmp_path / "a"
+        nested.mkdir()
+        expected = self._write(nested, "Promptfile")
+        assert find_promptfile(nested) == expected
+
+    def test_directory_named_like_a_promptfile_is_ignored(self, tmp_path):
+        (tmp_path / "Promptfile").mkdir()
+        expected = self._write(tmp_path, "promptfile")
+        assert find_promptfile(tmp_path) == expected

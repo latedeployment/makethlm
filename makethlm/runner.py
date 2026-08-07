@@ -11,16 +11,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .contracts import required_artifact_error, split_artifact_contract, value_matches
+from .cost import CostTotals, derive_cost, parse_cost
 from .dispatcher import (
     ClaudeDispatcher,
     CodexDispatcher,
     Dispatcher,
+    DispatchResult,
     OllamaDispatcher,
     OpenAIDispatcher,
     ShellDispatcher,
@@ -34,10 +38,11 @@ from .docker import (
     run_docker_build,
     strip_dockerfile_markdown_fence,
 )
+from .fixtures import FixtureStore
 from .models import (
-    ARTIFACT_CONTRACT_TYPES,
     MAX_FALLBACK_LLMS,
     MAX_LLM_RETRIES,
+    MAX_REPAIR_ATTEMPTS,
     HostGroup,
     LLMProvider,
     Promptfile,
@@ -46,9 +51,12 @@ from .models import (
     evaluate_condition,
     parse_duration_seconds,
 )
+from .progress import ElapsedIndicator
+from .ratelimit import is_rate_limited, rate_limit_backoff
 from .sandbox import build_sandbox_command
 from .secrets import is_secret_name, redact_text, secret_values_from_mapping
 from .ssh import build_ssh_argv, build_ssh_command, run_ssh_command
+from .staleness import digest_sources, up_to_date_reason
 from .subprocess_util import run_subprocess as _run_subprocess
 from .webhooks import send_webhook
 
@@ -140,6 +148,80 @@ def topological_levels(pf: Promptfile, target: str) -> list[list[str]]:
     return levels
 
 
+MAX_REPAIR_ECHO_CHARS = 2000
+
+_CONTRACT_REPAIR_HINTS = {
+    "json": "a single valid JSON value",
+    "object": "a single valid JSON object",
+    "array": "a single valid JSON array",
+    "integer": "a single integer with no other characters",
+    "number": "a single number with no other characters",
+    "boolean": "exactly true or false",
+    "nonempty": "a non-empty answer",
+    "text": "a text answer",
+}
+
+
+def format_fanout_response(results: list[tuple[str, DispatchResult]]) -> str:
+    """Return every fan-out answer, labeled by provider."""
+    sections = []
+    for name, outcome in results:
+        status = "" if outcome.success else " (failed)"
+        sections.append(f"[{name}{status}]\n{outcome.response.strip()}")
+    return "\n\n".join(sections)
+
+
+def build_judge_prompt(prompt: str, answers: list[tuple[str, str]]) -> str:
+    """Return the prompt asking a judge provider to merge fan-out answers."""
+    sections = [f"--- answer from {name} ---\n{text.strip()}" for name, text in answers]
+    joined = "\n\n".join(sections)
+    return (
+        f"{len(answers)} models were given the same task. Merge their answers into a "
+        f"single best response.\n\n"
+        f"Original task:\n{prompt}\n\n"
+        f"{joined}\n\n"
+        "Reply with the merged answer only. Prefer claims the models agree on, drop "
+        "anything contradicted or unsupported, and do not mention the models or that "
+        "a merge took place."
+    )
+
+
+def _last_prompt_index(steps: list[TaskStep]) -> int | None:
+    """Return the 1-based index of the final prompt step, if any.
+
+    Only that step is validated against ``produces`` during execution: it is
+    the one whose response the contract can still be repaired through.
+    """
+    indexes = [i for i, step in enumerate(steps, 1) if step.kind not in ("echo", "shell")]
+    return indexes[-1] if indexes else None
+
+
+def build_repair_prompt(prompt: str, expected: str, previous: str) -> str:
+    """Return a re-prompt asking the provider to satisfy an output contract."""
+    wanted = _CONTRACT_REPAIR_HINTS.get(expected, f"a value of type {expected}")
+    echoed = previous.strip()
+    if len(echoed) > MAX_REPAIR_ECHO_CHARS:
+        echoed = echoed[:MAX_REPAIR_ECHO_CHARS] + "\n[...truncated]"
+    return (
+        f"{prompt}\n\n"
+        f"Your previous response did not satisfy the required output contract "
+        f"produces={expected}. It must be {wanted}, with no prose, explanation, "
+        f"or code fences around it.\n\n"
+        f"Previous response:\n{echoed}\n\n"
+        f"Reply with the corrected output only."
+    )
+
+
+def _parse_task_cost(value: str | None) -> float | None:
+    """Return a task's budget in USD, ignoring values the parser rejected."""
+    if not value:
+        return None
+    try:
+        return parse_cost(value)
+    except ValueError:
+        return None
+
+
 def _parse_cache_duration(duration: str) -> float:
     """Parse a cache duration string like '1h', '30m', '1d' into seconds."""
     try:
@@ -165,6 +247,7 @@ class StepResult:
     exit_code: int | None = None
     provider: str | None = None
     attempt: int | None = None
+    variants: dict[str, str] = field(default_factory=dict)  # provider -> answer, for fan-out
 
 
 @dataclass
@@ -270,6 +353,10 @@ class Runner:
         verbose: bool = True,
         promptfile_path: str | None = None,
         dry_run: bool = False,
+        always_make: bool = False,
+        fixtures_dir: str | None = None,
+        record_fixtures: bool = False,
+        max_cost: float | None = None,
     ):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
@@ -279,6 +366,14 @@ class Runner:
         self.verbose = verbose and not quiet  # show progress unless quiet
         self.promptfile_path = promptfile_path
         self.dry_run = dry_run
+        self.always_make = always_make  # ignore staleness and cache skips
+        self.fixtures = FixtureStore(fixtures_dir) if fixtures_dir else None
+        self.record_fixtures = record_fixtures and self.fixtures is not None
+        self.max_cost = max_cost  # run-wide spend limit in USD
+        self.costs = CostTotals()
+        self._cost_lock = threading.Lock()
+        self._provider_limiters: dict[str, threading.Semaphore] = {}
+        self._limiter_lock = threading.Lock()
         self.artifacts: dict[
             str, dict[str, str]
         ] = {}  # task_name -> {stdout, stderr, exit_code, success, response}
@@ -356,6 +451,7 @@ class Runner:
             "guidance": self.pf.guidance,
             "task_guidance": task.guidance,
             "environment": {name: os.environ.get(name) for name in sorted(env_names)},
+            "sources": digest_sources(task.options.sources, self._resolve_working_dir(task)),
         }
 
     def _cache_key(self, task: Task, args: dict[str, str] | None = None) -> str:
@@ -386,12 +482,32 @@ class Runner:
             value for name, value in values.items() if is_secret_name(name) and value
         )
 
+    def _up_to_date_result(self, task: Task) -> TaskResult | None:
+        """Return a skip result when the task's outputs are newer than its sources."""
+        if self.always_make or self.dry_run:
+            return None
+        reason = up_to_date_reason(
+            task.options.sources,
+            task.options.outputs,
+            self._resolve_working_dir(task),
+        )
+        if reason is None:
+            return None
+        return TaskResult(
+            task_name=task.name,
+            prompt_sent="",
+            response=f"[skipped] {reason}",
+            success=True,
+        )
+
     def _get_cached_result(
         self,
         task: Task,
         args: dict[str, str] | None = None,
     ) -> TaskResult | None:
         """Return a cached TaskResult if valid, else None."""
+        if self.always_make:
+            return None
         if not task.options.cache or self._task_uses_secret_resolution(task, args):
             return None
         try:
@@ -634,6 +750,9 @@ class Runner:
 
     @staticmethod
     def _format_pipe_context(step: TaskStep, sr: StepResult) -> str:
+        if step.kind == "prompt":
+            source = sr.provider or "the previous model"
+            return f"Answer from {source}:\n{sr.response}".strip()
         label = step.capture or "previous command"
         return f"Shell output from {label}:\n{sr.response}".strip()
 
@@ -813,6 +932,16 @@ class Runner:
                         )
                     )
                     return result
+
+            # File staleness: skip when outputs are newer than sources
+            fresh = self._up_to_date_result(task)
+            if fresh is not None:
+                if self.verbose:
+                    reason = fresh.response.removeprefix("[skipped] ")
+                    _log(f"  [{idx}/{total}] {task_name} ... {reason}", dim=True)
+                result.task_results.append(fresh)
+                self._store_skipped_artifact(task)
+                continue
 
             # Check cache
             cached = self._get_cached_result(task, task_args)
@@ -995,6 +1124,16 @@ class Runner:
                 }
                 return tr
 
+        # File staleness check
+        fresh = self._up_to_date_result(task)
+        if fresh is not None:
+            if self.verbose:
+                reason = fresh.response.removeprefix("[skipped] ")
+                _log(f"  [{idx}/{total}] {task_name} ... {reason}", dim=True)
+            result.task_results.append(fresh)
+            self._store_skipped_artifact(task)
+            return fresh
+
         # Cache check
         cached = self._get_cached_result(task, task_args)
         if cached is not None:
@@ -1136,73 +1275,16 @@ class Runner:
     @staticmethod
     def _value_matches_contract(value: str, expected: str) -> bool:
         """Return whether a string value satisfies a supported contract type."""
-        if expected == "text":
-            return True
-        if expected == "nonempty":
-            return bool(value.strip())
-        if expected == "integer":
-            try:
-                int(value)
-            except ValueError:
-                return False
-            return True
-        if expected == "number":
-            try:
-                float(value)
-            except ValueError:
-                return False
-            return True
-        if expected == "boolean":
-            return value.strip().lower() in ("true", "false")
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return False
-        if expected == "json":
-            return True
-        if expected == "object":
-            return isinstance(parsed, dict)
-        if expected == "array":
-            return isinstance(parsed, list)
-        return False
+        return value_matches(value, expected)
 
     @staticmethod
     def _split_artifact_contract(contract: str) -> tuple[str, str, str]:
         """Split ``artifact.field[:type]`` into its components."""
-        possible_reference, separator, suffix = contract.rpartition(":")
-        if separator and "." not in suffix:
-            reference = possible_reference
-            expected = suffix
-        else:
-            reference = contract
-            expected = "nonempty"
-        artifact, dot, field_name = reference.rpartition(".")
-        if not dot or not artifact or not field_name:
-            raise ValueError(
-                f"invalid artifact contract {contract!r}; expected artifact.field[:type]"
-            )
-        return artifact, field_name, expected.lower()
+        return split_artifact_contract(contract)
 
     def _required_artifact_error(self, task: Task) -> str | None:
         """Return an actionable error for the first unmet input contract."""
-        for contract in task.options.requires:
-            try:
-                artifact, field_name, expected = self._split_artifact_contract(contract)
-            except ValueError as e:
-                return f"artifact contract failed: {e}"
-            if expected not in ARTIFACT_CONTRACT_TYPES:
-                return f"artifact contract failed: unknown type {expected!r} in {contract!r}"
-            if artifact not in self.artifacts:
-                return f"artifact contract failed: {artifact!r} is not available"
-            values = self.artifacts[artifact]
-            if field_name not in values:
-                return (
-                    f"artifact contract failed: field {field_name!r} is not "
-                    f"available on {artifact!r}"
-                )
-            if not self._value_matches_contract(values[field_name], expected):
-                return f"artifact contract failed: {artifact}.{field_name} is not {expected}"
-        return None
+        return required_artifact_error(task.options.requires, self.artifacts)
 
     def _apply_output_contract(
         self,
@@ -1250,6 +1332,8 @@ class Runner:
         resolved_task_args = self._resolved_task_args(task, args)
         positional_args = self._task_positional_args(task, resolved_task_args)
 
+        last_prompt_index = _last_prompt_index(resolved_steps)
+
         for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
                 _log(f"         {self._redact(step.content)}")
@@ -1286,8 +1370,19 @@ class Runner:
                     _log("         > sending prompt to LLM ...", dim=True)
                 pipe_context = "\n\n".join(pending_pipe_outputs)
                 pending_pipe_outputs.clear()
-                sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
+                sr = self._run_prompt_step(
+                    step,
+                    task,
+                    dispatcher,
+                    runtime_context,
+                    pipe_context,
+                    output_contract=(
+                        task.options.produces if step_index == last_prompt_index else None
+                    ),
+                )
                 prompt_parts.append(sr.content)
+                if step.pipe_output and sr.response:
+                    pending_pipe_outputs.append(self._format_pipe_context(step, sr))
 
             step_results.append(sr)
             all_responses.append(sr.response)
@@ -1322,6 +1417,8 @@ class Runner:
         success = True
         dispatcher = self._get_dispatcher(task)
         effective_group = self._effective_host_group(task, host_group)
+
+        last_prompt_index = _last_prompt_index(resolved_steps)
 
         for step_index, step in enumerate(resolved_steps, 1):
             if step.kind == "echo":
@@ -1424,10 +1521,21 @@ class Runner:
                     _log("         > sending prompt to LLM ...", dim=True)
                 pipe_context = "\n\n".join(pending_pipe_outputs)
                 pending_pipe_outputs.clear()
-                sr = self._run_prompt_step(step, task, dispatcher, runtime_context, pipe_context)
+                sr = self._run_prompt_step(
+                    step,
+                    task,
+                    dispatcher,
+                    runtime_context,
+                    pipe_context,
+                    output_contract=(
+                        task.options.produces if step_index == last_prompt_index else None
+                    ),
+                )
                 step_results.append(sr)
                 all_responses.append(sr.response)
                 prompt_parts.append(sr.content)
+                if step.pipe_output and sr.response:
+                    pending_pipe_outputs.append(self._format_pipe_context(step, sr))
                 if not sr.success:
                     success = False
                     break
@@ -1707,6 +1815,206 @@ class Runner:
             exit_code=result.exit_code,
         )
 
+    def _dispatch_limited(
+        self,
+        dispatcher: Dispatcher,
+        prompt: str,
+        task: Task,
+        provider_name: str,
+    ) -> DispatchResult:
+        """Dispatch under the provider's concurrency limit, if it declares one."""
+        limiter = self._provider_limiter(provider_name)
+        if limiter is None:
+            return dispatcher.dispatch(prompt, task)
+        with limiter:
+            return dispatcher.dispatch(prompt, task)
+
+    def _provider_limiter(self, provider_name: str) -> threading.Semaphore | None:
+        """Return the shared semaphore for a provider that caps concurrency."""
+        provider = self.pf.llm_providers.get(provider_name)
+        if provider is None or not provider.max_concurrency:
+            return None
+        with self._limiter_lock:
+            limiter = self._provider_limiters.get(provider_name)
+            if limiter is None:
+                limiter = threading.Semaphore(provider.max_concurrency)
+                self._provider_limiters[provider_name] = limiter
+            return limiter
+
+    def _dispatch_prompt(
+        self,
+        dispatcher: Dispatcher,
+        prompt: str,
+        task: Task,
+        provider_name: str,
+    ) -> DispatchResult:
+        """Dispatch a prompt, then record its usage against the run budget."""
+        budget_error = self._budget_error(task)
+        if budget_error:
+            return DispatchResult(response=budget_error, success=False)
+
+        with ElapsedIndicator(f"waiting on {provider_name}", enabled=self.verbose):
+            result = self._dispatch_with_fixtures(dispatcher, prompt, task, provider_name)
+        if result.cost_usd is None:
+            result.cost_usd = derive_cost(
+                self.pf.llm_providers.get(provider_name),
+                result.tokens_in,
+                result.tokens_out,
+            )
+        with self._cost_lock:
+            self.costs.add(result.tokens_in, result.tokens_out, result.cost_usd)
+        return result
+
+    def _budget_error(self, task: Task) -> str | None:
+        """Return an error when the run has already spent its budget."""
+        budget = self._task_budget(task)
+        if budget is None:
+            return None
+        with self._cost_lock:
+            spent = self.costs.cost_usd
+        if spent < budget:
+            return None
+        return (
+            f"budget exceeded: spent ${spent:.4f} of the ${budget:.4f} limit "
+            f"before task {task.name!r} could dispatch another prompt"
+        )
+
+    def _task_budget(self, task: Task) -> float | None:
+        """Return the effective budget for a task, if any."""
+        budgets = [
+            value
+            for value in (self.max_cost, _parse_task_cost(task.options.max_cost))
+            if value is not None
+        ]
+        return min(budgets) if budgets else None
+
+    def _dispatch_with_fixtures(
+        self,
+        dispatcher: Dispatcher,
+        prompt: str,
+        task: Task,
+        provider_name: str,
+    ) -> DispatchResult:
+        """Dispatch a prompt, serving or recording a fixture when configured."""
+        if self.fixtures is None:
+            return self._dispatch_limited(dispatcher, prompt, task, provider_name)
+
+        key_prompt = self._redact(prompt)
+        if not self.record_fixtures:
+            fixture = self.fixtures.load(task.name, key_prompt)
+            if fixture is None:
+                return DispatchResult(
+                    response=(
+                        f"no recorded fixture for a prompt in task {task.name!r}; "
+                        "record one with --fixtures DIR --record-fixtures"
+                    ),
+                    success=False,
+                )
+            return DispatchResult(
+                response=str(fixture["response"]),
+                success=bool(fixture.get("success", True)),
+                # A replayed fixture costs nothing.
+                cost_usd=0.0,
+            )
+
+        result = self._dispatch_limited(dispatcher, prompt, task, provider_name)
+        self.fixtures.save(
+            task.name,
+            key_prompt,
+            self._redact(result.response),
+            success=result.success,
+            provider=provider_name,
+        )
+        return result
+
+    def _attempt_with_provider(
+        self,
+        prompt: str,
+        task: Task,
+        provider_name: str,
+        dispatcher: Dispatcher,
+        output_contract: str | None,
+    ) -> tuple[DispatchResult, int]:
+        """Run one provider's retry and repair loop; return its result and attempts."""
+        retries = min(max(task.options.retries, 0), MAX_LLM_RETRIES)
+        repair_budget = (
+            min(max(task.options.repair, 0), MAX_REPAIR_ATTEMPTS) if output_contract else 0
+        )
+        repairs_used = 0
+        attempts = 0
+        dispatch_result = DispatchResult(response="", success=False)
+
+        for provider_attempt in range(1, retries + 2):
+            attempts += 1
+            if self.verbose and provider_attempt > 1:
+                _log(
+                    f"         retrying prompt with {provider_name} (attempt {provider_attempt})",
+                    dim=True,
+                )
+            dispatch_result = self._dispatch_prompt(dispatcher, prompt, task, provider_name)
+            if not dispatch_result.success and is_rate_limited(dispatch_result.response):
+                delay = rate_limit_backoff(provider_attempt)
+                if self.verbose:
+                    _log(
+                        f"         {provider_name} is rate limited; "
+                        f"waiting {delay:.0f}s before retrying",
+                        dim=True,
+                    )
+                time.sleep(delay)
+            # Re-prompt while the response violates the task's output contract.
+            while (
+                dispatch_result.success
+                and output_contract
+                and repairs_used < repair_budget
+                and not value_matches(dispatch_result.response, output_contract)
+            ):
+                repairs_used += 1
+                attempts += 1
+                if self.verbose:
+                    _log(
+                        f"         output is not {output_contract}; "
+                        f"repairing (attempt {repairs_used})",
+                        dim=True,
+                    )
+                dispatch_result = self._dispatch_prompt(
+                    dispatcher,
+                    build_repair_prompt(prompt, output_contract, dispatch_result.response),
+                    task,
+                    provider_name,
+                )
+            if dispatch_result.success:
+                break
+        return dispatch_result, attempts
+
+    def _step_dispatchers(
+        self,
+        step: TaskStep,
+        task: Task,
+        dispatcher: Dispatcher,
+    ) -> list[tuple[str, Dispatcher]]:
+        """Return the providers a prompt step should be sent to, in order.
+
+        A step-level ``@llm`` wins, then a task-level fan-out list, then the
+        task's single provider.
+        """
+        if step.llm:
+            provider = self.pf.llm_providers.get(step.llm)
+            if provider is not None:
+                return [(step.llm, _dispatcher_for_provider(provider))]
+
+        agent = self.pf.get_agent_for_task(task.name)
+        if not (agent and agent.llm) and len(task.options.llms) > 1:
+            targets: list[tuple[str, Dispatcher]] = []
+            for name in task.options.llms:
+                provider = self.pf.llm_providers.get(name)
+                if provider is not None:
+                    targets.append((name, _dispatcher_for_provider(provider)))
+            if targets:
+                return targets
+
+        primary_name = agent.llm if agent and agent.llm else task.options.llm or self.pf.default_llm
+        return [(primary_name or type(dispatcher).__name__, dispatcher)]
+
     def _run_prompt_step(
         self,
         step: TaskStep,
@@ -1714,20 +2022,28 @@ class Runner:
         dispatcher: Dispatcher,
         runtime_context: dict[str, str] | None = None,
         pipe_context: str | None = None,
+        output_contract: str | None = None,
     ) -> StepResult:
-        """Send a prompt step to the LLM dispatcher."""
+        """Send a prompt step to the LLM dispatcher.
+
+        A task with ``llm="a|b"`` sends the prompt to every provider at once and
+        keeps each answer; ``judge`` then merges them. Otherwise the single
+        provider is tried, falling back through ``fallback-llm`` on failure.
+        When *output_contract* is set, a response that violates it is
+        re-prompted up to the task's ``repair`` budget.
+        """
         prompt = step.content
         if runtime_context:
             prompt = self.pf._interpolate(prompt, runtime_context)
         if pipe_context:
             prompt = f"{pipe_context}\n\n{prompt}"
-        primary_name = (
-            self.pf.get_agent_for_task(task.name).llm
-            if self.pf.get_agent_for_task(task.name) and self.pf.get_agent_for_task(task.name).llm
-            else task.options.llm or self.pf.default_llm
-        )
-        primary_label = primary_name or type(dispatcher).__name__
-        candidates: list[tuple[str, Dispatcher]] = [(primary_label, dispatcher)]
+
+        targets = self._step_dispatchers(step, task, dispatcher)
+        if len(targets) > 1:
+            return self._run_fanout_step(prompt, task, targets, output_contract)
+
+        primary_label, primary_dispatcher = targets[0]
+        candidates: list[tuple[str, Dispatcher]] = [(primary_label, primary_dispatcher)]
         seen_providers = {primary_label}
         for provider_name in task.options.fallback_llms:
             provider = self.pf.llm_providers.get(provider_name)
@@ -1739,31 +2055,25 @@ class Runner:
                 candidates.append((provider_name, _dispatcher_for_provider(provider)))
                 seen_providers.add(provider_name)
 
-        last_response = ""
         total_attempt = 0
+        last_response = ""
         last_provider: str | None = None
         for provider_name, candidate in candidates:
-            retries = min(max(task.options.retries, 0), MAX_LLM_RETRIES)
-            for provider_attempt in range(1, retries + 2):
-                total_attempt += 1
-                last_provider = provider_name
-                if self.verbose and total_attempt > 1:
-                    _log(
-                        f"         retrying prompt with {provider_name} "
-                        f"(attempt {provider_attempt})",
-                        dim=True,
-                    )
-                dispatch_result = candidate.dispatch(prompt, task)
-                last_response = dispatch_result.response
-                if dispatch_result.success:
-                    return StepResult(
-                        kind="prompt",
-                        content=self._redact(prompt),
-                        response=self._redact(last_response),
-                        success=True,
-                        provider=provider_name,
-                        attempt=total_attempt,
-                    )
+            last_provider = provider_name
+            dispatch_result, attempts = self._attempt_with_provider(
+                prompt, task, provider_name, candidate, output_contract
+            )
+            total_attempt += attempts
+            last_response = dispatch_result.response
+            if dispatch_result.success:
+                return StepResult(
+                    kind="prompt",
+                    content=self._redact(prompt),
+                    response=self._redact(last_response),
+                    success=True,
+                    provider=provider_name,
+                    attempt=total_attempt,
+                )
 
         return StepResult(
             kind="prompt",
@@ -1772,6 +2082,111 @@ class Runner:
             success=False,
             provider=last_provider,
             attempt=total_attempt,
+        )
+
+    def _run_fanout_step(
+        self,
+        prompt: str,
+        task: Task,
+        targets: list[tuple[str, Dispatcher]],
+        output_contract: str | None,
+    ) -> StepResult:
+        """Send one prompt to several providers at once and keep every answer.
+
+        The step succeeds when at least one provider answered, matching how
+        ``fallback-llm`` treats a working provider as enough. Failed providers
+        are still recorded so the outcome is inspectable.
+        """
+        if self.verbose:
+            names = ", ".join(name for name, _ in targets)
+            _log(f"         > fanning out to {names}", dim=True)
+
+        results: dict[str, tuple[DispatchResult, int]] = {}
+        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            futures = {
+                pool.submit(
+                    self._attempt_with_provider,
+                    prompt,
+                    task,
+                    name,
+                    candidate,
+                    output_contract,
+                ): name
+                for name, candidate in targets
+            }
+            for future in futures:
+                results[futures[future]] = future.result()
+
+        ordered = [(name, results[name][0]) for name, _ in targets if name in results]
+        variants = {name: self._redact(outcome.response) for name, outcome in ordered}
+        succeeded = [(name, outcome) for name, outcome in ordered if outcome.success]
+        total_attempt = sum(results[name][1] for name, _ in ordered)
+
+        if not succeeded:
+            return StepResult(
+                kind="prompt",
+                content=self._redact(prompt),
+                response=self._redact(format_fanout_response(ordered)),
+                success=False,
+                provider="|".join(name for name, _ in ordered),
+                attempt=total_attempt,
+                variants=variants,
+            )
+
+        if task.options.judge:
+            judged = self._run_judge(prompt, task, succeeded, output_contract)
+            if judged is not None:
+                judged.variants = variants
+                judged.attempt = (judged.attempt or 0) + total_attempt
+                return judged
+
+        return StepResult(
+            kind="prompt",
+            content=self._redact(prompt),
+            response=self._redact(format_fanout_response(ordered)),
+            success=True,
+            provider="|".join(name for name, _ in ordered),
+            attempt=total_attempt,
+            variants=variants,
+        )
+
+    def _run_judge(
+        self,
+        prompt: str,
+        task: Task,
+        answers: list[tuple[str, DispatchResult]],
+        output_contract: str | None,
+    ) -> StepResult | None:
+        """Merge fan-out answers with the judge provider.
+
+        Returns ``None`` when the judge is not usable, so the caller falls back
+        to reporting every answer rather than losing them.
+        """
+        judge_name = task.options.judge
+        if not judge_name:
+            return None
+        provider = self.pf.llm_providers.get(judge_name)
+        if provider is None:
+            return None
+        if self.verbose:
+            _log(f"         > merging {len(answers)} answers with {judge_name}", dim=True)
+        judge_prompt = build_judge_prompt(prompt, [(name, r.response) for name, r in answers])
+        outcome, attempts = self._attempt_with_provider(
+            judge_prompt,
+            task,
+            judge_name,
+            _dispatcher_for_provider(provider),
+            output_contract,
+        )
+        if not outcome.success:
+            return None
+        return StepResult(
+            kind="prompt",
+            content=self._redact(judge_prompt),
+            response=self._redact(outcome.response),
+            success=True,
+            provider=judge_name,
+            attempt=attempts,
         )
 
     def _run_docker_task(
@@ -1800,13 +2215,13 @@ class Runner:
                     success=True,
                 )
             )
-            build_cmd = docker_dry_run_build_command(
+            dry_run_command = docker_dry_run_build_command(
                 task.name, docker.tag, docker.context, docker.file
             )
             step_results.append(
                 StepResult(
                     kind="docker-build",
-                    content=build_cmd,
+                    content=dry_run_command,
                     response="[dry-run] build Docker image",
                     success=True,
                 )
@@ -1922,12 +2337,28 @@ class Runner:
             elif not sr.success:
                 last_exit_code = "1"
 
-        self.artifacts[artifact_name] = {
+        artifact: dict[str, str] = {
             "stdout": "\n".join(stdout_parts).strip(),
             "stderr": "",  # stderr is mixed into stdout in current implementation
             "exit_code": last_exit_code if not task_result.success else "0",
             "success": "true" if task_result.success else "false",
             "response": "\n".join(response_parts).strip(),
+        }
+        # Fan-out answers stay individually addressable as {{task.provider.response}}.
+        for sr in task_result.step_results:
+            for provider_name, answer in sr.variants.items():
+                artifact[f"{provider_name}.response"] = answer
+        self.artifacts[artifact_name] = artifact
+
+    def _store_skipped_artifact(self, task: Task) -> None:
+        """Record a placeholder artifact for a task that was skipped."""
+        artifact_name = task.options.register or task.name
+        self.artifacts[artifact_name] = {
+            "stdout": "",
+            "stderr": "",
+            "exit_code": "0",
+            "success": "skipped",
+            "response": "",
         }
 
     def _fire_webhook(self, task: Task, task_result: TaskResult, elapsed: float) -> None:

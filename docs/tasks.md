@@ -120,7 +120,8 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `model` | string | LLM model to use for this task |
 | `temperature` | float | Sampling temperature (e.g., `0.2` for deterministic, `0.9` for creative) |
 | `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
-| `llm` | string | Name of the LLM provider to use (must be declared globally) |
+| `llm` | string | Provider name; `"a\|b"` fans out to several at once |
+| `judge` | string | Provider that merges fan-out answers into one response |
 | `agent` | string | Named agent whose instructions/provider apply to this task |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |
@@ -147,6 +148,8 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `secrets` | string | Override the configured secret backend for this task |
 | `when` | expression | Run only when the condition is true; repeat for multiple conditions |
 | `cache` | duration | Reuse successful results for a duration such as `30m`, `1h`, or `1d` |
+| `sources` | string | Input file patterns; skip the task when outputs are newer |
+| `outputs` | string | Output file patterns compared against `sources` |
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
@@ -155,6 +158,8 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `retries` | integer | LLM retries per provider, from 0 through 10 |
 | `requires` | string | `|`-separated `artifact.field[:type]` input contracts |
 | `produces` | string | Aggregate output type: `text`, `nonempty`, `json`, `object`, `array`, `integer`, `number`, or `boolean` |
+| `repair` | int | Re-prompt up to N times (max 3) when `produces` is violated |
+| `max-cost` | string | Stop the run when LLM spend reaches this many US dollars |
 | `ssh-key` | string | SSH identity file for this task's remote shell steps |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |

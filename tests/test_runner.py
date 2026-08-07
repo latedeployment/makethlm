@@ -3280,3 +3280,102 @@ task review [fallback-llm=backup, retries=1]:
         assert fallback.calls == 1
         assert step.provider == "backup"
         assert step.attempt == 3
+
+
+class TestContractRepair:
+    """Re-prompting when a response violates the task's produces contract."""
+
+    class ScriptedDispatcher(Dispatcher):
+        """Returns queued responses in order, repeating the last one."""
+
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.prompts = []
+
+        def dispatch(self, prompt, task):
+            self.prompts.append(prompt)
+            idx = min(len(self.prompts) - 1, len(self.responses) - 1)
+            return DispatchResult(response=self.responses[idx], success=True)
+
+    def _pf(self, options):
+        return parse(f"""\
+task inspect [{options}]:
+    return the report
+""")
+
+    def test_repairs_invalid_json(self):
+        pf = self._pf("produces=object, repair=1")
+        dispatcher = self.ScriptedDispatcher(["here you go: {}", '{"ok": true}'])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        assert result.success
+        assert len(dispatcher.prompts) == 2
+        assert result.task_results[0].response == '{"ok": true}'
+
+    def test_repair_prompt_includes_contract_and_previous_output(self):
+        pf = self._pf("produces=object, repair=1")
+        dispatcher = self.ScriptedDispatcher(["nope", '{"ok": true}'])
+        Runner(pf, dispatcher, verbose=False).run("inspect")
+        repair_prompt = dispatcher.prompts[1]
+        assert "produces=object" in repair_prompt
+        assert "nope" in repair_prompt
+        assert "return the report" in repair_prompt
+
+    def test_repair_budget_is_bounded(self):
+        pf = self._pf("produces=object, repair=2")
+        dispatcher = self.ScriptedDispatcher(["still not json"])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        assert not result.success
+        assert len(dispatcher.prompts) == 3  # initial + 2 repairs
+        assert "output is not object" in result.task_results[0].response
+
+    def test_no_repair_without_opt_in(self):
+        pf = self._pf("produces=object")
+        dispatcher = self.ScriptedDispatcher(["not json"])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        assert not result.success
+        assert len(dispatcher.prompts) == 1
+
+    def test_valid_first_response_is_not_repaired(self):
+        pf = self._pf("produces=object, repair=2")
+        dispatcher = self.ScriptedDispatcher(['{"ok": true}'])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        assert result.success
+        assert len(dispatcher.prompts) == 1
+
+    def test_repair_counts_toward_step_attempts(self):
+        pf = self._pf("produces=integer, repair=1")
+        dispatcher = self.ScriptedDispatcher(["about seven", "7"])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        step = result.task_results[0].step_results[-1]
+        assert step.attempt == 2
+        assert result.success
+
+    def test_only_the_final_prompt_is_repaired(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        pf = parse("""\
+task inspect [produces=object, repair=1]:
+    first prompt
+    !echo separator
+    second prompt
+""")
+        dispatcher = self.ScriptedDispatcher(["", "", ""])
+        Runner(pf, dispatcher, verbose=False).run("inspect")
+        # The first prompt is dispatched once; only the last one is repaired.
+        assert len(dispatcher.prompts) == 3
+        assert dispatcher.prompts[0] == "first prompt"
+        assert "second prompt" in dispatcher.prompts[1]
+        assert "second prompt" in dispatcher.prompts[2]
+
+    def test_shell_steps_are_not_rerun_by_repair(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        pf = parse("""\
+task inspect [produces=object, repair=1]:
+    !printf 'x' >> counter.txt
+    summarize it
+""")
+        dispatcher = self.ScriptedDispatcher(["bad", '{"ok": true}'])
+        result = Runner(pf, dispatcher, verbose=False).run("inspect")
+        assert len(dispatcher.prompts) == 2
+        assert (tmp_path / "counter.txt").read_text() == "x"
+        # The shell step's output still joins the aggregate response.
+        assert not result.success or '{"ok": true}' in result.task_results[0].response

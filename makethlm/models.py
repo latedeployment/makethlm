@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Literal
 
+from . import gitinfo
 from .interpolation import (
     apply_parameter_expansion,
     interpolate_text,
@@ -35,6 +36,8 @@ ARTIFACT_CONTRACT_TYPES = frozenset(
 )
 MAX_LLM_RETRIES = 10
 MAX_FALLBACK_LLMS = 4
+MAX_REPAIR_ATTEMPTS = 3
+MAX_FANOUT_LLMS = 8
 MAX_LLM_TOKENS = 1_000_000
 
 
@@ -50,6 +53,9 @@ class LLMProvider:
     api_key: str | None = None
     base_url: str | None = None
     shell_template: str | None = None  # for shell provider: 'cmd {prompt}'
+    price_in: float | None = None  # USD per million input tokens
+    price_out: float | None = None  # USD per million output tokens
+    max_concurrency: int | None = None  # cap on simultaneous calls to this provider
 
 
 @dataclass
@@ -87,7 +93,9 @@ class TaskOptions:
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    llm: str | None = None  # per-task LLM provider override
+    llm: str | None = None  # per-task LLM provider override (first of llms)
+    llms: list[str] = field(default_factory=list)  # fan-out providers from llm="a|b"
+    judge: str | None = None  # provider that merges fan-out answers
     agent: str | None = None  # agent to use for this task
     on: str | None = None  # host group to run on (Ansible-like)
     private: bool = False  # hide from --list
@@ -106,6 +114,8 @@ class TaskOptions:
     secrets: str | None = None  # per-task secrets backend override
     when: list[str] = field(default_factory=list)  # conditional execution expressions
     cache: str | None = None  # cache duration e.g. "1h", "30m", "1d"
+    sources: list[str] = field(default_factory=list)  # input file globs for staleness
+    outputs: list[str] = field(default_factory=list)  # output file globs for staleness
     timeout: str | None = None  # shell/SSH timeout e.g. "30s", "5m"
     llm_timeout: str | None = None  # prompt/LLM timeout e.g. "5m"
     rollback: str | None = None  # task to run if this task fails
@@ -114,6 +124,8 @@ class TaskOptions:
     retries: int = 0  # retry count per LLM provider
     requires: list[str] = field(default_factory=list)  # artifact contracts
     produces: str | None = None  # output type contract
+    repair: int = 0  # re-prompt attempts when produces is violated
+    max_cost: str | None = None  # spend limit in USD for runs reaching this task
     ssh_identity: str | None = None  # SSH identity file for remote shell steps
     ssh_strict_host_key_checking: str | None = None  # yes, no, or accept-new
     ssh_parallel: bool = False  # run each shell step across hosts concurrently
@@ -141,6 +153,8 @@ class TaskOptions:
             if overrides.max_tokens is not None
             else self.max_tokens,
             llm=overrides.llm if overrides.llm is not None else self.llm,
+            llms=overrides.llms if overrides.llms else self.llms,
+            judge=overrides.judge if overrides.judge is not None else self.judge,
             agent=overrides.agent if overrides.agent is not None else self.agent,
             on=overrides.on if overrides.on is not None else self.on,
             private=overrides.private or self.private,
@@ -165,6 +179,8 @@ class TaskOptions:
             secrets=overrides.secrets if overrides.secrets is not None else self.secrets,
             when=overrides.when if overrides.when else self.when,
             cache=overrides.cache if overrides.cache is not None else self.cache,
+            sources=overrides.sources if overrides.sources else self.sources,
+            outputs=overrides.outputs if overrides.outputs else self.outputs,
             timeout=overrides.timeout if overrides.timeout is not None else self.timeout,
             llm_timeout=overrides.llm_timeout
             if overrides.llm_timeout is not None
@@ -179,6 +195,8 @@ class TaskOptions:
             retries=overrides.retries if overrides.retries else self.retries,
             requires=overrides.requires if overrides.requires else self.requires,
             produces=overrides.produces if overrides.produces is not None else self.produces,
+            repair=overrides.repair if overrides.repair else self.repair,
+            max_cost=overrides.max_cost if overrides.max_cost is not None else self.max_cost,
             ssh_identity=overrides.ssh_identity
             if overrides.ssh_identity is not None
             else self.ssh_identity,
@@ -241,6 +259,7 @@ class TaskStep:
     quiet: bool = False  # @ prefix -- suppress command echoing
     capture: str | None = None  # -> name -- expose output as {{name.stdout}}
     pipe_output: bool = False  # |> -- prepend output to the next prompt step
+    llm: str | None = None  # @llm <name> -- provider override for this step
     script: bool = False  # execute content as a temporary script file
 
 
@@ -577,6 +596,42 @@ def _fn_bump_patch(*args: str) -> str:
     return f"{major}.{minor}.{patch + 1}"
 
 
+def _fn_changed_files(*args: str) -> str:
+    """Return space-separated paths that changed against a ref."""
+    if len(args) > 1:
+        raise ValueError("changed_files() takes at most 1 argument")
+    ref = args[0] if args else None
+    return " ".join(gitinfo.changed_files(ref))
+
+
+def _fn_changed(*args: str) -> str:
+    """Return whether any changed path matches a glob.
+
+    ``changed("src/**")`` compares against the default ref; ``changed("main",
+    "src/**")`` compares against an explicit one.
+    """
+    if len(args) == 1:
+        ref, pattern = None, args[0]
+    elif len(args) == 2:
+        ref, pattern = args[0], args[1]
+    else:
+        raise ValueError("changed() takes 1 or 2 arguments")
+    return "true" if gitinfo.matches(gitinfo.changed_files(ref), pattern) else "false"
+
+
+def _fn_git_branch(*args: str) -> str:
+    if args:
+        raise ValueError("git_branch() takes no arguments")
+    return gitinfo.branch()
+
+
+def _fn_git_sha(*args: str) -> str:
+    if len(args) > 1:
+        raise ValueError("git_sha() takes at most 1 argument")
+    short = args[0].strip().lower() not in ("false", "0", "no") if args else True
+    return gitinfo.sha(short=short)
+
+
 # Registry of callable string functions
 _STRING_FUNCTIONS: dict[str, Callable[..., str]] = {
     # String manipulation
@@ -611,6 +666,11 @@ _STRING_FUNCTIONS: dict[str, Callable[..., str]] = {
     "bump_major": _fn_bump_major,
     "bump_minor": _fn_bump_minor,
     "bump_patch": _fn_bump_patch,
+    # Git-aware inputs
+    "changed": _fn_changed,
+    "changed_files": _fn_changed_files,
+    "git_branch": _fn_git_branch,
+    "git_sha": _fn_git_sha,
 }
 
 
@@ -1315,6 +1375,7 @@ class Promptfile:
                     quiet=step.quiet,
                     capture=step.capture,
                     pipe_output=step.pipe_output,
+                    llm=step.llm,
                     script=step.script,
                 )
             )

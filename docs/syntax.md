@@ -1,6 +1,10 @@
 # Syntax Overview
 
-makethlm uses a file called `Promptfile` (also `promptfile`, `Promptfile.pf`, or `promptfile.pf`). You can specify a different file with `-f`.
+makethlm uses a file called `Promptfile`. Hidden and all-caps variants are also
+recognized: `Promptfile`, `promptfile`, `Promptfile.pf`, `promptfile.pf`, `.promptfile`,
+`.Promptfile`, `.promptfile.pf`, `.Promptfile.pf`, `PROMPTFILE`, or `PROMPTFILE.pf`. Discovery walks up parent directories and then falls
+back to a global Promptfile under `$XDG_CONFIG_HOME/makethlm/`. Pass `-f` to
+use a specific file.
 
 ## File Structure
 
