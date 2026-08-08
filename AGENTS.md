@@ -25,7 +25,8 @@ Tests live in `tests/`. Examples are under `examples/`, documentation under `doc
 - `uv build --wheel`: build the package wheel.
 - `./publish.sh --validate`: build and install the wheel in a temporary venv for a smoke test.
 - `scripts/release.py patch --no-build`: preview version/changelog release automation without publishing.
-- `uv run mkdocs serve`: preview docs locally when editing `docs/`.
+- `uv run --group docs mkdocs serve`: preview docs locally when editing `docs/`.
+- `uv run --locked --group docs mkdocs build --strict`: the docs gate CI runs.
 
 ## Coding Style & Naming Conventions
 

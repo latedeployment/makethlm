@@ -5,6 +5,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/makethlm)](https://pypi.org/project/makethlm/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-latedeployment.github.io-blue)](https://latedeployment.github.io/makethlm/)
 
 makethlm is a command-line task runner in the tradition of [Make](https://www.gnu.org/software/make/) and [Just](https://github.com/casey/just), but
 designed for a world where tasks are described in natural language and executed
@@ -151,6 +152,8 @@ makethlm --list         # see all tasks
 ```
 
 Lines starting with `!` are shell commands. Everything else is a prompt sent to the LLM. Tasks can depend on each other (`run: build` means "run build first").
+
+Full documentation: **<https://latedeployment.github.io/makethlm/>**
 
 More examples in [`examples/`](examples/).
 See also [`examples/cmake-project/`](examples/cmake-project/),
