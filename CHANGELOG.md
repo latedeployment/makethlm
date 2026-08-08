@@ -65,6 +65,10 @@
 
 #### Inputs and syntax
 
+- Make-style automatic variables inside a task: `{{makethlm_task}}` (`$@`),
+  `{{makethlm_deps}}` (`$^`), `{{makethlm_dep}}` (`$<`), `{{makethlm_changed}}`
+  (`$?`), plus `{{makethlm_sources}}` and `{{makethlm_outputs}}`.
+
 - Git-aware inputs: `changed()`, `changed_files()`, `git_branch()`, `git_sha()`,
   and `--since REF` to scope tasks to a diff.
 - Step-level shell output capture with `!cmd -> name`, `{{last.stdout}}`, and

@@ -9,7 +9,7 @@ import shlex
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from . import gitinfo
@@ -22,6 +22,7 @@ from .interpolation import (
 )
 from .mcp import MCPServer
 from .secrets import SecretError, is_secret_name, resolve_secret, resolve_secrets
+from .staleness import expand_patterns
 
 ARTIFACT_CONTRACT_TYPES = frozenset(
     {
@@ -988,6 +989,57 @@ def _eval_if_else(expr: str, variables: dict[str, str]) -> str:
     return _resolve_value(result_expr, variables)
 
 
+def _quote_paths(paths: list[str]) -> str:
+    """Join paths for use in a shell command, quoting only where needed."""
+    return " ".join(shlex.quote(path) for path in paths)
+
+
+def _file_variables(task: Task, global_working_dir: str | None) -> dict[str, str]:
+    """Return the source/output variables for a task, if it declares any.
+
+    ``makethlm_changed`` is make's ``$?``: the sources newer than the oldest
+    output, which is what an incremental recipe wants to act on.
+    """
+    empty = {"makethlm_sources": "", "makethlm_outputs": "", "makethlm_changed": ""}
+    options = task.options
+    if not options.sources and not options.outputs:
+        return empty
+
+    base_dir = options.working_dir or global_working_dir
+    try:
+        source_paths = expand_patterns(options.sources, base_dir) if options.sources else []
+        output_paths = expand_patterns(options.outputs, base_dir) if options.outputs else []
+    except ValueError:
+        return empty
+
+    root = Path(base_dir) if base_dir else Path.cwd()
+
+    def render(path: Path) -> str:
+        """Show a path the way the recipe would write it: relative to its cwd."""
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            return str(path)
+
+    sources = [render(path) for path in source_paths]
+    # Outputs may not exist yet, so fall back to the declared patterns.
+    outputs = [render(path) for path in output_paths] or list(options.outputs)
+
+    changed = sources
+    if source_paths and output_paths:
+        try:
+            oldest_output = min(path.stat().st_mtime for path in output_paths)
+            changed = [render(p) for p in source_paths if p.stat().st_mtime > oldest_output]
+        except OSError:
+            changed = sources
+
+    return {
+        "makethlm_sources": _quote_paths(sources),
+        "makethlm_outputs": _quote_paths(outputs),
+        "makethlm_changed": _quote_paths(changed),
+    }
+
+
 @dataclass
 class Promptfile:
     """The parsed representation of an entire Promptfile."""
@@ -1248,8 +1300,12 @@ class Promptfile:
             for arg in task.arguments:
                 if arg.name not in context and arg.default is not None:
                     context[arg.name] = arg.default
-        # Runtime variables
+        # Runtime variables. These mirror make's automatic variables so a recipe
+        # can name its own target, dependencies, and files without repeating them.
         context["makethlm_task"] = task_name
+        context["makethlm_deps"] = " ".join(task.dependencies)
+        context["makethlm_dep"] = task.dependencies[0] if task.dependencies else ""
+        context.update(_file_variables(task, self.settings.working_dir))
         if promptfile_path:
             context["makethlm_file"] = promptfile_path
             context["makethlm_dir"] = os.path.dirname(os.path.abspath(promptfile_path))

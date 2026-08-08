@@ -178,3 +178,38 @@ task release:
     !git tag v{{bump_minor(version)}}
     deploy version {{uppercase(version)}} to production
 ```
+
+## Automatic Variables
+
+Every task can reference its own target, dependencies, and files without
+repeating them, the way make's automatic variables work:
+
+| Variable | Make equivalent | Value |
+|----------|-----------------|-------|
+| `{{makethlm_task}}` | `$@` | Name of the running task |
+| `{{makethlm_deps}}` | `$^` | All dependency task names, space-separated |
+| `{{makethlm_dep}}` | `$<` | First dependency task name |
+| `{{makethlm_sources}}` | — | Files matched by `sources`, relative to the working directory |
+| `{{makethlm_outputs}}` | — | Files matched by `outputs`, falling back to the declared patterns |
+| `{{makethlm_changed}}` | `$?` | Only the sources newer than the oldest output |
+| `{{makethlm_file}}` | — | Path to the Promptfile |
+| `{{makethlm_dir}}` | — | Directory containing the Promptfile |
+
+```make
+task build [sources="src/*.c", outputs="build/app"]:
+    !mkdir -p build
+    !cc -o {{makethlm_outputs}} {{makethlm_sources}}
+```
+
+`makethlm_changed` is the incremental lever — it holds only the sources newer
+than the output, so a recipe can act on what actually changed:
+
+```make
+task lint [sources="src/**/*.py", outputs=".lint-stamp"]:
+    !ruff check {{makethlm_changed}}
+    !touch .lint-stamp
+```
+
+Paths are rendered relative to the directory the recipe runs in and quoted only
+when they need it, so names containing spaces stay safe. The file variables are
+empty for a task that declares neither `sources` nor `outputs`.
