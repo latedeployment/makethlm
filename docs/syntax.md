@@ -23,7 +23,7 @@ hosts web [user=deploy]:         # Host groups
     web1.example.com
 fn security_review:              # Functions
     review for vulnerabilities
-task build: dep1 dep2            # Tasks
+task build: dep1 dep2:           # Tasks
     !shell command
     natural language prompt
 just-build:                      # Bare Just-style shell recipe
@@ -91,7 +91,7 @@ fn <name>:
     reusable prompt text
 
 # Tasks
-task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
+task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]:
 task deploy [default, confirm("Really deploy?"), env(ENV, prod)]:
     !shell command
     !shell command -> captured

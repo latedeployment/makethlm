@@ -43,6 +43,6 @@ Docker blocks appear in the task list and can be used as dependencies:
 docker api:
     Python 3.11 slim image. Install requirements.txt.
 
-task deploy: api
+task deploy: api:
     push the api image to the registry
 ```

@@ -109,7 +109,7 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 Options can be combined with arguments and dependencies:
 
 ```
-task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
+task deploy(target) [llm=openai, on=web, model=gpt-4]: build test:
     deploy {{project}} to {{target}}
 ```
 

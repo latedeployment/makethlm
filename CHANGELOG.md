@@ -108,6 +108,13 @@
 - Real-world examples for Docker Compose, systemd, Kubernetes, Ansible inventory,
   Python package release, and CMake `compile_commands.json` analysis.
 
+### Fixed
+
+- The README and docs landing-page examples were missing the trailing `:` on
+  task headers with dependencies, so the first snippet a reader copies did not
+  parse. Fixed across README, getting-started, index, docker, tasks, and syntax
+  docs, with a test that parses every documented Promptfile snippet.
+
 ### Changed
 
 - The Claude CLI dispatcher requests the JSON envelope (`--output-format json`)

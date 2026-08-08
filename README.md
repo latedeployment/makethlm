@@ -23,16 +23,15 @@ project := "my-web-app"
 
 llm claude [model=opus]
 
-task build:
+task build [sources="src/**/*.ts", outputs="dist/bundle.js"]:
     !mkdir -p dist
-    check if src/ has changed since the last build.
-    if so, compile the TypeScript and bundle with esbuild.
+    compile the TypeScript in src/ and bundle it to dist/bundle.js with esbuild.
 
-task test: build
+task test: build:
     !npm test
     if any tests failed, explain the root cause and suggest/apply a fix.
 
-task deploy(target, port="8080"): build test
+task deploy(target, port="8080"): build test:
     !systemctl restart {{project}}
     verify {{project}} is running on {{target}} port {{port}}.
 ```
@@ -40,9 +39,23 @@ task deploy(target, port="8080"): build test
 ```
 $ makethlm deploy staging
 [ok] build
-  ...
+  Bundled 14 TypeScript files into dist/bundle.js.
 [ok] test
-  ...
+  All 32 tests passed.
+[ok] deploy
+  Verified my-web-app is running on staging port 8080. All health checks pass.
+```
+
+Run it again without touching `src/` and the build is skipped, because
+`sources` and `outputs` give the task the same file-dependency tracking `make`
+has — no LLM call needed to work out that nothing changed:
+
+```
+$ makethlm deploy staging
+[ok] build
+  [skipped] up to date (14 sources older than outputs)
+[ok] test
+  All 32 tests passed.
 [ok] deploy
   Verified my-web-app is running on staging port 8080. All health checks pass.
 ```
@@ -122,7 +135,7 @@ task build:
     !gcc src/main.c src/mylib.o -o {{project}}
     !echo "Build complete: ./{{project}}"
 
-task run: build
+task run: build:
     !./{{project}}
 
 task clean:
@@ -425,7 +438,7 @@ Docker blocks appear in the task list and can be used as dependencies:
 docker api:
     Python 3.11 slim image. Install requirements.txt.
 
-task deploy: api
+task deploy: api:
     push the api image to the registry
 ```
 
@@ -700,7 +713,7 @@ task review [llm=claude, model=opus, temperature=0.2, max_tokens=4096]:
 Options can be combined with dependencies:
 
 ```
-task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
+task deploy(target) [llm=openai, on=web, model=gpt-4]: build test:
     deploy {{project}} to {{target}}
 ```
 
@@ -1274,7 +1287,7 @@ fn <name>:
     reusable prompt text
 
 # Tasks
-task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]
+task <name>[(arg1, arg2="default", +variadic)] [options]: [dep1 dep2]:
     !shell command
     !shell command -> captured   # later: {{captured.stdout}}
     !shell command |>            # pipe output into next prompt

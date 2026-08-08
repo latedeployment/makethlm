@@ -15,16 +15,15 @@ project := "my-web-app"
 
 llm claude [model=opus]
 
-task build:
+task build [sources="src/**/*.ts", outputs="dist/bundle.js"]:
     !mkdir -p dist
-    check if src/ has changed since the last build.
-    if so, compile the TypeScript and bundle with esbuild.
+    compile the TypeScript in src/ and bundle it to dist/bundle.js with esbuild.
 
-task test: build
+task test: build:
     !npm test
     if any tests failed, explain the root cause and suggest/apply a fix.
 
-task deploy(target, port="8080"): build test
+task deploy(target, port="8080"): build test:
     !systemctl restart {{project}}
     verify {{project}} is running on {{target}} port {{port}}.
 ```
@@ -81,7 +80,7 @@ task build:
     !gcc -c src/mylib.c -o src/mylib.o
     !gcc src/main.c src/mylib.o -o {{project}}
 
-task run: build
+task run: build:
     !./{{project}}
 ```
 

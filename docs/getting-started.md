@@ -62,11 +62,11 @@ Tasks can depend on other tasks:
 task build:
     !npm run build
 
-task test: build
+task test: build:
     !npm test
     if any tests failed, explain the root cause
 
-task deploy: build test
+task deploy: build test:
     deploy to production
 ```
 
