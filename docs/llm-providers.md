@@ -37,6 +37,46 @@ task review [llm=codex]:
 makethlm invokes `codex exec` non-interactively and sends the prompt on stdin.
 Install and authenticate Codex first with `codex login`.
 
+The Codex run uses `--json` and `--output-last-message`, which gives makethlm
+three things a plain stdout read does not:
+
+- **Token usage.** `turn.completed` carries `input_tokens` and `output_tokens`,
+  so Codex calls are counted in the run's usage summary and history rather than
+  being reported as unpriced.
+- **A reliable answer.** The final message is read from the file Codex writes,
+  not scraped out of whatever else the stream printed.
+- **Native output contracts.** When a task declares `produces=object`, `array`,
+  `json`, `integer`, `number`, or `boolean`, makethlm passes a matching JSON
+  Schema via `--output-schema` so Codex constrains the answer at the source.
+  `repair` still applies, but usually has nothing left to fix.
+
+A Codex build that does not recognize these flags is detected and retried with
+plain output, so older installs keep working.
+
+## opencode
+
+[opencode](https://opencode.ai) is supported as a CLI provider:
+
+```
+llm opencode [model=anthropic/claude-sonnet-4-5]
+
+task review [llm=opencode]:
+    review the current diff and suggest fixes
+```
+
+Models use opencode's `provider/model` form. makethlm runs
+`opencode run --format json --auto` and reads the assistant text from the event
+stream, falling back to raw stdout if the stream shape is unfamiliar.
+
+Two things to know:
+
+- **`--auto` is passed**, matching how the Claude and Codex dispatchers run
+  non-interactively — without it a permission request would block until the task
+  timed out. opencode is therefore treated as a local-execution provider, so a
+  task using it needs `--allow-shell` as well as `--allow-llm` under `--safe`.
+- **opencode reports no token usage**, so its calls count as `unpriced` unless
+  the provider declares `price-in`/`price-out`.
+
 ## Native OpenAI
 
 `llm openai` calls the OpenAI Chat Completions API directly. Set
@@ -119,11 +159,12 @@ To use Codex as the default dispatcher for a run:
 makethlm review --codex
 ```
 
-Native OpenAI and Ollama can also be selected for one run:
+Native OpenAI, Ollama, and opencode can also be selected for one run:
 
 ```bash
 makethlm review --openai -m gpt-4o-mini
 makethlm review --ollama -m llama3
+makethlm review --opencode -m anthropic/claude-sonnet-4-5
 ```
 
 ## Rate Limits and Concurrency
@@ -213,3 +254,42 @@ This is the same piping `!cmd |>` already does for shell output, so a chain can
 mix both. A bare `@llm` clears the override and returns to the task's provider.
 A step-level `@llm` also wins over a task-level fan-out, so one step in a
 fan-out task can be pinned to a single model.
+
+## MCP Servers
+
+Declare an MCP server once and attach it to the tasks that need it:
+
+```make
+mcp files [command="npx -y @modelcontextprotocol/server-filesystem /tmp"]
+mcp github [url=https://api.githubcopilot.com/mcp/]
+mcp db [command=db-mcp, env(DB_URL, "postgres://localhost/app")]
+
+task review [mcp="files|github"]:
+    review the open pull request against the working tree
+```
+
+A declaration needs either `command=` (a local stdio server) or `url=` (a
+remote one), never both. Extra environment variables use the same `env(NAME,
+VALUE)` form as task options. Attach servers with `mcp=`, separated by pipes or
+commas.
+
+Each provider is configured **for that invocation only** — makethlm never edits
+your global MCP configuration:
+
+| Provider | How the servers are passed |
+|----------|----------------------------|
+| Claude | `--mcp-config` with an inline JSON document |
+| Codex | `-c mcp_servers.<name>...` config overrides |
+| opencode | `OPENCODE_CONFIG_CONTENT` inline JSON |
+
+Attaching a server is a capability, so `--safe` requires `--allow-mcp`:
+
+```bash
+makethlm --capabilities review
+#   mcp  review: attaches MCP server 'github' at https://api.githubcopilot.com/mcp/ (--allow-mcp)
+
+makethlm --safe --allow-llm --allow-shell --allow-mcp review
+```
+
+Native OpenAI and Ollama providers have no MCP transport; a task attaching
+servers and running on them simply does not get the tools.

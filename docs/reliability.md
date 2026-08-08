@@ -246,3 +246,33 @@ first ran.
 
 Shell, SSH, and Docker steps still execute during replay; only LLM calls are
 served from fixtures.
+
+## Watching and Debugging LLM Calls
+
+`--log-llm PATH` appends one JSON object per LLM call as it happens, so a long
+run can be watched live:
+
+```bash
+makethlm --log-llm calls.jsonl deploy &
+tail -f calls.jsonl | jq -c '{task, provider, kind, success, duration_ms}'
+```
+
+Each record carries the task, provider, call kind, attempt index, success,
+duration, token counts, cost, and the redacted prompt and response. `kind`
+explains *why* the call happened:
+
+| `kind` | Meaning |
+|--------|---------|
+| `prompt` | An ordinary prompt step |
+| `repair` | A re-prompt after a `produces` violation |
+| `fanout` | One branch of an `llm="a|b"` fan-out |
+| `judge` | The `judge` provider merging fan-out answers |
+| `budget` | A call refused because `max-cost` was reached |
+
+`source` distinguishes a real provider call from a replayed fixture, so a CI run
+using `--fixtures` is visibly spending nothing. Prompts and responses are
+redacted and truncated at 4000 characters, the file is created owner-only, and a
+log that cannot be written never fails the run it was observing.
+
+This is complementary to history: history records what a task produced, the call
+log records every attempt it took to get there.

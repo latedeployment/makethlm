@@ -20,6 +20,7 @@ from .interpolation import (
     split_unquoted,
     try_parameter_expansion,
 )
+from .mcp import MCPServer
 from .secrets import SecretError, is_secret_name, resolve_secret, resolve_secrets
 
 ARTIFACT_CONTRACT_TYPES = frozenset(
@@ -96,6 +97,7 @@ class TaskOptions:
     llm: str | None = None  # per-task LLM provider override (first of llms)
     llms: list[str] = field(default_factory=list)  # fan-out providers from llm="a|b"
     judge: str | None = None  # provider that merges fan-out answers
+    mcp: list[str] = field(default_factory=list)  # MCP servers this task may use
     agent: str | None = None  # agent to use for this task
     on: str | None = None  # host group to run on (Ansible-like)
     private: bool = False  # hide from --list
@@ -155,6 +157,7 @@ class TaskOptions:
             llm=overrides.llm if overrides.llm is not None else self.llm,
             llms=overrides.llms if overrides.llms else self.llms,
             judge=overrides.judge if overrides.judge is not None else self.judge,
+            mcp=overrides.mcp if overrides.mcp else self.mcp,
             agent=overrides.agent if overrides.agent is not None else self.agent,
             on=overrides.on if overrides.on is not None else self.on,
             private=overrides.private or self.private,
@@ -355,6 +358,8 @@ class Task:
     local_variables: dict[str, str] = field(default_factory=dict)
     function_namespace: str | None = None
     guidance: str | None = None
+    # Resolved from options.mcp by the parser, so dispatchers need only the task.
+    mcp_servers: list[MCPServer] = field(default_factory=list)
 
     @property
     def prompt(self) -> str:
@@ -1000,6 +1005,7 @@ class Promptfile:
     guidance: str | None = None  # global default prompt prepended to all tasks
     settings: Settings = field(default_factory=Settings)
     aliases: dict[str, str] = field(default_factory=dict)  # alias -> target
+    mcp_servers: dict[str, MCPServer] = field(default_factory=dict)
 
     @property
     def default_task(self) -> str | None:

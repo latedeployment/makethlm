@@ -14,7 +14,7 @@ from makethlm.cli import (
     find_promptfile,
     main,
 )
-from makethlm.dispatcher import ClaudeDispatcher, OpenAIDispatcher
+from makethlm.dispatcher import ClaudeDispatcher, DryRunDispatcher, OpenAIDispatcher
 from makethlm.history import get_run, record_run
 from makethlm.parser import parse
 from makethlm.runner import RunResult, StepResult, TaskResult
@@ -1024,3 +1024,73 @@ class TestPromptfileDiscovery:
         (tmp_path / "Promptfile").mkdir()
         expected = self._write(tmp_path, "promptfile")
         assert find_promptfile(tmp_path) == expected
+
+
+class TestOpenCodeProvider:
+    """opencode is a CLI agent, so it carries the same local-execution risk."""
+
+    def _pf(self, tmp_path, body):
+        path = tmp_path / "Promptfile"
+        path.write_text(body)
+        return path
+
+    def test_safe_mode_requires_allow_shell(self, tmp_path, capsys):
+        promptfile = self._pf(
+            tmp_path,
+            "llm opencode [model=anthropic/claude-sonnet-4-5]\n\ntask review:\n    review it\n",
+        )
+        # Pretend the CLI is installed so the run reaches the safe-mode gate.
+        with patch("makethlm.dispatcher.shutil.which", return_value="/usr/bin/opencode"):
+            code = main(["-f", str(promptfile), "--safe", "--allow-llm", "review"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "local execution access" in err
+
+    def test_missing_cli_is_reported(self, tmp_path, capsys):
+        promptfile = self._pf(
+            tmp_path,
+            "llm opencode [model=anthropic/claude-sonnet-4-5]\n\ntask review:\n    review it\n",
+        )
+        with patch("makethlm.dispatcher.shutil.which", return_value=None):
+            code = main(["-f", str(promptfile), "review"])
+        assert code == 1
+        assert "opencode" in capsys.readouterr().err
+
+    def test_capabilities_lists_local_execution(self, tmp_path):
+        promptfile = self._pf(
+            tmp_path,
+            "llm opencode [model=anthropic/claude-sonnet-4-5]\n\ntask review:\n    review it\n",
+        )
+        pf = parse(promptfile.read_text())
+        payload = _capability_payload(pf, "review", None, DryRunDispatcher())
+        reasons = [item["reason"] for item in payload["capabilities"]]
+        assert any("local execution access" in reason for reason in reasons)
+
+    def test_unknown_provider_is_still_reported(self, tmp_path, capsys):
+        promptfile = self._pf(tmp_path, "task review [llm=nosuchprovider]:\n    review it\n")
+        code = main(["-f", str(promptfile), "--check"])
+        assert code == 1
+        assert "unknown-provider" in capsys.readouterr().out
+
+
+class TestMCPCapability:
+    def _pf(self, tmp_path):
+        path = tmp_path / "Promptfile"
+        path.write_text(
+            "mcp gh [url=https://example.com/mcp/]\n\ntask review [mcp=gh]:\n    review it\n"
+        )
+        return path
+
+    def test_safe_mode_blocks_without_allow_mcp(self, tmp_path, capsys):
+        promptfile = self._pf(tmp_path)
+        code = main(["-f", str(promptfile), "--safe", "--allow-llm", "--allow-shell", "review"])
+        assert code == 1
+        assert "--allow-mcp" in capsys.readouterr().err
+
+    def test_capability_manifest_lists_the_server(self, tmp_path):
+        pf = parse(self._pf(tmp_path).read_text())
+        payload = _capability_payload(pf, "review", None, DryRunDispatcher())
+        mcp = [item for item in payload["capabilities"] if item["capability"] == "mcp"]
+        assert len(mcp) == 1
+        assert "gh" in mcp[0]["reason"]
+        assert mcp[0]["allow_flag"] == "--allow-mcp"

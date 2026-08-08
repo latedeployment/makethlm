@@ -22,6 +22,9 @@ Syntax overview (Justfile-compatible + LLM extensions):
     llm claude [model=opus]
     llm openai [model=gpt-4, key=$OPENAI_API_KEY]
 
+    mcp files [command="npx -y server-filesystem /tmp"]
+    mcp github [url=https://api.githubcopilot.com/mcp/]
+
     hosts web [user=deploy, port=22]:
         web1.example.com
         web2.example.com
@@ -52,12 +55,14 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from copy import deepcopy
 
 from .cost import parse_cost
 from .interpolation import split_unquoted
 from .inventory import parse_ansible_inventory
+from .mcp import MCPServer, split_command
 from .models import (
     ARTIFACT_CONTRACT_TYPES,
     MAX_FALLBACK_LLMS,
@@ -298,6 +303,15 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
             opts.llms = providers
         elif key == "judge":
             opts.judge = _strip_quotes(value)
+        elif key == "mcp":
+            servers = [
+                name.strip()
+                for name in _strip_quotes(value).replace("|", ",").split(",")
+                if name.strip()
+            ]
+            if not servers:
+                raise ParseError("mcp requires at least one server name")
+            opts.mcp.extend(servers)
         elif key == "agent":
             opts.agent = value
         elif key == "on":
@@ -1318,6 +1332,53 @@ def parse(
             i += 1
             continue
 
+        # ----- mcp <name> [opts] -----
+        if stripped.startswith("mcp "):
+            rest = stripped[4:].strip()
+            rest, bracket = _extract_brackets(rest)
+            mcp_name = rest.strip()
+            if not mcp_name:
+                raise ParseError("mcp declaration missing name", lineno)
+            mcp_opts = _parse_kv_pairs(bracket) if bracket else {}
+            url = _strip_quotes(mcp_opts.get("url", "")) or None
+            raw_command = _strip_quotes(mcp_opts.get("command", "")) or None
+            if url and raw_command:
+                raise ParseError(
+                    f"mcp {mcp_name!r} sets both url and command; pick one",
+                    lineno,
+                )
+            if not url and not raw_command:
+                raise ParseError(
+                    f"mcp {mcp_name!r} needs either command=... or url=...",
+                    lineno,
+                )
+            command: str | None = None
+            args: list[str] = []
+            if raw_command:
+                try:
+                    command, args = split_command(raw_command)
+                except ValueError as e:
+                    raise ParseError(f"mcp {mcp_name!r}: {e}", lineno)
+                extra = _strip_quotes(mcp_opts.get("args", ""))
+                if extra:
+                    args.extend(shlex.split(extra))
+            env: dict[str, str] = {}
+            for key, value in mcp_opts.items():
+                if key.startswith("env:"):
+                    env_name = key[4:].strip()
+                    if not env_name:
+                        raise ParseError("env(...) requires a non-empty name", lineno)
+                    env[env_name] = _strip_quotes(value)
+            pf.mcp_servers[mcp_name] = MCPServer(
+                name=mcp_name,
+                command=command,
+                args=args,
+                env=env,
+                url=url,
+            )
+            i += 1
+            continue
+
         # ----- agent <name> "<path>" [opts] -----
         if stripped.startswith("agent "):
             rest = stripped[6:].strip()
@@ -1677,6 +1738,13 @@ def parse(
                 f"task {task.name!r} postmortem targets unknown task {task.options.postmortem!r}",
                 task.line_number,
             )
+        for server_name in task.options.mcp:
+            if server_name not in pf.mcp_servers:
+                raise ParseError(
+                    f"task {task.name!r} references unknown MCP server {server_name!r}",
+                    task.line_number,
+                )
+        task.mcp_servers = [pf.mcp_servers[name] for name in task.options.mcp]
         # Provider names stay lenient at parse time, like [llm=...] always has;
         # --check reports the ones that do not resolve.
         if task.options.judge and len(task.options.llms) < 2:

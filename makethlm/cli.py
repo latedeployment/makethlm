@@ -20,6 +20,7 @@ from .dispatcher import (
     DryRunDispatcher,
     OllamaDispatcher,
     OpenAIDispatcher,
+    OpenCodeDispatcher,
     ShellDispatcher,
 )
 from .formatter import format_text
@@ -67,7 +68,7 @@ PROMPTFILE_NAMES = [
 ]
 
 
-_KNOWN_NATIVE_PROVIDERS = {"claude", "codex", "openai", "ollama"}
+_KNOWN_NATIVE_PROVIDERS = {"claude", "codex", "openai", "ollama", "opencode"}
 _SECRETS_BACKEND_TOOLS = {
     "infisical": "infisical",
     "1password": "op",
@@ -179,6 +180,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop the run once LLM spend reaches this many US dollars",
     )
     ap.add_argument(
+        "--log-llm",
+        metavar="PATH",
+        dest="log_llm",
+        default=None,
+        help="Append every LLM call to PATH as JSONL for live debugging",
+    )
+    ap.add_argument(
         "--fixtures",
         metavar="DIR",
         default=None,
@@ -279,6 +287,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the native Ollama HTTP dispatcher as the default LLM dispatcher",
     )
     ap.add_argument(
+        "--opencode",
+        action="store_true",
+        help="Use the opencode CLI as the default LLM dispatcher",
+    )
+    ap.add_argument(
         "--safe",
         action="store_true",
         help="Enable restrictive safety checks before execution",
@@ -312,6 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-secrets",
         action="store_true",
         help="Allow tasks to read or interpolate secrets in safe mode",
+    )
+    ap.add_argument(
+        "--allow-mcp",
+        action="store_true",
+        help="Allow tasks to attach MCP servers in safe mode",
     )
     ap.add_argument(
         "--allow-webhook",
@@ -351,6 +369,8 @@ def _build_dispatcher(args: argparse.Namespace, *, honor_dry_run: bool = True) -
         return OpenAIDispatcher(model=args.model)
     if args.ollama:
         return OllamaDispatcher(model=args.model)
+    if args.opencode:
+        return OpenCodeDispatcher(model=args.model)
     return ClaudeDispatcher(model=args.model)
 
 
@@ -378,7 +398,14 @@ def _task_uses_local_execution_provider(
     fallback_dispatcher: Dispatcher,
 ) -> bool:
     """Return whether a task can reach an LLM dispatcher that executes locally."""
-    local_dispatchers = (ClaudeDispatcher, CodexDispatcher, ShellDispatcher)
+    # opencode runs an agent with --auto, so it can execute locally like the
+    # other CLI-backed providers.
+    local_dispatchers = (
+        ClaudeDispatcher,
+        CodexDispatcher,
+        OpenCodeDispatcher,
+        ShellDispatcher,
+    )
     return any(
         isinstance(dispatcher, local_dispatchers)
         for dispatcher in _task_dispatchers(pf, task_name, fallback_dispatcher)
@@ -832,6 +859,7 @@ def _validate_safe_mode(
     allow_llm: bool,
     allow_secrets: bool = False,
     allow_webhook: bool = False,
+    allow_mcp: bool = False,
     task_args: dict[str, str] | None = None,
     dispatcher: Dispatcher | None = None,
 ) -> list[str]:
@@ -886,6 +914,9 @@ def _validate_safe_mode(
                 f"task {task_name!r} uses an LLM dispatcher with local execution access; "
                 "pass --allow-shell"
             )
+        if task.mcp_servers and not allow_mcp:
+            names = ", ".join(server.name for server in task.mcp_servers)
+            errors.append(f"task {task_name!r} attaches MCP servers ({names}); pass --allow-mcp")
         if task.options.webhook and not allow_webhook:
             errors.append(f"task {task_name!r} sends a webhook; pass --allow-webhook")
     return errors
@@ -1000,6 +1031,14 @@ def _capability_payload(
                     f"invokes the external {backend!r} secret backend",
                     "--allow-shell",
                 )
+        for server in task.mcp_servers:
+            add(
+                task_name,
+                "mcp",
+                f"attaches MCP server {server.name!r}"
+                + (f" at {server.url}" if server.url else f" running {server.command!r}"),
+                "--allow-mcp",
+            )
         if task.options.webhook:
             add(
                 task_name,
@@ -2046,6 +2085,7 @@ def main(argv: list[str] | None = None) -> int:
                         allow_llm=args.allow_llm,
                         allow_secrets=args.allow_secrets,
                         allow_webhook=args.allow_webhook,
+                        allow_mcp=args.allow_mcp,
                         task_args=task_args if safe_target == target else None,
                         dispatcher=configured_dispatcher,
                     )
@@ -2071,6 +2111,7 @@ def main(argv: list[str] | None = None) -> int:
             fixtures_dir=args.fixtures,
             record_fixtures=args.record_fixtures,
             max_cost=max_cost,
+            call_log_path=args.log_llm,
         )
         try:
             started = time.monotonic()

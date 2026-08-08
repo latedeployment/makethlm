@@ -4,54 +4,120 @@
 
 ### Added
 
-- Secrets injection with `{{#secret:NAME}}` and env, Infisical, 1Password, and SOPS backends.
-- Parallel CLI execution with `--parallel`.
-- Parallel worker limits with `--jobs N`.
-- Machine-readable JSON output with `--json` for runs, plans, graphs, and history.
-- Bare Just-style shell recipes, e.g. `build:` with plain shell command lines.
-- Just compatibility tracking documentation.
-- Promptfile validation with `--check`.
-- Step-level shell output capture with `!cmd -> name`, `{{last.stdout}}`, and `!cmd |>` prompt piping.
-- Local Ruff/dev dependency setup for linting and package smoke validation.
-- Just-style `import`, optional `import?`, `[default]`, `[confirm("...")]`, and `[env(NAME, VALUE)]`.
-- Shell completion generation with `makethlm completions bash|zsh|fish`.
-- Native OpenAI and Ollama dispatchers via `llm openai`, `llm ollama`, `--openai`, and `--ollama`.
-- Release preparation script for version bump, changelog, commit, tag, build, and publish flow.
-- Secret backend tests, value-free secret audit logging, and a policy to block secrets in LLM prompts.
-- Just compatibility for shebang/script recipes, `script("COMMAND")`, modules, `&&` subsequent dependencies, multi-task invocation, shell arrays, and more built-ins.
-- Real-world examples for Docker Compose, systemd, Kubernetes, Ansible inventory, Python package release, and CMake `compile_commands.json` analysis.
-- Fail-closed sandbox selection, network-deny defaults, read-only workspace support, and sandbox working-directory propagation.
-- Failure postmortem tasks, typed artifact contracts, and retry/fallback LLM provider strategies.
-- Transitive capability inspection with `--capabilities`.
-- Replayable, redacted local run bundles with `makethlm replay RUN_ID`.
-- Cache keys that include task arguments, variables, providers, agents, options, artifacts, and referenced environment inputs.
-- Module-scoped variables, functions, providers, agents, host groups, guidance, rollback hooks, and nested namespaces.
-- Per-host Ansible inventory connection settings.
-- Make-style file staleness with `sources` and `outputs`, source content digests
-  in cache keys, and `--always-make`/`-B` to force a run.
+#### Incremental builds
+
+- Make-style file staleness with `sources` and `outputs`: a task is skipped when
+  every output exists and is at least as new as every matched source.
+- Source content digests folded into cache keys, so a `cache` duration expires as
+  soon as an input file changes on disk.
+- `--always-make`/`-B` to ignore staleness and cache skips for a run.
+- `--watch` and `--watch-interval` to re-run a target when its `sources` or the
+  Promptfile change.
+- Cache keys that include task arguments, variables, providers, agents, options,
+  artifacts, and referenced environment inputs.
+
+#### Reliable workflows
+
+- Failure postmortem tasks, typed artifact contracts, and retry/fallback LLM
+  provider strategies.
 - Output contract repair with `repair=N`, re-prompting the final prompt step when
   a response violates `produces`.
 - Recorded LLM fixtures with `--fixtures DIR` and `--record-fixtures` for
   deterministic, offline, zero-spend runs that fail closed on a missing fixture.
-- Token, cost, and call accounting per run with provider `price-in`/`price-out`
-  declarations, a usage summary, history columns, and `--max-cost`/`max-cost`
-  budgets that stop a run once spend reaches the limit.
-- `--watch` and `--watch-interval` to re-run a target when its `sources` or the
-  Promptfile change.
-- Git-aware inputs: `changed()`, `changed_files()`, `git_branch()`, `git_sha()`,
-  and `--since REF` to scope tasks to a diff.
 - Per-provider `max-concurrency` caps and exponential backoff between retries of
   a rate-limited provider.
+- Replayable, redacted local run bundles with `makethlm replay RUN_ID`.
+
+#### Cost and budgets
+
+- Token, cost, and call accounting per run with provider `price-in`/`price-out`
+  declarations, a usage summary, and history columns.
+- `--max-cost` and per-task `max-cost` budgets that stop a run once spend reaches
+  the limit.
+
+#### Multiple models
+
+- Fan-out with `llm="a|b"`: one prompt to several providers concurrently, every
+  answer kept as `{{task.provider.response}}`.
+- `judge` to merge fan-out answers into a single response.
+- `@llm <name>` and a prompt-line `|>` to chain one model's answer into the next.
+
+#### Providers
+
+- Native OpenAI and Ollama dispatchers via `llm openai`, `llm ollama`,
+  `--openai`, and `--ollama`.
+- opencode CLI provider via `llm opencode` and `--opencode`, treated as a
+  local-execution provider under safe mode.
+- MCP servers declared with `mcp <name> [command=... | url=...]` and attached per
+  task with `mcp=`, translated per invocation for Claude (`--mcp-config`), Codex
+  (`-c mcp_servers.*`), and opencode (`OPENCODE_CONFIG_CONTENT`), gated by
+  `--allow-mcp` in safe mode.
+- Codex token usage, reliable final-message capture, and native `--output-schema`
+  enforcement of `produces` contracts.
+
+#### Observability
+
+- `--log-llm PATH` writes a redacted JSONL record of every LLM call, labeled by
+  kind (prompt, repair, fan-out, judge, budget) for live debugging.
 - Live elapsed-time indicator on a TTY while waiting for an LLM response.
+- Transitive capability inspection with `--capabilities`.
+- Machine-readable JSON output with `--json` for runs, plans, graphs, and history.
+
+#### Inputs and syntax
+
+- Git-aware inputs: `changed()`, `changed_files()`, `git_branch()`, `git_sha()`,
+  and `--since REF` to scope tasks to a diff.
+- Step-level shell output capture with `!cmd -> name`, `{{last.stdout}}`, and
+  `!cmd |>` prompt piping.
+- Module-scoped variables, functions, providers, agents, host groups, guidance,
+  rollback hooks, and nested namespaces.
+- Bare Just-style shell recipes, e.g. `build:` with plain shell command lines.
+- Just-style `import`, optional `import?`, `[default]`, `[confirm("...")]`, and
+  `[env(NAME, VALUE)]`.
+- Just compatibility for shebang/script recipes, `script("COMMAND")`, modules,
+  `&&` subsequent dependencies, multi-task invocation, shell arrays, and more
+  built-ins.
+- Hidden and all-caps Promptfile names (`.promptfile`, `.Promptfile`,
+  `PROMPTFILE`, and their `.pf` forms).
+
+#### Security
+
+- Secrets injection with `{{#secret:NAME}}` and env, Infisical, 1Password, and
+  SOPS backends.
+- Secret backend tests, value-free secret audit logging, and a policy to block
+  secrets in LLM prompts.
+- Fail-closed sandbox selection, network-deny defaults, read-only workspace
+  support, and sandbox working-directory propagation.
+
+#### Execution
+
+- Parallel CLI execution with `--parallel` and worker limits with `--jobs N`.
+- Per-host Ansible inventory connection settings.
+
+#### Tooling
+
 - `makethlm fmt` with `--check` for canonical Promptfile formatting.
+- Promptfile validation with `--check`.
+- Shell completion generation with `makethlm completions bash|zsh|fish`.
 - A clean `mypy` gate across the package, with strict checking on the focused
   modules, and contract checking extracted into `makethlm/contracts.py`.
-- Hidden and all-caps Promptfile names (`.promptfile`, `.Promptfile`, `PROMPTFILE`,
-  and their `.pf` forms).
-- Multi-model tasks: `llm="a|b"` fans one prompt out to several providers
-  concurrently and keeps every answer as `{{task.provider.response}}`, `judge`
-  merges them into one response, and `@llm <name>` plus a prompt-line `|>` chains
-  one model's answer into the next.
+- Release preparation script for version bump, changelog, commit, tag, build, and
+  publish flow.
+- Local Ruff/dev dependency setup for linting and package smoke validation.
+- Just compatibility tracking documentation.
+- Real-world examples for Docker Compose, systemd, Kubernetes, Ansible inventory,
+  Python package release, and CMake `compile_commands.json` analysis.
+
+### Changed
+
+- The Claude CLI dispatcher requests the JSON envelope (`--output-format json`)
+  so usage and cost are reported, retrying without it on CLIs that reject it.
+- The Codex CLI dispatcher runs with `--json` and `--output-last-message`,
+  reading the answer from the file rather than stdout, with the same fallback for
+  older builds.
+- `llm=` accepts a pipe-separated provider list; a single name behaves as before.
+- Skipped tasks record an artifact with `success` set to `skipped`, so dependents
+  and `when` conditions can observe them.
 
 ## 0.1.0 - 2026-05-24
 

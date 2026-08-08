@@ -122,6 +122,7 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test
 | `max_tokens` | int | Maximum tokens in the LLM response, from 1 through 1,000,000 |
 | `llm` | string | Provider name; `"a\|b"` fans out to several at once |
 | `judge` | string | Provider that merges fan-out answers into one response |
+| `mcp` | string | MCP servers to attach, e.g. `mcp="files\|github"` |
 | `agent` | string | Named agent whose instructions/provider apply to this task |
 | `on` | string | Host group to execute shell commands on via SSH |
 | `private` | flag | Hide this task from `--list` output (also: `_`-prefixed tasks) |

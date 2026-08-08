@@ -36,6 +36,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--watch` | | Re-run the target whenever a watched source file changes |
 | `--watch-interval SECONDS` | | Polling interval for `--watch` (default: 1.0) |
 | `--max-cost USD` | | Stop the run once LLM spend reaches this many US dollars |
+| `--log-llm PATH` | | Append every LLM call to PATH as JSONL for live debugging |
 | `--fixtures DIR` | | Serve LLM responses from recorded fixtures in DIR |
 | `--record-fixtures` | | Call providers normally and record responses into `--fixtures DIR` |
 | `--model MODEL` | `-m` | Override the LLM model for all tasks |
@@ -44,6 +45,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--codex` | | Use the Codex CLI as the default LLM dispatcher |
 | `--openai` | | Use the native OpenAI API dispatcher as the default LLM dispatcher |
 | `--ollama` | | Use the native Ollama HTTP dispatcher as the default LLM dispatcher |
+| `--opencode` | | Use the opencode CLI as the default LLM dispatcher |
 | `--safe` | | Enable restrictive safety checks before execution |
 | `--allow-backticks` | | Allow parse-time backtick commands in safe or inspection modes |
 | `--allow-shell` | | Allow local shell steps in safe mode |
@@ -51,6 +53,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--allow-docker` | | Allow docker blocks in safe mode |
 | `--allow-llm` | | Allow LLM prompt execution in safe mode |
 | `--allow-secrets` | | Allow secret reads and sensitive interpolation in safe mode |
+| `--allow-mcp` | | Allow tasks to attach MCP servers in safe mode |
 | `--allow-webhook` | | Allow webhook delivery in safe mode |
 | `--quiet` | `-q` | Suppress command echoing |
 | `--verbose` | | Verbose output with step details |

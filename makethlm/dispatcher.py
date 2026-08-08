@@ -8,11 +8,13 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from .mcp import claude_config, codex_overrides, opencode_config
 from .models import Task, parse_duration_seconds
 from .subprocess_util import run_subprocess
 
@@ -148,6 +150,8 @@ class ClaudeDispatcher(Dispatcher):
             f"[makethlm-{task.name}] You are a makethlm sub-agent executing task '{task.name}'."
         )
         cmd.extend(["--system-prompt", system_prompt])
+        if task.mcp_servers:
+            cmd.extend(["--mcp-config", claude_config(task.mcp_servers)])
         # Ask for the JSON envelope so usage and cost are reported. Older CLIs
         # that reject the flag fall back to plain text below.
         cmd.extend(["--output-format", "json"])
@@ -179,6 +183,58 @@ class ClaudeDispatcher(Dispatcher):
             )
 
 
+def parse_codex_events(stdout: str) -> tuple[str | None, int | None, int | None]:
+    """Parse `codex exec --json` JSONL output.
+
+    Returns ``(final_message, tokens_in, tokens_out)``. Any element is ``None``
+    when the stream did not carry it, so a Codex build that emits a different
+    shape degrades to the raw stdout rather than an empty answer.
+    """
+    message: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.completed":
+            usage = event.get("usage") or {}
+            tokens_in = _int_or_none(usage.get("input_tokens")) or tokens_in
+            tokens_out = _int_or_none(usage.get("output_tokens")) or tokens_out
+        elif event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    # Later messages supersede earlier ones.
+                    message = text
+    return message, tokens_in, tokens_out
+
+
+# Contracts whose shape can be handed to Codex as a JSON Schema.
+_CODEX_SCHEMA_TYPES: dict[str, dict[str, object]] = {
+    "json": {"type": ["object", "array", "string", "number", "boolean", "null"]},
+    "object": {"type": "object"},
+    "array": {"type": "array"},
+    "integer": {"type": "integer"},
+    "number": {"type": "number"},
+    "boolean": {"type": "boolean"},
+}
+
+
+def codex_output_schema(produces: str | None) -> dict[str, object] | None:
+    """Return a JSON Schema for a task's output contract, if one applies."""
+    if not produces:
+        return None
+    return _CODEX_SCHEMA_TYPES.get(produces)
+
+
 class CodexDispatcher(Dispatcher):
     """Dispatches prompts to the Codex CLI (`codex exec`)."""
 
@@ -193,7 +249,7 @@ class CodexDispatcher(Dispatcher):
 
     def dispatch(self, prompt: str, task: Task) -> DispatchResult:
         model = task.options.model or self.default_model
-        cmd = [
+        base = [
             "codex",
             "--ask-for-approval",
             "never",
@@ -204,23 +260,56 @@ class CodexDispatcher(Dispatcher):
             "never",
         ]
         if model:
-            cmd.extend(["--model", model])
-        cmd.append("-")
+            base.extend(["--model", model])
+        base.extend(codex_overrides(task.mcp_servers))
 
+        schema = codex_output_schema(task.options.produces)
         try:
-            result = run_subprocess(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=_llm_timeout(task),
-                input=prompt,
-            )
-            response = result.stdout
-            if result.returncode != 0 and result.stderr and not response:
+            with tempfile.TemporaryDirectory(prefix="makethlm-codex-") as workdir:
+                # --json gives usage; --output-last-message gives the answer
+                # without depending on how stdout is formatted.
+                last_message = os.path.join(workdir, "last-message.txt")
+                cmd = [*base, "--json", "--output-last-message", last_message]
+                if schema is not None:
+                    schema_path = os.path.join(workdir, "schema.json")
+                    with open(schema_path, "w", encoding="utf-8") as handle:
+                        json.dump(schema, handle)
+                    cmd.extend(["--output-schema", schema_path])
+                cmd.append("-")
+
+                result = run_subprocess(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=_llm_timeout(task),
+                    input=prompt,
+                )
+                if result.returncode != 0 and _is_unknown_option_error(result.stderr):
+                    # An older Codex without these flags: fall back to plain output.
+                    result = run_subprocess(
+                        [*base, "-"],
+                        capture_output=True,
+                        text=True,
+                        timeout=_llm_timeout(task),
+                        input=prompt,
+                    )
+                    return _codex_plain_result(result)
+
+                message, tokens_in, tokens_out = parse_codex_events(result.stdout)
+                try:
+                    with open(last_message, encoding="utf-8") as handle:
+                        file_message = handle.read()
+                except OSError:
+                    file_message = ""
+
+            response = file_message or message or result.stdout
+            if result.returncode != 0 and result.stderr and not response.strip():
                 response = result.stderr
             return DispatchResult(
                 response=response,
                 success=result.returncode == 0,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
             )
         except FileNotFoundError:
             return DispatchResult(
@@ -230,6 +319,100 @@ class CodexDispatcher(Dispatcher):
         except subprocess.TimeoutExpired:
             return DispatchResult(
                 response=f"error: codex CLI timed out after {_llm_timeout(task):.0f}s",
+                success=False,
+            )
+
+
+def _codex_plain_result(result: subprocess.CompletedProcess[str]) -> DispatchResult:
+    """Build a result from a Codex run that produced plain stdout."""
+    response = result.stdout
+    if result.returncode != 0 and result.stderr and not response:
+        response = result.stderr
+    return DispatchResult(response=response, success=result.returncode == 0)
+
+
+def parse_opencode_events(stdout: str) -> str | None:
+    """Extract assistant text from `opencode run --format json` output.
+
+    opencode emits one JSON event per line as
+    ``{"type": ..., "timestamp": ..., "sessionID": ..., ...}``; assistant text
+    arrives on ``text`` events. Parsing is deliberately lenient — an unknown
+    event shape returns ``None`` so the caller falls back to raw stdout rather
+    than losing the answer.
+    """
+    chunks: list[str] = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "text":
+            continue
+        part = event.get("part")
+        text = part.get("text") if isinstance(part, dict) else event.get("text")
+        if isinstance(text, str) and text:
+            chunks.append(text)
+    return "".join(chunks) if chunks else None
+
+
+class OpenCodeDispatcher(Dispatcher):
+    """Dispatches prompts to the opencode CLI (`opencode run`).
+
+    Models use opencode's ``provider/model`` form, e.g.
+    ``anthropic/claude-sonnet-4-5``. opencode reports no token usage, so cost
+    for this provider is only known when the Promptfile declares prices.
+    """
+
+    def __init__(self, model: str | None = None, config: str | None = None):
+        self.default_model = model
+        self.config = config  # inline JSON for OPENCODE_CONFIG_CONTENT
+
+    def validate_tool(self) -> str | None:
+        if shutil.which("opencode") is None:
+            return "error: 'opencode' CLI not found on PATH. See https://opencode.ai"
+        return None
+
+    def dispatch(self, prompt: str, task: Task) -> DispatchResult:
+        model = task.options.model or self.default_model
+        # --auto approves non-denied permissions, matching how the Claude and
+        # Codex dispatchers run non-interactively; without it a tool request
+        # would block until the task times out.
+        cmd = ["opencode", "run", "--format", "json", "--auto"]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
+
+        env = dict(os.environ)
+        config = opencode_config(task.mcp_servers) if task.mcp_servers else self.config
+        if config:
+            env["OPENCODE_CONFIG_CONTENT"] = config
+
+        try:
+            result = run_subprocess(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=_llm_timeout(task),
+                env=env,
+            )
+            response = parse_opencode_events(result.stdout) or result.stdout
+            if result.returncode != 0 and result.stderr and not response.strip():
+                response = result.stderr
+            return DispatchResult(
+                response=response,
+                success=result.returncode == 0,
+            )
+        except FileNotFoundError:
+            return DispatchResult(
+                response="error: 'opencode' CLI not found on PATH",
+                success=False,
+            )
+        except subprocess.TimeoutExpired:
+            return DispatchResult(
+                response=f"error: opencode CLI timed out after {_llm_timeout(task):.0f}s",
                 success=False,
             )
 

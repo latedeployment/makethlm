@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .calllog import CallLog, CallRecord
 from .contracts import required_artifact_error, split_artifact_contract, value_matches
 from .cost import CostTotals, derive_cost, parse_cost
 from .dispatcher import (
@@ -27,6 +28,7 @@ from .dispatcher import (
     DispatchResult,
     OllamaDispatcher,
     OpenAIDispatcher,
+    OpenCodeDispatcher,
     ShellDispatcher,
 )
 from .docker import (
@@ -308,6 +310,8 @@ def _dispatcher_for_provider(provider: LLMProvider) -> Dispatcher:
         )
     if provider_name == "ollama":
         return OllamaDispatcher(model=provider.model, base_url=provider.base_url)
+    if provider_name == "opencode":
+        return OpenCodeDispatcher(model=provider.model)
     # Default: use Claude CLI dispatcher
     return ClaudeDispatcher(model=provider.model)
 
@@ -357,6 +361,7 @@ class Runner:
         fixtures_dir: str | None = None,
         record_fixtures: bool = False,
         max_cost: float | None = None,
+        call_log_path: str | None = None,
     ):
         self.pf = pf
         self.dispatcher = dispatcher  # fallback/default dispatcher
@@ -370,8 +375,10 @@ class Runner:
         self.fixtures = FixtureStore(fixtures_dir) if fixtures_dir else None
         self.record_fixtures = record_fixtures and self.fixtures is not None
         self.max_cost = max_cost  # run-wide spend limit in USD
+        self.call_log = CallLog(call_log_path) if call_log_path else None
         self.costs = CostTotals()
         self._cost_lock = threading.Lock()
+        self._call_index = 0
         self._provider_limiters: dict[str, threading.Semaphore] = {}
         self._limiter_lock = threading.Lock()
         self.artifacts: dict[
@@ -1847,14 +1854,26 @@ class Runner:
         prompt: str,
         task: Task,
         provider_name: str,
+        kind: str = "prompt",
     ) -> DispatchResult:
         """Dispatch a prompt, then record its usage against the run budget."""
         budget_error = self._budget_error(task)
         if budget_error:
-            return DispatchResult(response=budget_error, success=False)
+            refusal = DispatchResult(response=budget_error, success=False)
+            self._record_call(
+                task=task,
+                provider_name=provider_name,
+                prompt=prompt,
+                result=refusal,
+                duration_ms=0,
+                kind="budget",
+            )
+            return refusal
 
         with ElapsedIndicator(f"waiting on {provider_name}", enabled=self.verbose):
-            result = self._dispatch_with_fixtures(dispatcher, prompt, task, provider_name)
+            started = time.monotonic()
+        result = self._dispatch_with_fixtures(dispatcher, prompt, task, provider_name)
+        duration_ms = int((time.monotonic() - started) * 1000)
         if result.cost_usd is None:
             result.cost_usd = derive_cost(
                 self.pf.llm_providers.get(provider_name),
@@ -1863,7 +1882,54 @@ class Runner:
             )
         with self._cost_lock:
             self.costs.add(result.tokens_in, result.tokens_out, result.cost_usd)
+        self._record_call(
+            task=task,
+            provider_name=provider_name,
+            prompt=prompt,
+            result=result,
+            duration_ms=duration_ms,
+            kind=kind,
+        )
         return result
+
+    def _record_call(
+        self,
+        *,
+        task: Task,
+        provider_name: str,
+        prompt: str,
+        result: DispatchResult,
+        duration_ms: int,
+        kind: str,
+    ) -> None:
+        """Append one dispatch attempt to the call log, if one is configured."""
+        if self.call_log is None:
+            return
+        source = "provider"
+        if self.fixtures is not None and not self.record_fixtures:
+            source = "fixture"
+        self.call_log.record(
+            CallRecord(
+                task=task.name,
+                provider=provider_name,
+                kind=kind,
+                attempt=self._next_call_index(),
+                success=result.success,
+                duration_ms=duration_ms,
+                prompt=self._redact(prompt),
+                response=self._redact(result.response),
+                source=source,
+                tokens_in=result.tokens_in,
+                tokens_out=result.tokens_out,
+                cost_usd=result.cost_usd,
+            )
+        )
+
+    def _next_call_index(self) -> int:
+        """Return a monotonically increasing index across concurrent calls."""
+        with self._cost_lock:
+            self._call_index += 1
+            return self._call_index
 
     def _budget_error(self, task: Task) -> str | None:
         """Return an error when the run has already spent its budget."""
@@ -1934,6 +2000,7 @@ class Runner:
         provider_name: str,
         dispatcher: Dispatcher,
         output_contract: str | None,
+        kind: str = "prompt",
     ) -> tuple[DispatchResult, int]:
         """Run one provider's retry and repair loop; return its result and attempts."""
         retries = min(max(task.options.retries, 0), MAX_LLM_RETRIES)
@@ -1951,7 +2018,9 @@ class Runner:
                     f"         retrying prompt with {provider_name} (attempt {provider_attempt})",
                     dim=True,
                 )
-            dispatch_result = self._dispatch_prompt(dispatcher, prompt, task, provider_name)
+            dispatch_result = self._dispatch_prompt(
+                dispatcher, prompt, task, provider_name, kind=kind
+            )
             if not dispatch_result.success and is_rate_limited(dispatch_result.response):
                 delay = rate_limit_backoff(provider_attempt)
                 if self.verbose:
@@ -1981,6 +2050,7 @@ class Runner:
                     build_repair_prompt(prompt, output_contract, dispatch_result.response),
                     task,
                     provider_name,
+                    kind="repair",
                 )
             if dispatch_result.success:
                 break
@@ -2111,6 +2181,7 @@ class Runner:
                     name,
                     candidate,
                     output_contract,
+                    "fanout",
                 ): name
                 for name, candidate in targets
             }
@@ -2177,6 +2248,7 @@ class Runner:
             judge_name,
             _dispatcher_for_provider(provider),
             output_contract,
+            kind="judge",
         )
         if not outcome.success:
             return None
