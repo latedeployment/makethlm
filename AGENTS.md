@@ -10,7 +10,8 @@ This repository contains the `makethlm` Python CLI package. Code lives in `maket
 - `runner.py` executes tasks, dependencies, shell steps, SSH, Docker, caching, and webhooks.
 - `dispatcher.py` routes prompt steps to dry-run, Claude CLI, or shell-template providers.
 - `contracts.py`, `cost.py`, `staleness.py`, `fixtures.py`, `gitinfo.py`, `ratelimit.py`,
-  `formatter.py`, and `progress.py` hold focused logic split out of the larger modules.
+  `formatter.py`, `progress.py`, `calllog.py`, `mcp.py`, `graph.py`, and `prompts.py` hold
+  focused logic split out of the larger modules.
 
 Tests live in `tests/`. Examples are under `examples/`, documentation under `docs/`, and MkDocs configuration is in `mkdocs.yml`. Treat `dist/`, `site/`, `*.egg-info`, `__pycache__/`, and compiled example outputs as generated.
 

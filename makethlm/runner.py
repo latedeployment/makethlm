@@ -41,6 +41,8 @@ from .docker import (
     strip_dockerfile_markdown_fence,
 )
 from .fixtures import FixtureStore
+from .graph import CycleError as CycleError
+from .graph import topological_levels, topological_sort
 from .models import (
     MAX_FALLBACK_LLMS,
     MAX_LLM_RETRIES,
@@ -54,6 +56,12 @@ from .models import (
     parse_duration_seconds,
 )
 from .progress import ElapsedIndicator
+from .prompts import (
+    _last_prompt_index,
+    build_judge_prompt,
+    build_repair_prompt,
+    format_fanout_response,
+)
 from .ratelimit import is_rate_limited, rate_limit_backoff
 from .sandbox import build_sandbox_command
 from .secrets import is_secret_name, redact_text, secret_values_from_mapping
@@ -77,141 +85,6 @@ def _fmt_elapsed(seconds: float) -> str:
     if seconds < 1:
         return f"{seconds:.1f}s"
     return f"{seconds:.1f}s"
-
-
-class CycleError(Exception):
-    """Raised when task dependencies contain a cycle."""
-
-    def __init__(self, cycle: list[str]):
-        self.cycle = cycle
-        super().__init__(f"dependency cycle detected: {' -> '.join(cycle)}")
-
-
-def topological_sort(pf: Promptfile, target: str) -> list[str]:
-    """Return the tasks needed to run `target` in dependency order."""
-    order: list[str] = []
-    visited: set[str] = set()
-    in_stack: set[str] = set()
-
-    def visit(name: str, path: list[str]) -> None:
-        if name in in_stack:
-            cycle_start = path.index(name)
-            raise CycleError(path[cycle_start:] + [name])
-        if name in visited:
-            return
-        in_stack.add(name)
-        path.append(name)
-        for dep in pf.tasks[name].dependencies:
-            visit(dep, path)
-        path.pop()
-        in_stack.remove(name)
-        visited.add(name)
-        order.append(name)
-        for dep in pf.tasks[name].subsequent_dependencies:
-            visit(dep, path)
-
-    visit(target, [])
-    return order
-
-
-def topological_levels(pf: Promptfile, target: str) -> list[list[str]]:
-    """Return tasks grouped into levels for parallel execution.
-
-    Tasks at the same level have no dependencies on each other and can
-    be executed concurrently.
-    """
-    order = topological_sort(pf, target)
-    if any(pf.tasks[name].subsequent_dependencies for name in order):
-        return [[name] for name in order]
-
-    # Build the in-degree map restricted to our subgraph
-    order_set = set(order)
-    completed: set[str] = set()
-    remaining = list(order)
-    levels: list[list[str]] = []
-
-    while remaining:
-        # A task is ready if all its deps (within our subgraph) are completed
-        level: list[str] = []
-        for name in remaining:
-            deps = [d for d in pf.tasks[name].dependencies if d in order_set]
-            if all(d in completed for d in deps):
-                level.append(name)
-
-        if not level:
-            # Should never happen if topological_sort is correct, but safety valve
-            break
-
-        levels.append(level)
-        for name in level:
-            completed.add(name)
-        remaining = [n for n in remaining if n not in completed]
-
-    return levels
-
-
-MAX_REPAIR_ECHO_CHARS = 2000
-
-_CONTRACT_REPAIR_HINTS = {
-    "json": "a single valid JSON value",
-    "object": "a single valid JSON object",
-    "array": "a single valid JSON array",
-    "integer": "a single integer with no other characters",
-    "number": "a single number with no other characters",
-    "boolean": "exactly true or false",
-    "nonempty": "a non-empty answer",
-    "text": "a text answer",
-}
-
-
-def format_fanout_response(results: list[tuple[str, DispatchResult]]) -> str:
-    """Return every fan-out answer, labeled by provider."""
-    sections = []
-    for name, outcome in results:
-        status = "" if outcome.success else " (failed)"
-        sections.append(f"[{name}{status}]\n{outcome.response.strip()}")
-    return "\n\n".join(sections)
-
-
-def build_judge_prompt(prompt: str, answers: list[tuple[str, str]]) -> str:
-    """Return the prompt asking a judge provider to merge fan-out answers."""
-    sections = [f"--- answer from {name} ---\n{text.strip()}" for name, text in answers]
-    joined = "\n\n".join(sections)
-    return (
-        f"{len(answers)} models were given the same task. Merge their answers into a "
-        f"single best response.\n\n"
-        f"Original task:\n{prompt}\n\n"
-        f"{joined}\n\n"
-        "Reply with the merged answer only. Prefer claims the models agree on, drop "
-        "anything contradicted or unsupported, and do not mention the models or that "
-        "a merge took place."
-    )
-
-
-def _last_prompt_index(steps: list[TaskStep]) -> int | None:
-    """Return the 1-based index of the final prompt step, if any.
-
-    Only that step is validated against ``produces`` during execution: it is
-    the one whose response the contract can still be repaired through.
-    """
-    indexes = [i for i, step in enumerate(steps, 1) if step.kind not in ("echo", "shell")]
-    return indexes[-1] if indexes else None
-
-
-def build_repair_prompt(prompt: str, expected: str, previous: str) -> str:
-    """Return a re-prompt asking the provider to satisfy an output contract."""
-    wanted = _CONTRACT_REPAIR_HINTS.get(expected, f"a value of type {expected}")
-    echoed = previous.strip()
-    if len(echoed) > MAX_REPAIR_ECHO_CHARS:
-        echoed = echoed[:MAX_REPAIR_ECHO_CHARS] + "\n[...truncated]"
-    return (
-        f"{prompt}\n\n"
-        f"Your previous response did not satisfy the required output contract "
-        f"produces={expected}. It must be {wanted}, with no prose, explanation, "
-        f"or code fences around it.\n\n"
-        f"Previous response:\n{echoed}\n\n"
-        f"Reply with the corrected output only."
-    )
 
 
 def _parse_task_cost(value: str | None) -> float | None:

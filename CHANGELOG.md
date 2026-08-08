@@ -101,6 +101,9 @@
 - Shell completion generation with `makethlm completions bash|zsh|fish`.
 - A clean `mypy` gate across the package, with strict checking on the focused
   modules, and contract checking extracted into `makethlm/contracts.py`.
+- Dependency resolution extracted into `makethlm/graph.py` and the prompts
+  makethlm composes itself (repair, judge, fan-out) into `makethlm/prompts.py`,
+  both re-exported from `makethlm.runner` so existing imports keep working.
 - Release preparation script for version bump, changelog, commit, tag, build, and
   publish flow.
 - Local Ruff/dev dependency setup for linting and package smoke validation.
