@@ -943,6 +943,50 @@ Paths are rendered relative to the directory the recipe runs in and quoted only
 when they need it, so names containing spaces stay safe. The file variables are
 empty for a task that declares neither `sources` nor `outputs`.
 
+### How they expand
+
+The variables are plain text substitution, like make's — the value is spliced
+into the command before the shell sees it. Multiple paths are **separated by a
+single space**, never a comma or semicolon, and each path is quoted only when it
+contains something the shell would otherwise split on:
+
+```
+!cc -o {{makethlm_outputs}} {{makethlm_sources}}
+# the shell receives:
+cc -o build/app src/alpha.c src/beta.c 'src/two words.c'
+```
+
+Because the quoting is per path, ordinary word splitting iterates them
+correctly, including names with spaces:
+
+```
+task check [sources="src/*.c", outputs="build/app"]:
+    !for f in {{makethlm_sources}}; do echo "checking $f"; done
+    !set -- {{makethlm_sources}}; echo "$# files"
+```
+
+In a `script` recipe they can fill a bash array, which is sturdier for anything
+non-trivial:
+
+```
+task report [script("bash"), sources="src/*.c", outputs="build/app"]:
+    files=({{makethlm_sources}})
+    echo "${#files[@]} sources"
+    for f in "${files[@]}"; do
+        printf '%s: %s bytes\n' "$f" "$(wc -c < "$f")"
+    done
+```
+
+One gotcha, shared with make: wrapping the variable in double quotes collapses
+it into a single argument, and the per-path quotes become literal characters.
+
+```
+!for f in "{{makethlm_sources}}"; do ...   # one iteration, not three
+!for f in {{makethlm_sources}}; do ...     # correct
+```
+
+Leave them unquoted and let the per-path quoting do its job.
+
 ### Built-in Functions
 
 Justfile-compatible built-in functions, available in `{{ }}` templates:
