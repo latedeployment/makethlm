@@ -124,6 +124,10 @@
 
 ### Changed
 
+- The README is now a landing page (1426 -> 245 lines) pointing at the published
+  documentation site, instead of restating most of `docs/` a second time. It also
+  covers `repair`, `judge`, and `mcp`, which it had never mentioned.
+
 - The Claude CLI dispatcher requests the JSON envelope (`--output-format json`)
   so usage and cost are reported, retrying without it on CLIs that reject it.
 - The Codex CLI dispatcher runs with `--json` and `--output-last-message`,
