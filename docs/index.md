@@ -31,27 +31,44 @@ task deploy(target, port="8080"): build test:
 ```
 $ makethlm deploy staging
 [ok] build
-  ...
+  Bundled 14 TypeScript files into dist/bundle.js.
 [ok] test
-  ...
+  All 32 tests passed.
 [ok] deploy
   Verified my-web-app is running on staging port 8080. All health checks pass.
+```
+
+Run it again without touching `src/` and the build is skipped, because `sources`
+and `outputs` give the task the same file-dependency tracking `make` has:
+
+```
+$ makethlm deploy staging
+[ok] build
+  [skipped] up to date (14 sources older than outputs)
 ```
 
 ## Key Features
 
 - **Natural language tasks** -- describe what you want in plain English, the LLM executes it
 - **Shell interleaving** -- freely mix `!shell` commands with LLM prompts in a single task
-- **Multi-provider LLM support** -- Claude, OpenAI, Ollama, or any CLI-based LLM
+- **Multi-provider LLM support** -- Claude, Codex, opencode, OpenAI, Ollama, or any CLI-based LLM
+- **Several models at once** -- fan one prompt out with `llm="a|b"`, keep every
+  answer, and have a `judge` merge them
 - **Task dependencies** -- topological sort with diamond/transitive dependency resolution
+- **Incremental builds** -- `sources`/`outputs` skip a task whose outputs are
+  newer than its inputs, with make-style automatic variables
 - **Task arguments** -- positional args with defaults and variadic support
 - **Reusable functions** -- `fn`/`@use` for shared prompt templates
 - **Docker generation** -- describe Docker images in prose, makethlm builds them
 - **SSH host inventory** -- run shell commands on remote hosts via SSH
-- **Reliable workflows** -- postmortems, rollback, typed artifact contracts,
-  bounded provider fallback, reproducible cache keys, and redacted replay
+- **Reliable workflows** -- postmortems, rollback, typed artifact contracts with
+  `repair`, bounded provider fallback, reproducible cache keys, and redacted replay
+- **Cost controls** -- token and spend accounting per run, with `--max-cost` budgets
+- **Reproducible runs** -- record LLM responses once and replay them in CI with
+  no credentials, no network, and no spend
+- **MCP servers** -- declare once, attach per task, configured per invocation
 - **Capability-first safety** -- inspect transitive shell, SSH, Docker, LLM,
-  secret, and webhook requirements before execution
+  secret, MCP, and webhook requirements before execution
 - **Namespaced modules** -- reuse tasks and their variables, providers, agents,
   hosts, guidance, aliases, and failure hooks without name collisions
 - **Variable system** -- `{{var}}` interpolation, backtick execution, string functions, conditionals

@@ -20,7 +20,7 @@ makethlm [OPTIONS] [TASK] [ARGS...]
 | `--summary` | `-s` | List task names only (compact, one per line) |
 | `--dump` | | Dump parsed Promptfile structure (variables, settings, tasks) |
 | `--check` | | Validate Promptfile references, required tools, and risky capabilities |
-| `--capabilities` | | Explain transitive shell, SSH, Docker, LLM, secret, and webhook capabilities |
+| `--capabilities` | | Explain transitive shell, SSH, Docker, LLM, secret, MCP, and webhook capabilities |
 | `--plan` | | Preview execution order, variables, providers, hosts, and resolved steps |
 | `--graph` | | Print a task dependency graph and exit |
 | `--graph-format FORMAT` | | Graph format: `mermaid` or `dot` |

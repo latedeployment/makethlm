@@ -20,16 +20,18 @@ Safe mode disables backtick command substitution during parsing unless
 backticks by default, so inspecting an unfamiliar Promptfile does not run its
 parse-time commands. Runtime checks can block local shell steps, SSH
 steps, docker blocks, LLM prompt execution, external secret backends, runtime
-shell conditions, and webhooks. Failure postmortem and rollback task closures
-are checked too. Webhook delivery requires `--allow-webhook`, and secret
+shell conditions, attached MCP servers, and webhooks. Failure postmortem and rollback task closures
+are checked too. Webhook delivery requires `--allow-webhook`, attaching MCP servers requires
+`--allow-mcp`, and secret
 placeholders or sensitive environment/template inputs require
 `--allow-secrets`. Every explicit environment read such as `${NAME}` or
 `env_var("NAME")` is permissioned; authorization does not depend on guessing
 whether its name looks sensitive.
 
-Claude CLI, Codex CLI, and custom shell-template LLM providers can execute
-local tools or write files. Safe mode therefore requires both `--allow-llm`
-and `--allow-shell` for prompt tasks that can reach one of those providers.
+Claude CLI, Codex CLI, opencode, and custom shell-template LLM providers can
+execute local tools or write files. Safe mode therefore requires both
+`--allow-llm` and `--allow-shell` for prompt tasks that can reach one of those
+providers.
 Native OpenAI and Ollama HTTP providers require `--allow-llm` but do not add
 the local shell capability.
 

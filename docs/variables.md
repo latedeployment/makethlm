@@ -107,6 +107,8 @@ Justfile-compatible built-in functions, available in `{{ }}` templates:
 | `{{arch()}}` | CPU architecture (e.g., `x86_64`, `aarch64`) |
 | `{{num_cpus()}}` | Number of CPU cores |
 | `{{home_directory()}}` | User's home directory |
+| `{{cwd()}}` | Directory makethlm was invoked from |
+| `{{invocation_directory()}}` | Same as `cwd()`, Justfile-compatible spelling |
 
 ```
 task info:
