@@ -26,7 +26,7 @@ set working-dir "/home/deploy/app"
 | `set secrets-vault "name"` | 1Password vault name |
 | `set secrets-file "path"` | SOPS encrypted secrets file |
 | `set secrets-audit` | Log secret resolution metadata without values |
-| `set allow-secrets-in-prompts false` | Block secret placeholders and secret-like environment/template inputs in LLM prompt steps |
+| `set allow-secrets-in-prompts false` | Block secret placeholders and secret-like environment/template inputs in LLM prompt steps (alias: `set secrets-allow-llm`) |
 | `set shell "name"` | Set the shell used for `!` commands (default: system shell) |
 | `set shell := ["bash", "-cu"]` | Use Just-style shell command array syntax |
 | `set working-dir "path"` | Set the working directory for all tasks |

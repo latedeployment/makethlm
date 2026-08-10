@@ -286,7 +286,7 @@ def _parse_task_options(kvs: dict[str, str]) -> TaskOptions:
                 opts.temperature = float(value)
             except ValueError:
                 raise ParseError(f"temperature must be a number, got {value!r}")
-        elif key == "max_tokens":
+        elif key in ("max_tokens", "max-tokens"):
             try:
                 opts.max_tokens = int(value)
             except ValueError:

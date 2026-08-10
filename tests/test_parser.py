@@ -3810,3 +3810,45 @@ task inspect [repair=lots]:
 task inspect [repair=9]:
     inspect it
 """)
+
+
+class TestOptionSpelling:
+    """Documented promise: every option accepts hyphens or underscores."""
+
+    @pytest.mark.parametrize(
+        "spelling,attribute,expected",
+        [
+            ("max_tokens=100", "max_tokens", 100),
+            ("max-tokens=100", "max_tokens", 100),
+            ("no_exit_message", "no_exit_message", True),
+            ("no-exit-message", "no_exit_message", True),
+            ("working_dir=/tmp", "working_dir", "/tmp"),
+            ("working-dir=/tmp", "working_dir", "/tmp"),
+            ("llm_timeout=5m", "llm_timeout", "5m"),
+            ("llm-timeout=5m", "llm_timeout", "5m"),
+        ],
+    )
+    def test_both_spellings_are_accepted(self, spelling, attribute, expected):
+        pf = parse(f"task t [{spelling}]:\n    do it\n")
+        assert getattr(pf.tasks["t"].options, attribute) == expected
+
+    @pytest.mark.parametrize(
+        "alias,canonical,attribute,expected",
+        [
+            ('source="a.c"', "sources", "sources", ["a.c"]),
+            ('output="a.o"', "outputs", "outputs", ["a.o"]),
+            ('budget="1.00"', "max-cost", "max_cost", "1.00"),
+            ('identity-file="k"', "ssh-key", "ssh_identity", '"k"'),
+        ],
+    )
+    def test_documented_aliases_work(self, alias, canonical, attribute, expected):
+        pf = parse(f"task t [{alias}]:\n    do it\n")
+        assert getattr(pf.tasks["t"].options, attribute) == expected
+
+    def test_on_failure_aliases_postmortem(self):
+        pf = parse("task diagnose:\n    !x\n\ntask t [on-failure=diagnose]:\n    do it\n")
+        assert pf.tasks["t"].options.postmortem == "diagnose"
+
+    def test_secrets_allow_llm_aliases_the_setting(self):
+        pf = parse("set secrets-allow-llm false\n\ntask t:\n    do it\n")
+        assert pf.settings.allow_secrets_in_prompts is False

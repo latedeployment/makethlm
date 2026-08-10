@@ -117,6 +117,9 @@
 
 ### Fixed
 
+- `max-tokens` was rejected while every other multi-word task option accepted
+  both hyphens and underscores. Both spellings now work.
+
 - The README and docs landing-page examples were missing the trailing `:` on
   task headers with dependencies, so the first snippet a reader copies did not
   parse. Fixed across README, getting-started, index, docker, tasks, and syntax

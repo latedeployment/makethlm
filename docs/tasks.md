@@ -149,19 +149,19 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test:
 | `secrets` | string | Override the configured secret backend for this task |
 | `when` | expression | Run only when the condition is true; repeat for multiple conditions |
 | `cache` | duration | Reuse successful results for a duration such as `30m`, `1h`, or `1d` |
-| `sources` | string | Input file patterns; skip the task when outputs are newer |
-| `outputs` | string | Output file patterns compared against `sources` |
+| `sources` | string | Input file patterns; skip the task when outputs are newer (alias: `source`) |
+| `outputs` | string | Output file patterns compared against `sources` (alias: `output`) |
 | `timeout` | duration | Shell and SSH command timeout, e.g. `timeout=30s` or `timeout=5m` |
 | `llm-timeout` | duration | Prompt/LLM timeout, e.g. `llm-timeout=10m` |
 | `rollback` | string | Task to run if this task fails |
-| `postmortem` | string | Diagnostic task to run after failure and before rollback |
+| `postmortem` | string | Diagnostic task to run after failure and before rollback (alias: `on-failure`) |
 | `fallback-llm` | string | Up to four `|`-separated providers to try after the primary provider; duplicates are removed |
 | `retries` | integer | LLM retries per provider, from 0 through 10 |
 | `requires` | string | `|`-separated `artifact.field[:type]` input contracts |
 | `produces` | string | Aggregate output type: `text`, `nonempty`, `json`, `object`, `array`, `integer`, `number`, or `boolean` |
 | `repair` | int | Re-prompt up to N times (max 3) when `produces` is violated |
-| `max-cost` | string | Stop the run when LLM spend reaches this many US dollars |
-| `ssh-key` | string | SSH identity file for this task's remote shell steps |
+| `max-cost` | string | Stop the run when LLM spend reaches this many US dollars (alias: `budget`) |
+| `ssh-key` | string | SSH identity file for this task's remote shell steps (alias: `identity-file`) |
 | `ssh-strict-host-key-checking` | string | SSH host key policy: `yes`, `no`, or `accept-new` |
 | `ssh-parallel` | flag | Run each shell step across all target hosts concurrently |
 | `sandbox` | string | Wrap shell steps with `docker`, `systemd`, `bwrap`, or `none` |
@@ -173,3 +173,22 @@ task deploy(target) [llm=openai, on=web, model=gpt-4]: build test:
 
 See [Reliable Workflows](reliability.md) for postmortems, contracts, provider
 fallbacks, deterministic cache inputs, and run replay.
+
+## Option Spelling
+
+Every option name may be written with hyphens or underscores — `no-exit-message`
+and `no_exit_message` are the same option. A few also have a second name, for
+when it reads better in context:
+
+| Canonical | Alias |
+|-----------|-------|
+| `sources` | `source` |
+| `outputs` | `output` |
+| `postmortem` | `on-failure` |
+| `max-cost` | `budget` |
+| `ssh-key` | `identity-file` |
+
+```make
+task deploy [budget="2.50", on-failure=diagnose, identity-file="~/.ssh/deploy"]:
+    !./scripts/deploy
+```
